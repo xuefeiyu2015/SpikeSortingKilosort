@@ -1,0 +1,72 @@
+# Template for a real recording session. Copy to configs/<session>.yaml and edit.
+# Copies are gitignored; this template is tracked.
+#
+#   python scripts/run_pipeline.py --config configs/Athos_2026_08_13.yaml \
+#          --machine windows_rig
+#
+# Placeholders {data_root}, {output_root}, {cache}, {downloads} and {session}
+# are filled from configs/machines/<machine>.yaml at load time -- keep absolute
+# machine paths out of this file.
+
+session: Athos_2026_08_13
+
+# Steps 8-9 (cross-system alignment) need both systems. Set skip_sync: true for
+# a single-system session; set skip_blackrock / skip_neuropixels when only one
+# system recorded.
+skip_sync: false
+skip_blackrock: false
+skip_neuropixels: false
+
+output_dir: "{output_root}/{session}"
+
+blackrock:
+  # NSP-*.ns6 carries the two sync channels (see SynchronizePulse_setup.md):
+  #   channel 1 = 1 Hz square wave from SpikeGLX SMA1
+  #   channel 2 = 14 s coded burst from Blackrock DO1
+  sync_file: "{data_root}/Monkey Athos/2026-08-13/NSP-Athos_001.ns6"
+  # HUB-*.ns6 carries the Utah array spike data.
+  spike_file: "{data_root}/Monkey Athos/2026-08-13/HUB-Athos_001.ns6"
+  sync_1hz_channel: 1
+  burst_channel: 2
+  # Thresholds in the units returned by the reader (volts after neo scaling).
+  sync_threshold: 2.5
+  burst_threshold: 2.5
+  # A .ns6 may expose several streams; pin one if read_blackrock is ambiguous.
+  stream_id: null
+  # Non-neural channels to drop before sorting.
+  exclude_channels: []
+
+neuropixels:
+  # SpikeGLX run: <run_dir>/<run_name>_g<gate>/...
+  run_dir: "{data_root}/Monkey Athos/2026-08-13"
+  run_name: "Athos_2026_08_13"
+  gate: 0
+  trigger: 0
+  probes: [0]
+  # Leave null to build the channel map from the run's .meta (recommended for
+  # NP 1.0 NHP long -- the .meta is authoritative per run).
+  probe_name: null
+  n_chan_bin: null
+  # SY-word bit carrying the SMA1 1 Hz square wave (SpikeGLX default is 6).
+  sync_bit: 6
+  sync_pulse_ms: 500
+  # XA1 analog input in the obx stream carries the 14 s coded burst.
+  burst_word: 1
+  # CatGT -xa thresholds in volts, (primary, secondary); set from a real obx file.
+  burst_threshold_v: [1.0, 0.0]
+  # Expected burst pulse width in ms; 0 accepts any width.
+  burst_pulse_ms: 0
+
+sync_period_s: 1.0
+burst_interval_s: 14.0
+# Step 9 passes when burst residuals stay under this (seconds).
+alignment_tolerance_s: 0.001
+
+preprocess:
+  apply: true
+  bandpass: [300, 6000]
+  common_reference: "median"
+  detect_bad_channels: true
+
+# Merged into Kilosort4's settings dict.
+kilosort_settings: {}

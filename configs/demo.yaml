@@ -1,0 +1,32 @@
+# Demo session -- an ordinary session config that happens to point at the
+# official Kilosort4 example recording.
+#
+# Nothing about it is special-cased in the code: it names a binary and sets the
+# skip flags for the stages that need data it does not have.
+#
+# Fetch the file once (separate from the pipeline, not a pipeline stage):
+#   python scripts/fetch_demo_data.py
+# Then:
+#   python scripts/run_pipeline.py --config configs/demo.yaml
+session: demo
+
+# No second system to align to, so steps 8-9 are skipped. Sync *extraction* still
+# runs: this recording's SY word does carry the 1 Hz square wave.
+skip_sync: true
+
+# No NSP-*.ns6 / HUB-*.ns6, so step 4 and the Blackrock half of steps 8-10 skip.
+skip_blackrock: true
+
+output_dir: "{downloads}/spikesorting_demo"
+
+neuropixels:
+  bin_file: "{downloads}/.test_data/ZFM-02370_mini.imec0.ap.short.bin"
+  # This download is a bare .bin with no .meta beside it, so the channel count
+  # and rate have to be stated here. 384 AP channels + 1 SY word.
+  n_chan_bin: 385
+  sample_rate: 30000
+  probe_name: "NeuroPix1_default.mat"
+  sync_bit: 6
+  sync_pulse_ms: 500
+
+kilosort_settings: {}

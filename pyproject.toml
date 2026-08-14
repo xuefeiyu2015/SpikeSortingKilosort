@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spikesorting"
+version = "0.1.0"
+description = "Kilosort4 spike sorting pipeline for Blackrock Utah array and Neuropixels recordings, with cross-system time alignment"
+requires-python = ">=3.10"
+
+# Base dependencies only. These are enough to run the config layer, the sync
+# extraction fallback, alignment and export -- i.e. everything that must work on
+# a machine without a CUDA GPU.
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Installed inside the `kilosort4` conda env on the sorting machines.
+sorting = [
+    "kilosort>=4.0",
+    "spikeinterface>=0.101",
+    "probeinterface>=0.2.21",
+    "neo>=0.13",
+]
+dev = ["pytest>=7.4"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

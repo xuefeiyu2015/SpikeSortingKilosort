@@ -1,0 +1,12 @@
+# Lab Windows rig: CUDA GPU, SpikeGLX command line tools, network data share.
+data_root: "Z:/jeurissenlab.cns.nyu.edu/server"
+output_root: "Z:/jeurissenlab.cns.nyu.edu/server/sorted"
+
+# Fast local SSD for Kilosort's temp.dat. Must NOT be the network share.
+cache_dir: "D:/kilosort_cache"
+
+# Folders containing runit.bat / TPrime.exe
+catgt_dir: "C:/SpikeGLX/CommandLineTools/CatGTWinApp/CatGT-win"
+tprime_dir: "C:/SpikeGLX/CommandLineTools/TPrimeWinApp"
+
+device: "cuda"
