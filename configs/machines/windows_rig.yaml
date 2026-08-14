@@ -1,8 +1,11 @@
 # Lab Windows rig: CUDA GPU, SpikeGLX command line tools, network data share.
-data_root: "Z:/jeurissenlab.cns.nyu.edu/server"
-output_root: "Z:/jeurissenlab.cns.nyu.edu/server/sorted"
+#
+# System facts only: scratch disk, installed tools, device. Where recordings
+# live is a property of the recording, so it belongs in the session config --
+# do not re-add data_root / output_root here.
 
-# Fast local SSD for Kilosort's temp.dat. Must NOT be the network share.
+# Fast local SSD for Kilosort's temp.dat. Must be a local drive, never the
+# network share (Z:) that the session configs read their data from.
 cache_dir: "D:/kilosort_cache"
 
 # Folders containing runit.bat / TPrime.exe

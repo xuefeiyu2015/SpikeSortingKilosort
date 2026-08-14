@@ -1,13 +1,15 @@
 # HPC / Linux batch node. Runs pipeline steps 1-5 headless.
 #
+# System facts only: scratch disk, installed tools, device. Where recordings
+# live is a property of the recording, so it belongs in the session config --
+# do not re-add data_root / output_root here.
+#
 # catgt_dir and tprime_dir are intentionally null: the sorting path must never
 # depend on them. Sync extraction falls back to the pure-NumPy detectors in
 # spikesorting.sync.edges, which write byte-identical edge files.
 #
 # CatGT does ship a Linux runit.sh -- if it is installed here, set catgt_dir and
 # the wrapper will be used instead of the fallback.
-data_root: "/scratch/ephys"
-output_root: "/scratch/ephys/sorted"
 
 # Node-local scratch, not the shared filesystem.
 cache_dir: "/tmp/kilosort_cache"

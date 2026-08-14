@@ -4,9 +4,11 @@
 #   python scripts/run_pipeline.py --config configs/Athos_2026_08_13.yaml \
 #          --machine windows_rig
 #
-# Placeholders {data_root}, {output_root}, {cache}, {downloads} and {session}
-# are filled from configs/machines/<machine>.yaml at load time -- keep absolute
-# machine paths out of this file.
+# Write every data path out in full. configs/machines/<machine>.yaml carries only
+# system facts (scratch disk, tool locations, device) and supplies no roots, so
+# {data_root} and {output_root} no longer expand -- a leftover one resolves to ""
+# silently rather than raising, turning "{data_root}/x" into "/x". output_dir is
+# therefore required. {session} still expands, to the `session:` value below.
 
 session: Athos_2026_08_13
 
@@ -17,15 +19,15 @@ skip_sync: false
 skip_blackrock: false
 skip_neuropixels: false
 
-output_dir: "{output_root}/{session}"
+output_dir: "Z:/jeurissenlab.cns.nyu.edu/server/sorted/{session}"
 
 blackrock:
   # NSP-*.ns5 carries the two sync channels (see SynchronizePulse_setup.md):
   #   channel 1 = 1 Hz square wave from SpikeGLX SMA1
   #   channel 2 = 14 s coded burst from Blackrock DO1
-  sync_file: "{data_root}/Monkey Athos/2026-08-13/NSP-Athos_001.ns5"
+  sync_file: "Z:/jeurissenlab.cns.nyu.edu/server/Monkey Athos/2026-08-13/NSP-Athos_001.ns5"
   # HUB-*.ns6 carries the Utah array spike data.
-  spike_file: "{data_root}/Monkey Athos/2026-08-13/HUB-Athos_001.ns6"
+  spike_file: "Z:/jeurissenlab.cns.nyu.edu/server/Monkey Athos/2026-08-13/HUB-Athos_001.ns6"
   sync_1hz_channel: 1
   burst_channel: 2
   # Thresholds in the units returned by the reader (volts after neo scaling).
@@ -38,7 +40,7 @@ blackrock:
 
 neuropixels:
   # SpikeGLX run: <run_dir>/<run_name>_g<gate>/...
-  run_dir: "{data_root}/Monkey Athos/2026-08-13"
+  run_dir: "Z:/jeurissenlab.cns.nyu.edu/server/Monkey Athos/2026-08-13"
   run_name: "Athos_2026_08_13"
   gate: 0
   trigger: 0

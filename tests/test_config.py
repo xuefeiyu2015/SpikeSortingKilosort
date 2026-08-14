@@ -1,4 +1,9 @@
-"""Session/machine config: placeholder resolution and input validation."""
+"""Session/machine config: path resolution and input validation.
+
+Session files carry the data paths; machine profiles carry only system facts.
+Several tests below read the real tracked configs, so they fail if that split
+is broken rather than merely if the loader is.
+"""
 
 from __future__ import annotations
 
@@ -22,26 +27,58 @@ def test_demo_config_is_an_ordinary_session():
     assert session.neuropixels.sample_rate == 30000.0
 
 
-def test_demo_paths_resolve_under_the_downloads_dir():
+def test_demo_paths_are_written_out_in_the_session_config():
     session = cfg.load_session(CONFIG_DIR / "demo.yaml", "mac", CONFIG_DIR)
-    downloads = cfg.downloads_dir()
-    assert str(session.neuropixels.bin_file).startswith(str(downloads))
-    assert "{downloads}" not in str(session.output_root)
+    binary = session.neuropixels.bin_file
+    assert binary.name == "ZFM-02370_mini.imec0.ap.short.bin"
+    assert binary.parent.name == "demo_data"
+    # "~/..." went through _as_path().expanduser() rather than a machine root.
+    assert binary.is_absolute()
+    assert session.output_root.is_absolute()
 
 
-def test_template_resolves_machine_placeholders():
+def _template_paths(session):
+    return (
+        session.blackrock.sync_file,
+        session.blackrock.spike_file,
+        session.neuropixels.run_dir,
+        session.output_root,
+    )
+
+
+def test_template_leaves_no_unresolved_placeholders():
+    # A stale {data_root} would not raise: _substitute only knows five names and
+    # an unknown one is left alone, while a known-but-unset one becomes "" --
+    # silently turning "{data_root}/Monkey Athos" into "/Monkey Athos".
     session = cfg.load_session(CONFIG_DIR / "session_template.yaml", "windows_rig", CONFIG_DIR)
-    machine = cfg.load_machine("windows_rig", CONFIG_DIR)
-    assert str(session.blackrock.sync_file).startswith(str(machine.data_root))
+    for path in _template_paths(session):
+        assert "{" not in str(path)
+        assert str(path).startswith("Z:")
     assert str(session.output_root).endswith(session.session)
-    assert "{data_root}" not in str(session.blackrock.spike_file)
 
 
-def test_same_session_resolves_differently_per_machine():
-    windows = cfg.load_session(CONFIG_DIR / "session_template.yaml", "windows_rig", CONFIG_DIR)
-    hpc = cfg.load_session(CONFIG_DIR / "session_template.yaml", "hpc", CONFIG_DIR)
-    assert windows.blackrock.sync_file != hpc.blackrock.sync_file
-    assert windows.session == hpc.session
+def test_session_paths_no_longer_vary_by_machine():
+    # The inverse of the old two-layer behaviour, and the point of the split:
+    # data paths live in the session file, so one file resolves identically
+    # everywhere. The machine profile only decides where temp.dat goes and
+    # whether CatGT/TPrime exist.
+    loaded = [
+        cfg.load_session(CONFIG_DIR / "session_template.yaml", m, CONFIG_DIR)
+        for m in ("mac", "hpc", "windows_rig")
+    ]
+    assert len({str(s.blackrock.sync_file) for s in loaded}) == 1
+    assert len({str(s.output_root) for s in loaded}) == 1
+    assert len({str(s.machine.cache_dir) for s in loaded}) == 3
+
+
+def test_machine_profiles_carry_no_recording_paths():
+    # The invariant the split establishes: machine profile = system facts only.
+    # cache_dir stays -- a local SSD for temp.dat really is a property of the box.
+    for name in ("mac", "hpc", "windows_rig"):
+        profile = cfg.load_machine(name, CONFIG_DIR)
+        assert profile.data_root is None, name
+        assert profile.output_root is None, name
+        assert profile.cache_dir is not None, name
 
 
 def test_hpc_profile_has_no_command_line_tools():
@@ -83,7 +120,7 @@ def test_require_inputs_raises_with_every_problem_at_once():
 def test_skip_blackrock_suppresses_blackrock_checks(tmp_path):
     path = tmp_path / "s.yaml"
     path.write_text(
-        "session: s\nskip_blackrock: true\noutput_dir: '{output_root}/s'\n"
+        f"session: s\nskip_blackrock: true\noutput_dir: '{tmp_path / 'out'}'\n"
         "neuropixels:\n  bin_file: '/nope/missing.bin'\n",
         encoding="utf-8",
     )
