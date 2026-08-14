@@ -81,6 +81,11 @@ class MachineProfile:
     catgt_dir: Path | None = None
     #: Directory containing the TPrime executable. None where TPrime is absent.
     tprime_dir: Path | None = None
+    #: Directory holding conda environments shared between accounts on this
+    #: machine (e.g. ``C:/ProgramData/anaconda3/envs``). None where each user has
+    #: their own -- ``conda env list`` is then the only discovery source. Used by
+    #: :mod:`spikesorting.doctor`; nothing in the pipeline depends on it.
+    conda_envs_dir: Path | None = None
     #: torch device string handed to Kilosort4 ("cuda", "cuda:0", "cpu").
     device: str = "cuda"
 
@@ -93,6 +98,7 @@ class MachineProfile:
             cache_dir=_as_path(data.get("cache_dir")),
             catgt_dir=_as_path(data.get("catgt_dir")),
             tprime_dir=_as_path(data.get("tprime_dir")),
+            conda_envs_dir=_as_path(data.get("conda_envs_dir")),
             device=str(data.get("device", "cuda")),
         )
 
@@ -104,17 +110,21 @@ class MachineProfile:
     def has_tprime(self) -> bool:
         return self.tprime_dir is not None
 
+    @property
+    def has_shared_envs(self) -> bool:
+        return self.conda_envs_dir is not None
+
 
 @dataclass(frozen=True)
 class BlackrockSpec:
     """Blackrock inputs.
 
-    Channel defaults follow ``SynchronizePulse_setup.md``: in ``NSP-*.ns6``,
+    Channel defaults follow ``SynchronizePulse_setup.md``: in ``NSP-*.ns5``,
     channel 1 carries the 1 Hz square wave from SpikeGLX and channel 2 carries
     the 14 s coded burst emitted by Blackrock DO1.
     """
 
-    #: NSP-*.ns6 -- holds the two sync channels.
+    #: NSP-*.ns5 -- holds the two sync channels.
     sync_file: Path | None = None
     #: HUB-*.ns6 -- holds the Utah array spike data.
     spike_file: Path | None = None
@@ -123,7 +133,7 @@ class BlackrockSpec:
     #: Rising-edge thresholds, in the units returned by the reader (see io.blackrock).
     sync_threshold: float = 2.5
     burst_threshold: float = 2.5
-    #: Stream to read from the .ns6 file (neo/SpikeInterface stream id).
+    #: Stream to read from the .nsX file (neo/SpikeInterface stream id).
     stream_id: str | None = None
     #: Channel ids to exclude from sorting (sync / analog inputs sharing the file).
     exclude_channels: tuple[str, ...] = ()

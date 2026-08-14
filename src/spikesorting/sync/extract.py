@@ -5,8 +5,8 @@ Produces four canonical edge files in ``<output>/sync/``:
 ===================== ==============================================
 ``npx_1hz.txt``       SpikeGLX SY-word bit 6, the 1 Hz square wave
 ``npx_burst.txt``     OneBox XA1, the 14 s coded burst
-``blackrock_1hz.txt`` NSP ns6 channel 1, the same 1 Hz square wave
-``blackrock_burst.txt`` NSP ns6 channel 2, the same 14 s burst
+``blackrock_1hz.txt`` NSP ns5 channel 1, the same 1 Hz square wave
+``blackrock_burst.txt`` NSP ns5 channel 2, the same 14 s burst
 ===================== ==============================================
 
 Every file uses the CatGT convention: leading-edge times in seconds from stream

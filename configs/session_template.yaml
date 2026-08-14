@@ -20,10 +20,10 @@ skip_neuropixels: false
 output_dir: "{output_root}/{session}"
 
 blackrock:
-  # NSP-*.ns6 carries the two sync channels (see SynchronizePulse_setup.md):
+  # NSP-*.ns5 carries the two sync channels (see SynchronizePulse_setup.md):
   #   channel 1 = 1 Hz square wave from SpikeGLX SMA1
   #   channel 2 = 14 s coded burst from Blackrock DO1
-  sync_file: "{data_root}/Monkey Athos/2026-08-13/NSP-Athos_001.ns6"
+  sync_file: "{data_root}/Monkey Athos/2026-08-13/NSP-Athos_001.ns5"
   # HUB-*.ns6 carries the Utah array spike data.
   spike_file: "{data_root}/Monkey Athos/2026-08-13/HUB-Athos_001.ns6"
   sync_1hz_channel: 1
@@ -31,7 +31,7 @@ blackrock:
   # Thresholds in the units returned by the reader (volts after neo scaling).
   sync_threshold: 2.5
   burst_threshold: 2.5
-  # A .ns6 may expose several streams; pin one if read_blackrock is ambiguous.
+  # A .nsX may expose several streams; pin one if read_blackrock is ambiguous.
   stream_id: null
   # Non-neural channels to drop before sorting.
   exclude_channels: []

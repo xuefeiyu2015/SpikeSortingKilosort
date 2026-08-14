@@ -2,8 +2,8 @@
 
 Two distinct jobs, deliberately kept apart:
 
-* **Sync channels** (``NSP-*.ns6`` channels 1 and 2) are read with ``neo.rawio``
-  one channel at a time, in chunks. A full 30 kHz ``.ns6`` is far too large to
+* **Sync channels** (``NSP-*.ns5`` channels 1 and 2) are read with ``neo.rawio``
+  one channel at a time, in chunks. A full 30 kHz ``.nsX`` is far too large to
   load, and only two channels are ever needed.
 * **Spike data** (``HUB-*.ns6``) is read with SpikeInterface, which hands a
   ``BaseRecording`` straight to the preprocessing and sorting stages.
@@ -35,7 +35,7 @@ _NSX_RE = re.compile(r"\.ns(\d)$", re.IGNORECASE)
 
 
 def nsx_number(path: str | Path) -> int:
-    """``NSP-Athos_001.ns6`` -> ``6``."""
+    """``NSP-Athos_001.ns5`` -> ``5``, ``HUB-Athos_001.ns6`` -> ``6``."""
     match = _NSX_RE.search(Path(path).name)
     if not match:
         raise ValueError(f"not a Blackrock .nsX file: {path}")

@@ -9,6 +9,7 @@ Layout of the package mirrors the pipeline stages documented in ``CLAUDE.md``:
 ``sort``     Kilosort4 entry points (steps 3, 4)
 ``export``   post-curation metrics and final export (steps 7, 10)
 ``plots``    rendering only; never computes
+``doctor``   environment health check; reports what is missing, installs nothing
 
 Only ``numpy``/``scipy``/``pandas``/``yaml`` are imported at package import time.
 Heavyweight, GPU-bound dependencies (``kilosort``, ``torch``, ``spikeinterface``,

@@ -14,7 +14,7 @@ session: demo
 # runs: this recording's SY word does carry the 1 Hz square wave.
 skip_sync: true
 
-# No NSP-*.ns6 / HUB-*.ns6, so step 4 and the Blackrock half of steps 8-10 skip.
+# No NSP-*.ns5 / HUB-*.ns6, so step 4 and the Blackrock half of steps 8-10 skip.
 skip_blackrock: true
 
 output_dir: "{downloads}/spikesorting_demo"
