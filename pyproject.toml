@@ -8,25 +8,47 @@ version = "0.1.0"
 description = "Kilosort4 spike sorting pipeline for Blackrock Utah array and Neuropixels recordings, with cross-system time alignment"
 requires-python = ">=3.10"
 
-# Base dependencies only. These are enough to run the config layer, the sync
-# extraction fallback, alignment and export -- i.e. everything that must work on
-# a machine without a CUDA GPU.
+# Everything that works without a CUDA GPU, which is the line that matters: all
+# of these are pure Python and none of them depend on torch, so `pip install -e .`
+# is safe on a laptop and complete on the HPC for every stage except sorting.
+#
+# neo, probeinterface and spikeinterface live here rather than behind an extra
+# because reading a Blackrock file is not a GPU activity. Behind the `sorting`
+# extra they were unreachable without also installing kilosort -- which pulls
+# torch, and on Windows PyPI serves a CPU-only torch. Wanting to read an .ns5 on
+# a laptop should not be able to silently break CUDA sorting on the rig.
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
     "pandas>=2.0",
     "matplotlib>=3.7",
     "pyyaml>=6.0",
+    # spikeinterface already requires neo and probeinterface, so these two look
+    # redundant -- they are not. This package imports both *directly*
+    # (io/blackrock.py:51, probes/common.py:25, probes/io.py:167), and the stages
+    # that need them -- Blackrock extraction, .prb export -- do not go through
+    # spikeinterface at all. Declaring what you import is what keeps those from
+    # breaking silently if spikeinterface ever changes its reader stack.
+    #
+    # The floors track what the *oldest supported spikeinterface* itself
+    # requires, so the three cannot state a combination pip could not resolve:
+    # spikeinterface 0.101.0 requires neo>=0.13.0 and probeinterface>=0.2.23.
+    # Newer spikeinterface raises them (0.104.x wants neo>=0.14.4,
+    # probeinterface>=0.3.2) and pip resolves that from whichever version is
+    # actually installed -- these floors only bind at the bottom of the range.
+    "neo>=0.13.0",
+    "probeinterface>=0.2.23",
+    "spikeinterface>=0.101",
 ]
 
 [project.optional-dependencies]
-# Installed inside the `kilosort4` conda env on the sorting machines.
-sorting = [
-    "kilosort>=4.0",
-    "spikeinterface>=0.101",
-    "probeinterface>=0.2.21",
-    "neo>=0.13",
-]
+# The GPU half, installed inside the `kilosort4` conda env on a sorting machine.
+#
+# torch is deliberately absent here: kilosort declares it, and which build you get
+# is Kilosort's own install story -- pinning a wheel or an index URL in this file
+# would go stale and mislead. scripts/check_env.py reports whether the resulting
+# torch actually sees the GPU, which is the part this repo can usefully own.
+sorting = ["kilosort>=4.0"]
 dev = ["pytest>=7.4"]
 
 [tool.setuptools.packages.find]

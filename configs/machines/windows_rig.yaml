@@ -8,13 +8,36 @@
 # network share (Z:) that the session configs read their data from.
 cache_dir: "D:/kilosort_cache"
 
-# Folders containing runit.bat / TPrime.exe
+# Folders containing runit.bat / TPrime.exe. Both distributions nest the real
+# tools one level below the *WinApp folder -- the executables live in CatGT-win
+# and TPrime-win, not in the folder the zip unpacks to.
 catgt_dir: "C:/SpikeGLX/CommandLineTools/CatGTWinApp/CatGT-win"
-tprime_dir: "C:/SpikeGLX/CommandLineTools/TPrimeWinApp"
+tprime_dir: "C:/SpikeGLX/CommandLineTools/TPrimeWinApp/TPrime-win"
 
 # Conda envs are created here by the admin account with `conda create -p ...`, so
 # they are shared by every user but are not registered in a lab account's own
-# `conda env list`. scripts/check_env.py looks here as well as asking conda.
+# `conda env list`. This is the last resort of the three sources check_env.py
+# tries: the env it is already running in, then conda, then this directory.
 conda_envs_dir: "C:/ProgramData/anaconda3/envs"
 
+# Environments on this box, by role. Omit the block to get the conventional names
+# (sorting: kilosort4, curation: phy). Point `sorting` at another env to check or
+# switch Kilosort versions; `--sorting-env` does it for one run.
+#
+# `name` is what the env is called. `path` is optional and is the directory that
+# HOLDS the env, not the env itself -- the prefix is path/name. Given a path,
+# that is the answer: nothing else is consulted, and a prefix that is not there
+# is an error rather than an excuse to go looking for the name elsewhere.
+#
+#   sorting: kilosort4          # shorthand for {name: kilosort4}; search for it
+#   sorting:
+#     name: ks5
+#     path: "D:/envs"           # -> D:/envs/ks5, used as given
+conda_envs:
+  sorting: kilosort4
+  curation: phy
+
+# This rig runs a CUDA 12.8 torch build. Recorded as a fact about the box, not as
+# an install instruction -- torch comes in with kilosort, per Kilosort's own docs.
+# `check_env.py` reports the build actually present and whether it sees the GPU.
 device: "cuda"

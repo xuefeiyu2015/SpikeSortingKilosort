@@ -17,12 +17,36 @@ interpreter via ``subprocess`` with no shell and no ``.ps1`` involved. That also
 keeps the multi-second ``import torch`` inside a throwaway subprocess, leaving
 the lazy-import guarantee of this package intact.
 
-**A shared environment may be invisible to ``conda env list``.** That command
-reads ``~/.conda/environments.txt`` plus the *calling* user's ``envs_dirs``, so
-an env the admin account created with ``conda create -p`` is not necessarily
-registered for the lab account. Discovery therefore also stats
-``<machine.conda_envs_dir>/<name>`` directly; without that, a perfectly good
-shared env is reported as missing.
+**No single source knows about every environment.** Each role ("sorting",
+"curation") is configured as an :class:`~spikesorting.config.EnvLocation` -- a
+*name* and, optionally, a *path* to the directory holding it -- taken from
+``machine.conda_envs[role]``, or an override from the caller, falling back to the
+:class:`EnvSpec` default name.
+
+**When a path is given the prefix is ``path / name``, and nothing else is
+consulted** -- not even when that prefix turns out to be absent. Saying where the
+env lives is an instruction, and a wrong one deserves an error rather than a
+silent substitution by whatever else answers to the same name.
+
+Otherwise the name is searched for, across three sources in this order:
+
+1. ``conda info --json`` (:func:`list_conda_envs`), i.e. what ``conda activate
+   <name>`` would find.
+2. ``<machine.conda_envs_dir>/<name>``, stat'ed directly. ``conda env list`` reads
+   ``~/.conda/environments.txt`` plus the *calling* user's ``envs_dirs``, so an env
+   the admin account created with ``conda create -p`` is not necessarily registered
+   for the lab account; without this fallback a perfectly good shared env is
+   reported as missing.
+3. *the environment this interpreter is already running in* (:func:`active_env`),
+   when its name matches. Last resort, but the only source that survives a machine
+   where conda itself is unreachable -- a batch node handed ``<prefix>/bin/python``
+   directly, or a box whose conda is not on ``PATH``.
+
+Every source matches on the name: an env is never adopted merely for being active,
+so running this from ``base`` while intending to sort in ``kilosort4`` still
+reports on ``kilosort4``. Between the two settings and the three sources, a ``ks5``
+env can be checked beside a ``kilosort4`` one -- by name where conda knows it, by
+path where it does not.
 
 Computation only -- every function returns :class:`Check` values and prints
 nothing. ``scripts/check_env.py`` does the rendering.
@@ -38,9 +62,9 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
-from .config import MachineProfile, SessionConfig
+from .config import EnvLocation, MachineProfile, SessionConfig
 
 __all__ = [
     "Check",
@@ -49,10 +73,17 @@ __all__ = [
     "ENV_SPECS",
     "KILOSORT_DOCS",
     "PHY_DOCS",
+    "ORIGIN_CONFIGURED",
+    "ORIGIN_ACTIVE",
+    "ORIGIN_CONDA",
+    "ORIGIN_SHARED",
     "conda_executable",
+    "active_env",
     "list_conda_envs",
+    "env_location",
     "env_python",
     "check_conda",
+    "check_env_names",
     "resolve_env",
     "probe_env",
     "EnvReport",
@@ -74,6 +105,9 @@ __all__ = [
 # once, so upstream is the only source that stays correct.
 KILOSORT_DOCS = "https://github.com/MouseLand/Kilosort#installation"
 PHY_DOCS = "https://phy.readthedocs.io/en/latest/installation/"
+SPIKEINTERFACE_DOCS = "https://github.com/SpikeInterface/spikeinterface"
+NEO_DOCS = "https://github.com/NeuralEnsemble/python-neo"
+PROBEINTERFACE_DOCS = "https://github.com/SpikeInterface/probeinterface"
 CATGT_DOCS = "https://billkarsh.github.io/SpikeGLX/More_help/CatGT_ReadMe.html"
 TPRIME_DOCS = "https://billkarsh.github.io/SpikeGLX/help/syncEdges/Sync_edges/"
 
@@ -84,6 +118,12 @@ SECTION_TOOLS = "command-line tools"
 SECTION_SHELL = "shell"
 SECTION_PATHS = "paths"
 SECTION_SESSION = "session"
+
+#: Where an environment was found. Reported verbatim, so these read as prose.
+ORIGIN_CONFIGURED = "configured path"  # a prefix named outright in the config
+ORIGIN_ACTIVE = "active"  # the env this interpreter is running in
+ORIGIN_CONDA = "per-user"  # conda info --json
+ORIGIN_SHARED = "shared"  # machine.conda_envs_dir
 
 OK = "ok"
 MISSING = "missing"
@@ -128,17 +168,43 @@ class PackageSpec:
     distribution: str | None = None
     #: False for packages that are nice to have but block no stage.
     required: bool = True
+    #: The ``pyproject.toml`` optional-dependency group that provides this, or
+    #: None when it is a base dependency. ``pip install -e .`` installs only the
+    #: base set, so a package in an extra is missing after the obvious install
+    #: command and the report has to say which extra brings it in.
+    extra: str | None = None
+    #: False for packages this project deliberately does not declare, so no pip
+    #: command here would install them: torch (the right wheel depends on the
+    #: GPU) and phy (its own env, installed from upstream's instructions). Their
+    #: fix is a documentation link, not a command.
+    declared: bool = True
+    #: This package's *own* upstream, when pointing at the environment's docs
+    #: would misdirect -- spikeinterface is not a Kilosort question. None falls
+    #: back to :attr:`EnvSpec.docs`.
+    docs: str | None = None
 
     @property
     def dist(self) -> str:
         return self.distribution or self.module
+
+    @property
+    def install_hint(self) -> str | None:
+        """The pip command that installs this one, or None if we do not ship it."""
+        if not self.declared:
+            return None
+        target = f'".[{self.extra}]"' if self.extra else "."
+        return f"pip install --no-build-isolation -e {target}"
 
 
 @dataclass(frozen=True)
 class EnvSpec:
     """A conda environment the workflow expects, and how to set it up."""
 
-    name: str
+    #: Stable identity, and the key a machine profile configures the name under.
+    #: Unlike the name it never changes across sorter versions.
+    role: str
+    #: Name used when neither the machine profile nor the caller supplies one.
+    default_name: str
     purpose: str
     python: str
     docs: str
@@ -153,9 +219,15 @@ class EnvSpec:
     probe_torch: bool = False
 
 
+# The package lists and docs hang off the *role*, not the version: pointing
+# `sorting` at a `ks5` env still checks it for this list and still cites the
+# Kilosort docs. That stays right until a future Kilosort changes its
+# dependencies, at which point this grows a per-version branch -- inventing one
+# now would only guess.
 ENV_SPECS: tuple[EnvSpec, ...] = (
     EnvSpec(
-        name="kilosort4",
+        role="sorting",
+        default_name="kilosort4",
         purpose="sorting, Blackrock/SpikeGLX IO, alignment, export",
         python="3.11",
         docs=KILOSORT_DOCS,
@@ -188,38 +260,60 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
                 "kilosort",
                 "sort.py:95",
                 ("sort_neuropixels", "sort_blackrock"),
+                extra="sorting",
             ),
             PackageSpec(
                 "torch",
                 "sort.py:45",
                 ("sort_neuropixels", "sort_blackrock"),
+                declared=False,
             ),
             PackageSpec(
                 "spikeinterface",
                 "sort.py:173, io/blackrock.py:189, preprocess.py:33",
                 ("sort_blackrock", "preprocessing"),
+                docs=SPIKEINTERFACE_DOCS,
             ),
+            # Only io/blackrock.py reaches neo. align and validate read the edge
+            # *files* through catgt.read_edge_file and never touch it, so losing
+            # neo costs Blackrock reading, not the alignment that follows it.
             PackageSpec(
                 "neo",
                 "io/blackrock.py:51",
-                ("extract_sync (Blackrock)", "align", "validate"),
+                ("extract_sync (Blackrock)", "sort_blackrock"),
+                docs=NEO_DOCS,
             ),
+            # Checked on its own even though spikeinterface hard-requires it. The
+            # probe uses find_spec, which does not execute the module, so a
+            # spikeinterface whose probeinterface has been removed underneath it
+            # still reports present -- and this repo imports probeinterface
+            # directly anyway. Without this row the failure surfaces as a raw
+            # ModuleNotFoundError from make_probe.py, which has no ImportError
+            # handler, instead of as a line here.
             PackageSpec(
                 "probeinterface",
                 "probes/common.py:25, probes/io.py:167",
                 ("probe objects", ".prb export"),
+                docs=PROBEINTERFACE_DOCS,
             ),
-            PackageSpec("pytest", "tests/", ("test suite",), required=False),
+            PackageSpec(
+                "pytest", "tests/", ("test suite",), required=False, extra="dev"
+            ),
         ),
     ),
     EnvSpec(
-        name="phy",
+        role="curation",
+        default_name="phy",
         purpose="manual curation (step 6, not scripted)",
         python="3.12",
         docs=PHY_DOCS,
         required=False,
         disables=("curation",),
-        packages=(PackageSpec("phy", "run by hand after sorting", ("curation",)),),
+        packages=(
+            PackageSpec(
+                "phy", "run by hand after sorting", ("curation",), declared=False
+            ),
+        ),
     ),
 )
 
@@ -302,6 +396,47 @@ def conda_executable() -> str | None:
     return shutil.which("conda")
 
 
+def active_env() -> Path | None:
+    """Prefix of the conda environment this interpreter runs in, or None.
+
+    ``CONDA_PREFIX`` is what ``conda activate`` sets. ``sys.prefix`` is the
+    fallback and covers the case that matters on a batch node, where
+    ``<prefix>/bin/python`` is invoked by path and nothing was ever activated.
+
+    ``conda-meta`` is the test for "is this a conda prefix at all": ``sys.prefix``
+    is *always* set, and for a system Python it points at something like
+    ``/usr/local``, which is not an environment anyone meant.
+    """
+    declared = os.environ.get("CONDA_PREFIX")
+    candidates = [Path(declared)] if declared else []
+    candidates.append(Path(sys.prefix))
+    for candidate in candidates:
+        try:
+            if (candidate / "conda-meta").is_dir():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def env_location(
+    spec: EnvSpec,
+    machine: MachineProfile,
+    overrides: Mapping[str, EnvLocation] | None = None,
+) -> EnvLocation:
+    """Where to look for this role's env: caller > machine profile > spec default.
+
+    Name and path are resolved as one unit rather than field by field, so an
+    override always replaces a whole location. Overriding the name while silently
+    inheriting a path from the profile would send the lookup to
+    ``<profile path>/<new name>``, which is nobody's intent.
+    """
+    override = (overrides or {}).get(spec.role)
+    if override is not None:
+        return override.resolve(spec.default_name)
+    return machine.env_location(spec.role, spec.default_name)
+
+
 def list_conda_envs(conda: str | None = None) -> dict[str, Path]:
     """Map env name -> prefix as *this account's* conda sees it.
 
@@ -349,27 +484,57 @@ def env_python(prefix: Path) -> Path | None:
 
 
 def resolve_env(
-    name: str, machine: MachineProfile, envs: dict[str, Path] | None = None
-) -> tuple[Path | None, bool]:
-    """Locate an environment. Returns ``(prefix, is_shared)``.
+    location: EnvLocation,
+    machine: MachineProfile,
+    envs: dict[str, Path] | None = None,
+    active: Path | None = None,
+) -> tuple[Path | None, str]:
+    """Locate an environment. Returns ``(prefix, origin)``, origin ``ORIGIN_*``.
 
-    Conda's own answer wins when it has one, because that is what
-    ``conda activate <name>`` would resolve to. The shared directory is the
-    fallback, which is the case that matters on the rig: an env created by the
-    admin account is not in the lab account's ``conda env list``.
+    A configured ``path`` settles it: the prefix is ``path / name`` and nothing
+    else is consulted, **including when it turns out not to be there**. Saying
+    where the env lives is an instruction, so a wrong path is an error worth
+    reporting; quietly using some other env that matched by name is the outcome
+    this avoids.
+
+    Without a path the *name* is searched for, in the order the module docstring
+    gives: conda's own listing, the machine's shared directory, then the
+    environment this interpreter is running in. Every source matches on the name
+    -- an active env called something else is never adopted, because reporting on
+    the env you asked about, rather than the one you happen to be in, is what
+    makes the report mean anything.
+
+    ``envs`` and ``active`` are injectable so callers can resolve several specs
+    against one snapshot, and so tests need not touch the real machine.
     """
+    name = location.name or ""
+
+    configured = location.prefix
+    if configured is not None:
+        return (configured if configured.is_dir() else None), ORIGIN_CONFIGURED
+
     envs = list_conda_envs() if envs is None else envs
+
     prefix = envs.get(name)
-    if prefix is None and machine.conda_envs_dir is not None:
+    if prefix is not None:
+        origin = (
+            ORIGIN_SHARED
+            if machine.conda_envs_dir is not None
+            and _is_within(prefix, machine.conda_envs_dir)
+            else ORIGIN_CONDA
+        )
+        return prefix, origin
+
+    if machine.conda_envs_dir is not None:
         candidate = machine.conda_envs_dir / name
         if candidate.is_dir():
-            prefix = candidate
-    if prefix is None:
-        return None, False
-    shared = machine.conda_envs_dir is not None and _is_within(
-        prefix, machine.conda_envs_dir
-    )
-    return prefix, shared
+            return candidate, ORIGIN_SHARED
+
+    active = active_env() if active is None else active
+    if active is not None and active.name == name:
+        return active, ORIGIN_ACTIVE
+
+    return None, ORIGIN_CONDA
 
 
 def _is_within(path: Path, parent: Path) -> bool:
@@ -415,25 +580,60 @@ def probe_env(
 # ---------------------------------------------------------------------------
 
 
-def check_conda(machine: MachineProfile) -> list[Check]:
+def check_conda(machine: MachineProfile, active: Path | None = None) -> list[Check]:
     """Is conda reachable at all?
 
     Worth its own line: without it every environment would otherwise be reported
     as "not found", which points at the wrong problem. Not fatal on its own when
-    the machine declares a shared ``conda_envs_dir``, since environments there
-    are found by path and their interpreters run without conda's help.
+    another discovery source can still find environments by path and run their
+    interpreters without conda's help -- either a shared ``conda_envs_dir``, or an
+    already-active environment, which is the common case for a batch job that was
+    handed ``<prefix>/bin/python`` directly.
     """
     conda = conda_executable()
     if conda is not None:
         return [Check(name="conda", status=OK, detail=conda, section=SECTION_ENVS)]
+
+    survivable = machine.has_shared_envs or active is not None
+    detail = "not found via CONDA_EXE or PATH"
+    if active is not None:
+        detail += f"; using the active environment {active}"
     return [
         Check(
             name="conda",
-            status=WARN if machine.has_shared_envs else MISSING,
-            detail="not found via CONDA_EXE or PATH",
+            status=WARN if survivable else MISSING,
+            detail=detail,
             section=SECTION_ENVS,
-            disables=() if machine.has_shared_envs else ("all stages",),
+            disables=() if survivable else ("all stages",),
             fix="install Miniconda/Anaconda, or set CONDA_EXE",
+        )
+    ]
+
+
+def check_env_names(
+    machine: MachineProfile, overrides: Mapping[str, EnvLocation] | None = None
+) -> list[Check]:
+    """Flag ``conda_envs`` keys that name no known role.
+
+    ``config.py`` ignores keys it does not recognise, so a typo'd ``sortin:``
+    would silently leave the default name in place and surface much later as a
+    confusing "env not found". Same for an override from a caller.
+    """
+    roles = {spec.role for spec in ENV_SPECS}
+    configured = set(machine.conda_envs) | set(overrides or {})
+    unknown = sorted(configured - roles)
+    if not unknown:
+        return []
+    return [
+        Check(
+            name="conda_envs",
+            status=WARN,
+            detail=(
+                f"unknown role(s) {', '.join(unknown)} -- ignored."
+                f" Valid roles: {', '.join(sorted(roles))}"
+            ),
+            section=SECTION_ENVS,
+            fix=f"fix or remove the key in the '{machine.name}' machine profile",
         )
     ]
 
@@ -447,11 +647,20 @@ class EnvReport:
     """
 
     spec: EnvSpec
+    #: What was configured for this role, after the machine profile and any
+    #: override. Carried so that :func:`env_checks` stays pure and need not
+    #: re-resolve it.
+    location: EnvLocation = field(default_factory=EnvLocation)
     prefix: Path | None = None
-    shared: bool = False
+    origin: str = ORIGIN_CONDA
     python: Path | None = None
     #: Parsed probe JSON, or ``{"error": ...}``, or ``{}`` when never run.
     probe: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def name(self) -> str:
+        """The environment's name, as configured. Labels every check."""
+        return self.location.name or self.spec.default_name
 
     @property
     def torch_info(self) -> dict[str, Any] | None:
@@ -459,57 +668,103 @@ class EnvReport:
 
 
 def inspect_env(
-    spec: EnvSpec, machine: MachineProfile, envs: dict[str, Path] | None = None
+    spec: EnvSpec,
+    machine: MachineProfile,
+    envs: dict[str, Path] | None = None,
+    active: Path | None = None,
+    overrides: Mapping[str, EnvLocation] | None = None,
 ) -> EnvReport:
     """Resolve an environment and probe it once."""
-    prefix, shared = resolve_env(spec.name, machine, envs)
+    location = env_location(spec, machine, overrides)
+    prefix, origin = resolve_env(location, machine, envs, active)
     if prefix is None:
-        return EnvReport(spec, probe={})
+        return EnvReport(spec, location, origin=origin, probe={})
     python = env_python(prefix)
     if python is None:
-        return EnvReport(spec, prefix, shared, probe={})
+        return EnvReport(spec, location, prefix, origin, probe={})
     return EnvReport(
-        spec, prefix, shared, python, probe_env(python, spec.packages, spec.probe_torch)
+        spec,
+        location,
+        prefix,
+        origin,
+        python,
+        probe_env(python, spec.packages, spec.probe_torch),
     )
 
 
 def check_env(
-    spec: EnvSpec, machine: MachineProfile, envs: dict[str, Path] | None = None
+    spec: EnvSpec,
+    machine: MachineProfile,
+    envs: dict[str, Path] | None = None,
+    active: Path | None = None,
+    overrides: Mapping[str, EnvLocation] | None = None,
 ) -> list[Check]:
     """Health of one conda environment: the env itself, then its packages."""
-    return env_checks(inspect_env(spec, machine, envs))
+    return env_checks(inspect_env(spec, machine, envs, active, overrides))
+
+
+def _package_fix(package: PackageSpec, spec: EnvSpec, env: str) -> str:
+    """What to do about one missing package. Pure."""
+    if package.install_hint is None:
+        # Nothing here installs it; a documentation link is the whole answer.
+        return f"install {package.module} into '{env}' -- see {package.docs or spec.docs}"
+    fix = f"in '{env}': {package.install_hint}"
+    return f"{fix} -- see {package.docs}" if package.docs else fix
 
 
 def env_checks(report: EnvReport) -> list[Check]:
     """Turn an :class:`EnvReport` into findings. Pure."""
     spec = report.spec
+    name = report.name
     absent_status = MISSING if spec.required else WARN
-    provenance = "shared" if report.shared else "per-user"
+    provenance = report.origin
 
     if report.prefix is None:
+        # A configured path that is not there is a different problem from an env
+        # that could not be found, and needs a different instruction: the config
+        # is wrong, or the path moved. Saying "create the env" would misdirect.
+        if report.origin == ORIGIN_CONFIGURED:
+            # Naming both halves makes the join visible, which is what turns the
+            # likeliest mistake -- giving the env's own prefix as `path`, so the
+            # name gets appended twice -- into something self-evident on sight.
+            detail = (
+                f"no env '{name}' in the configured path"
+                f" {report.location.path} -- needed for {spec.purpose}"
+            )
+            fix = (
+                f"conda_envs.{spec.role}.path is the directory that *holds* the"
+                f" env, not the env itself; correct it, or drop it to search for"
+                f" an env named '{name}'"
+            )
+        else:
+            detail = (
+                "not found via conda env list, in the machine's conda_envs_dir,"
+                f" or as the active env -- needed for {spec.purpose}"
+            )
+            fix = (
+                f"create the '{name}' env (python {spec.python}) per {spec.docs},"
+                f" or set conda_envs.{spec.role} to the name and path you use"
+            )
         return [
             Check(
-                name=f"env:{spec.name}",
+                name=f"env:{name}",
                 status=absent_status,
-                detail=(
-                    "not found via conda env list or the machine's conda_envs_dir"
-                    f" -- needed for {spec.purpose}"
-                ),
+                detail=detail,
                 section=SECTION_ENVS,
                 disables=spec.disables,
-                fix=f"create the '{spec.name}' env (python {spec.python}) per {spec.docs}",
+                fix=fix,
             )
         ]
 
     if report.python is None:
         return [
             Check(
-                name=f"env:{spec.name}",
+                name=f"env:{name}",
                 status=absent_status,
                 detail=f"{report.prefix} ({provenance}) exists but holds no interpreter",
                 section=SECTION_ENVS,
                 disables=spec.disables,
-                fix=f"recreate the '{spec.name}' env per {spec.docs}",
+                fix=f"recreate the '{name}' env per {spec.docs}",
             )
         ]
 
@@ -517,12 +772,12 @@ def env_checks(report: EnvReport) -> list[Check]:
     if "error" in probe:
         return [
             Check(
-                name=f"env:{spec.name}",
+                name=f"env:{name}",
                 status=absent_status,
                 detail=f"{report.prefix} ({provenance}) could not be probed: {probe['error']}",
                 section=SECTION_ENVS,
                 disables=spec.disables,
-                fix=f"recreate the '{spec.name}' env per {spec.docs}",
+                fix=f"recreate the '{name}' env per {spec.docs}",
             )
         ]
 
@@ -530,7 +785,7 @@ def env_checks(report: EnvReport) -> list[Check]:
     found = probe.get("packages", {})
     checks = [
         Check(
-            name=f"env:{spec.name}",
+            name=f"env:{name}",
             status=OK,
             detail=f"{prefix} ({provenance}, python {probe.get('python', '?')})",
             section=SECTION_ENVS,
@@ -542,7 +797,7 @@ def env_checks(report: EnvReport) -> list[Check]:
             version = entry.get("version") or "version unknown"
             checks.append(
                 Check(
-                    name=f"{spec.name}/{package.module}",
+                    name=f"{name}/{package.module}",
                     status=OK,
                     detail=version,
                     section=SECTION_ENVS,
@@ -551,12 +806,17 @@ def env_checks(report: EnvReport) -> list[Check]:
         else:
             checks.append(
                 Check(
-                    name=f"{spec.name}/{package.module}",
+                    name=f"{name}/{package.module}",
                     status=MISSING if package.required else WARN,
                     detail=f"not installed (used by {package.reached_from})",
                     section=SECTION_ENVS,
                     disables=package.disables,
-                    fix=f"install into '{spec.name}' -- see {spec.docs}",
+                    # Where we ship the package the command *is* the answer, so
+                    # the link is added only when the package has an upstream of
+                    # its own -- falling back to the env's docs would tell you to
+                    # read Kilosort's install page about neo. Undeclared packages
+                    # have no command, so there a link is all there is.
+                    fix=_package_fix(package, spec, name),
                 )
             )
     return checks
@@ -827,22 +1087,23 @@ def _looks_networked(path: Path, data_root: Path | None) -> bool:
 
 
 def check_machine_paths(machine: MachineProfile) -> list[Check]:
-    """Roots and scratch declared by the machine profile."""
+    """Roots and scratch declared by the machine profile.
+
+    An unset ``data_root`` / ``output_root`` is **not** a finding. Recording paths
+    are a property of the recording, so they live in the session config, written
+    out in full; every machine profile says "do not re-add data_root here". These
+    are checked when a profile happens to set one, and passed over in silence
+    otherwise -- warning about a field the design deliberately leaves empty just
+    trains the reader to ignore the report.
+    """
     checks: list[Check] = []
     for label, path in (
         ("data_root", machine.data_root),
         ("output_root", machine.output_root),
     ):
         if path is None:
-            checks.append(
-                Check(
-                    name=label,
-                    status=WARN,
-                    detail=f"not set in machine profile '{machine.name}'",
-                    section=SECTION_PATHS,
-                )
-            )
-        elif path.exists():
+            continue
+        if path.exists():
             checks.append(
                 Check(name=label, status=OK, detail=str(path), section=SECTION_PATHS)
             )
@@ -925,15 +1186,24 @@ def check_session(config: SessionConfig) -> list[Check]:
 
 
 def run_all(
-    machine: MachineProfile, config: SessionConfig | None = None
+    machine: MachineProfile,
+    config: SessionConfig | None = None,
+    env_overrides: Mapping[str, EnvLocation] | None = None,
 ) -> list[Check]:
-    """Every check, in report order."""
+    """Every check, in report order.
+
+    ``env_overrides`` maps a role to an :class:`~spikesorting.config.EnvLocation`
+    and outranks the machine profile, so a one-off run can be pointed at another
+    env without editing it.
+    """
     envs = list_conda_envs()
-    checks: list[Check] = check_conda(machine)
+    active = active_env()
+    checks: list[Check] = check_conda(machine, active)
+    checks.extend(check_env_names(machine, env_overrides))
     torch_info: dict[str, Any] | None = None
 
     for spec in ENV_SPECS:
-        report = inspect_env(spec, machine, envs)
+        report = inspect_env(spec, machine, envs, active, env_overrides)
         checks.extend(env_checks(report))
         if spec.probe_torch and report.torch_info is not None:
             torch_info = report.torch_info

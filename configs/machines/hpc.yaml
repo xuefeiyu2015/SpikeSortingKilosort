@@ -17,4 +17,17 @@ cache_dir: "/tmp/kilosort_cache"
 catgt_dir: null
 tprime_dir: null
 
+# conda_envs_dir is unset: a batch job here usually runs <prefix>/bin/python
+# directly, and check_env.py recognises the env it is running in without help.
+#
+# Uncomment if the environments are not called kilosort4 / phy, or live somewhere
+# conda does not list. `path` is the directory holding the env, so the prefix is
+# path/name -- useful here, where a module-loaded env often sits outside any
+# registered envs dir:
+# conda_envs:
+#   sorting:
+#     name: kilosort4
+#     path: "/shared/apps/envs"     # -> /shared/apps/envs/kilosort4
+#   curation: phy
+
 device: "cuda"

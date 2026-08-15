@@ -26,6 +26,7 @@ from typing import Any
 import yaml
 
 __all__ = [
+    "EnvLocation",
     "MachineProfile",
     "BlackrockSpec",
     "NeuropixelsSpec",
@@ -68,6 +69,67 @@ def _as_path(value: Any) -> Path | None:
 
 
 @dataclass(frozen=True)
+class EnvLocation:
+    """Where a machine keeps one conda environment: a name, optionally a place.
+
+    The two are deliberately separate settings. ``name`` is what the environment
+    is called; ``path`` is the directory that *holds* it, and the prefix is
+    ``path / name`` -- so ``path`` is a per-role counterpart to
+    ``conda_envs_dir``, not the environment directory itself. With no ``path``
+    the name is searched for instead.
+    """
+
+    name: str | None = None
+    #: Directory *containing* the environment. Joined with ``name``; never the
+    #: prefix on its own.
+    path: Path | None = None
+
+    def resolve(self, default_name: str) -> "EnvLocation":
+        """This location with ``name`` filled in from the spec default."""
+        return EnvLocation(name=self.name or default_name, path=self.path)
+
+    @property
+    def prefix(self) -> Path | None:
+        """``path / name`` when a path was configured, else None."""
+        if self.path is None or not self.name:
+            return None
+        return self.path / self.name
+
+
+def _as_env_locations(value: Any) -> dict[str, EnvLocation]:
+    """Coerce a YAML ``conda_envs`` block to ``role -> EnvLocation``.
+
+    Accepts either shorthand or the full form, since naming only the name is the
+    common case::
+
+        conda_envs:
+          sorting: kilosort4
+          curation:
+            name: phy
+            path: /shared/apps/envs
+
+    Anything malformed degrades to empty or to a name-only entry rather than
+    raising, so a bad profile still loads and the problem surfaces as a check
+    instead of a traceback -- as :func:`_as_path` turns junk into ``None``.
+    """
+    if not isinstance(value, dict):
+        return {}
+    located: dict[str, EnvLocation] = {}
+    for role, entry in value.items():
+        if entry is None:
+            continue
+        if isinstance(entry, dict):
+            name = entry.get("name")
+            located[str(role)] = EnvLocation(
+                name=str(name) if name else None,
+                path=_as_path(entry.get("path")),
+            )
+        else:
+            located[str(role)] = EnvLocation(name=str(entry))
+    return located
+
+
+@dataclass(frozen=True)
 class MachineProfile:
     """Machine-local paths and settings."""
 
@@ -82,10 +144,21 @@ class MachineProfile:
     #: Directory containing the TPrime executable. None where TPrime is absent.
     tprime_dir: Path | None = None
     #: Directory holding conda environments shared between accounts on this
-    #: machine (e.g. ``C:/ProgramData/anaconda3/envs``). None where each user has
-    #: their own -- ``conda env list`` is then the only discovery source. Used by
-    #: :mod:`spikesorting.doctor`; nothing in the pipeline depends on it.
+    #: machine (e.g. ``C:/ProgramData/anaconda3/envs``). The *last* of three
+    #: discovery sources and purely a fallback: the environment this interpreter
+    #: runs in is tried first, then ``conda env list``. Leaving it None is normal
+    #: -- it is only needed where an env one account created is invisible to
+    #: another's ``conda env list``. Used by :mod:`spikesorting.doctor`; nothing
+    #: in the pipeline depends on it.
     conda_envs_dir: Path | None = None
+    #: The conda environments on this machine, keyed by *role* ("sorting",
+    #: "curation"). The role is stable; the name is not, which is the point --
+    #: ``sorting: ks5`` points the check at a different Kilosort version without
+    #: touching any code, and an optional ``path`` says where to find it instead
+    #: of searching. Absent roles fall back to the built-in defaults (kilosort4,
+    #: phy), so a machine using the conventional names needs no entry at all.
+    #: Read only by :mod:`spikesorting.doctor`, like ``conda_envs_dir``.
+    conda_envs: dict[str, EnvLocation] = field(default_factory=dict)
     #: torch device string handed to Kilosort4 ("cuda", "cuda:0", "cpu").
     device: str = "cuda"
 
@@ -99,6 +172,7 @@ class MachineProfile:
             catgt_dir=_as_path(data.get("catgt_dir")),
             tprime_dir=_as_path(data.get("tprime_dir")),
             conda_envs_dir=_as_path(data.get("conda_envs_dir")),
+            conda_envs=_as_env_locations(data.get("conda_envs")),
             device=str(data.get("device", "cuda")),
         )
 
@@ -113,6 +187,10 @@ class MachineProfile:
     @property
     def has_shared_envs(self) -> bool:
         return self.conda_envs_dir is not None
+
+    def env_location(self, role: str, default_name: str) -> EnvLocation:
+        """This machine's env for ``role``, with the name defaulted."""
+        return self.conda_envs.get(role, EnvLocation()).resolve(default_name)
 
 
 @dataclass(frozen=True)

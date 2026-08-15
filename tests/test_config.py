@@ -95,6 +95,63 @@ def test_windows_profile_has_both_tools():
     assert machine.has_catgt and machine.has_tprime
 
 
+def test_env_names_default_when_the_profile_declares_none():
+    # hpc.yaml has no conda_envs block; the defaults must survive that untouched.
+    machine = cfg.load_machine("hpc", CONFIG_DIR)
+    assert machine.conda_envs == {}
+    assert machine.env_location("sorting", "kilosort4") == cfg.EnvLocation("kilosort4")
+
+
+def test_env_names_come_from_the_profile_when_declared():
+    machine = cfg.load_machine("windows_rig", CONFIG_DIR)
+    assert machine.env_location("sorting", "kilosort4").name == "kilosort4"
+    assert machine.env_location("curation", "phy").name == "phy"
+
+
+def test_shorthand_and_full_form_mean_the_same_thing(tmp_path):
+    # Naming only the name is the common case, so `sorting: ks5` must work as a
+    # shorthand for the mapping form -- otherwise the simple case reads badly.
+    machines = tmp_path / "machines"
+    machines.mkdir()
+    (machines / "short.yaml").write_text("conda_envs:\n  sorting: ks5\n", encoding="utf-8")
+    (machines / "full.yaml").write_text(
+        "conda_envs:\n  sorting:\n    name: ks5\n", encoding="utf-8"
+    )
+
+    short = cfg.load_machine("short", tmp_path)
+    full = cfg.load_machine("full", tmp_path)
+
+    assert short.conda_envs == full.conda_envs == {"sorting": cfg.EnvLocation("ks5")}
+    assert short.conda_envs["sorting"].path is None
+
+
+def test_env_path_is_the_directory_holding_the_env(tmp_path):
+    machines = tmp_path / "machines"
+    machines.mkdir()
+    (machines / "p.yaml").write_text(
+        'conda_envs:\n  sorting:\n    name: ks5\n    path: "/shared/envs"\n',
+        encoding="utf-8",
+    )
+
+    location = cfg.load_machine("p", tmp_path).env_location("sorting", "kilosort4")
+
+    assert location.path == Path("/shared/envs")
+    assert location.prefix == Path("/shared/envs/ks5")  # joined, not used as-is
+
+
+def test_malformed_conda_envs_degrades_to_empty(tmp_path):
+    # A scalar where a mapping belongs must not crash the load: the profile still
+    # works with defaults, and doctor reports the problem instead.
+    machines = tmp_path / "machines"
+    machines.mkdir()
+    (machines / "broken.yaml").write_text("conda_envs: kilosort4\n", encoding="utf-8")
+
+    machine = cfg.load_machine("broken", tmp_path)
+
+    assert machine.conda_envs == {}
+    assert machine.env_location("sorting", "kilosort4").name == "kilosort4"
+
+
 def test_output_paths_are_derived_from_the_root(tmp_path):
     paths = cfg.OutputPaths(tmp_path / "session")
     assert paths.sync.name == "sync"

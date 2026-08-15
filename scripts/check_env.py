@@ -7,12 +7,21 @@ like ``make_probe.py``. Run it straight after cloning onto a new PC:
     python scripts/check_env.py
     python scripts/check_env.py --machine windows_rig
     python scripts/check_env.py --config configs/Athos.yaml   # also checks inputs
+    python scripts/check_env.py --sorting-env ks5             # check another env
+    python scripts/check_env.py --sorting-env ks5 --sorting-env-path /opt/envs
 
-It inspects the ``kilosort4`` and ``phy`` conda environments, the CUDA GPU, the
+It inspects the sorting and curation conda environments, the CUDA GPU, the
 CatGT/TPrime command-line tools, the PowerShell execution policy on Windows, and
 the paths the machine profile declares. Everything it finds missing is reported
 with the pipeline stages that gap disables and a pointer to the official setup
 instructions.
+
+The environments default to ``kilosort4`` and ``phy``; a machine profile sets them
+under ``conda_envs:``, and the ``--*-env`` / ``--*-env-path`` flags override that
+for one run -- which is how you check a new Kilosort version side by side with the
+one you currently sort with. The two settings are separate: a *name*, and
+optionally the *directory holding it*, whose prefix is then ``path/name``. Without
+a path the name is searched for.
 
 It installs nothing. Setting up Kilosort and phy stays a human task done from
 upstream's own docs -- they change (the right torch wheel depends on the GPU,
@@ -28,11 +37,12 @@ batch job.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 from _cli import default_machine
 
 from spikesorting import doctor
-from spikesorting.config import load_machine, load_session
+from spikesorting.config import EnvLocation, load_machine, load_session
 
 MARKERS = {doctor.OK: "[ok]", doctor.WARN: "[--]", doctor.MISSING: "[!!]"}
 
@@ -113,16 +123,50 @@ def main() -> int:
         default=None,
         help="optional session YAML; adds a check of its input files",
     )
+    # Two flags per role, generated from ENV_SPECS so a new role cannot be added
+    # without its flags appearing too. They override the machine profile for this
+    # run, and mirror the two settings in the profile: a name, and where it lives.
+    for spec in doctor.ENV_SPECS:
+        parser.add_argument(
+            f"--{spec.role}-env",
+            metavar="NAME",
+            default=None,
+            help=(
+                f"name of the conda env for {spec.purpose}"
+                f" (default: machine profile, else '{spec.default_name}')"
+            ),
+        )
+        parser.add_argument(
+            f"--{spec.role}-env-path",
+            metavar="DIR",
+            default=None,
+            help=(
+                f"directory holding that env; the prefix is DIR/NAME."
+                f" Without it the name is searched for"
+            ),
+        )
     args = parser.parse_args()
 
     machine = load_machine(args.machine)
     config = load_session(args.config, machine) if args.config else None
+    overrides = {}
+    for spec in doctor.ENV_SPECS:
+        name = getattr(args, f"{spec.role}_env")
+        path = getattr(args, f"{spec.role}_env_path")
+        if name or path:
+            # A flag-supplied name and path travel together, and a name given
+            # alone drops the profile's path -- matching env_location's rule that
+            # an override replaces a whole location rather than half of one.
+            overrides[spec.role] = EnvLocation(
+                name=name or machine.env_location(spec.role, spec.default_name).name,
+                path=Path(path).expanduser() if path else None,
+            )
 
     print(f"machine profile '{machine.name}' (device: {machine.device})")
     if config is not None:
         print(f"session '{config.session}'")
 
-    checks = doctor.run_all(machine, config)
+    checks = doctor.run_all(machine, config, overrides)
     print(render_report(checks))
     actions = render_actions(checks)
     if actions:
