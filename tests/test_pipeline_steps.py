@@ -101,3 +101,24 @@ def test_lfp_export_skips_when_the_system_did_not_record(tmp_path):
 
     assert result.status == "skipped"
     assert any("has_neuropixels_data" in note for note in result.notes)
+
+
+def test_a_missing_sorter_is_reported_as_an_environment_problem():
+    # SpikeInterface reports it as a plain Exception saying "is not installed",
+    # not an ImportError -- checking only for ImportError let it escape as a
+    # traceback instead of the note naming the env to activate.
+    from spikesorting.pipeline import _is_environment_problem, _sorting_environment_note
+
+    si_style = Exception("The sorter kilosort4 is not installed. Please install it with:")
+
+    assert _is_environment_problem(si_style)
+    assert _is_environment_problem(ImportError("No module named 'kilosort'"))
+    assert "conda activate kilosort4" in _sorting_environment_note(si_style)
+
+
+def test_a_bad_probe_is_not_mistaken_for_a_missing_environment():
+    # A map that cannot be resolved is a data problem: reporting it as "activate
+    # the sorting env" would send you to fix the wrong thing.
+    from spikesorting.pipeline import _is_environment_problem
+
+    assert not _is_environment_problem(FileNotFoundError("probe_name 'x.mat' not found at ..."))

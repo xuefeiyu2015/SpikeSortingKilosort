@@ -511,16 +511,30 @@ def test_probeinterface_is_checked_even_though_spikeinterface_requires_it():
 
 
 def test_find_spec_does_not_detect_a_broken_dependency(tmp_path, monkeypatch):
-    """The reason the row above cannot be dropped, pinned as behaviour."""
-    pkg = tmp_path / "spikeinterface"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("from probeinterface import Probe\n")
-    monkeypatch.syspath_prepend(tmp_path)
+    """The reason the row above cannot be dropped, pinned as behaviour.
 
+    Uses a package that exists nowhere rather than naming the real ones: asserting
+    that probeinterface is *absent* only held on a machine where it happened not
+    to be installed, so this test passed on a bare laptop and failed on any
+    machine actually set up to sort.
+    """
+    import importlib
     from importlib import util
 
-    assert util.find_spec("spikeinterface") is not None  # "present"
-    assert util.find_spec("probeinterface") is None  # yet its dependency is gone
+    pkg = tmp_path / "pretend_sorter"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("import pretend_sorter_backend\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(tmp_path)
+
+    # find_spec locates the package without executing it, so the missing import
+    # inside is invisible -- the package reports "present".
+    assert util.find_spec("pretend_sorter") is not None
+    assert util.find_spec("pretend_sorter_backend") is None
+
+    # It only surfaces on a real import, which is where doctor cannot afford to
+    # find out: hence a row of its own for every package this repo imports.
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("pretend_sorter")
 
 
 def test_base_dependency_hints_a_plain_editable_install():

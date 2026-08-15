@@ -92,9 +92,7 @@ def load_probe(config: SessionConfig, system: str) -> dict:
         from .probes import neuropixels as np_probes
 
         if spec.probe_name is not None:
-            from .probes.io import probe_from_mat
-
-            return probe_from_mat(Path.home() / ".kilosort" / "probes" / spec.probe_name)
+            return _probe_from_kilosort_library(spec.probe_name)
         return np_probes.probe_from_meta(_neuropixels_stream(config).meta)
 
     from .probes.utah import probe_from_cmp, utah_grid_probe
@@ -102,6 +100,35 @@ def load_probe(config: SessionConfig, system: str) -> dict:
     if spec.cmp_file is not None:
         return probe_from_cmp(spec.cmp_file, independent=True)
     return utah_grid_probe(96, independent=True)
+
+
+def _probe_from_kilosort_library(name: str) -> dict:
+    """Resolve a ``probe_name`` against Kilosort's own probe directory.
+
+    ``run_kilosort(probe_name=...)`` used to do this itself, downloading the file
+    when missing. Loading now goes through SpikeInterface, so the map has to be
+    resolved *before* Kilosort is involved -- which means on a machine that may
+    not have Kilosort at all. Say so plainly rather than failing on a guessed
+    path, and point at the setting that does not need it.
+    """
+    from .probes.io import probe_from_mat
+
+    try:
+        from kilosort.utils import PROBE_DIR  # type: ignore[import-not-found]
+
+        directory = Path(PROBE_DIR)
+    except Exception:
+        directory = Path.home() / ".kilosort" / "probes"
+
+    path = directory / name
+    if not path.exists():
+        raise FileNotFoundError(
+            f"probe_name '{name}' not found at {path}. Kilosort ships these and "
+            "downloads them on first use, so this needs the kilosort4 env. On a "
+            "machine without it, set neuropixels.probe_file to a JSON built by "
+            "scripts/make_probe.py instead."
+        )
+    return probe_from_mat(path)
 
 
 def _neuropixels_stream(config: SessionConfig, probe: int = 0) -> Any:

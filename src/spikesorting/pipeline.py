@@ -148,15 +148,25 @@ def step_lfp(config: SessionConfig, probe: int = 0, decimate: int = 1) -> StepRe
 # ----------------------------------------------------------------------------
 
 
-def _sorting_environment_note(error: ImportError) -> str:
+def _sorting_environment_note(error: Exception) -> str:
     """A missing sorter is an environment problem; say which one and how to fix it."""
     return (
-        f"cannot import the sorting stack ({error}). Sorting needs the 'kilosort4' "
+        f"cannot sort here ({error}). Sorting needs the 'kilosort4' "
         "conda environment with a CUDA build of torch:\n"
         "         conda activate kilosort4\n"
         "       Every other stage -- sync extraction, alignment, export -- runs "
         "without it."
     )
+
+
+def _is_environment_problem(error: Exception) -> bool:
+    """Is this "the machine is not set up" rather than "the data is wrong"?
+
+    SpikeInterface reports a missing sorter as a plain ``Exception`` carrying
+    "is not installed", so an ImportError check alone misses it and the stage
+    dies with a traceback instead of the note telling you which env to activate.
+    """
+    return isinstance(error, ImportError) or "not installed" in str(error)
 
 
 def step_sort_neuropixels(config: SessionConfig, probe_index: int = 0) -> StepResult:
@@ -182,9 +192,13 @@ def step_sort_neuropixels(config: SessionConfig, probe_index: int = 0) -> StepRe
         recording = load_data(config, "neuropixels", probe_index=probe_index)
         recording = preprocess(recording, config, "neuropixels")
         sorted_result = sort(recording, config, "neuropixels")
-    except ImportError as error:
+    except Exception as error:
         result.status = "failed"
-        result.note(_sorting_environment_note(error))
+        result.note(
+            _sorting_environment_note(error)
+            if _is_environment_problem(error)
+            else f"{type(error).__name__}: {error}"
+        )
         return result
     result.note(
         f"{sorted_result.n_units} units, {sorted_result.n_spikes} spikes "
@@ -217,9 +231,13 @@ def step_sort_blackrock(config: SessionConfig, probe: dict | None = None) -> Ste
         recording = load_data(config, "blackrock", probe=probe)
         recording = preprocess(recording, config, "blackrock")
         sorted_result = sort(recording, config, "blackrock")
-    except ImportError as error:
+    except Exception as error:
         result.status = "failed"
-        result.note(_sorting_environment_note(error))
+        result.note(
+            _sorting_environment_note(error)
+            if _is_environment_problem(error)
+            else f"{type(error).__name__}: {error}"
+        )
         return result
     result.note(f"{sorted_result.n_units} units -> {sorted_result.results_dir}")
     result.notes.extend(sorted_result.notes)

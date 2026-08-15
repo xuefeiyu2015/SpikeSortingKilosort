@@ -32,4 +32,13 @@ neuropixels:
   sync_bit: 6
   sync_pulse_ms: 500
 
+# Kilosort filters and common-average-references internally, which is enough for a
+# dense probe, so nothing extra is applied here. Stated rather than omitted so the
+# setting is visible: apply: true would reroute the sort through SpikeInterface and
+# cost a second copy of the recording in cache_dir.
+preprocess:
+  apply: false
+  bandpass: [300, 6000]
+  common_reference: "median"
+
 kilosort_settings: {}
