@@ -1,6 +1,8 @@
 """Drive sync-edge extraction for a session (pipeline steps 2 and 4).
 
-Produces four canonical edge files in ``<output>/sync/``:
+Produces four canonical edge files, each in the ``sync/`` directory beside the
+recording it came from -- the SpikeGLX pair under ``neuropixels_dir``, the NSP
+pair under ``blackrock_dir``:
 
 ===================== ==============================================
 ``npx_1hz.txt``       SpikeGLX SY-word bit 6, the 1 Hz square wave
@@ -42,6 +44,15 @@ NPX_1HZ = "npx_1hz"
 NPX_BURST = "npx_burst"
 BR_1HZ = "blackrock_1hz"
 BR_BURST = "blackrock_burst"
+
+#: Which system's ``sync/`` each edge file lives in. Stated rather than inferred
+#: from the name prefix, so a reader never has to guess where to look.
+EDGE_SYSTEM = {
+    NPX_1HZ: "neuropixels",
+    NPX_BURST: "neuropixels",
+    BR_1HZ: "blackrock",
+    BR_BURST: "blackrock",
+}
 
 
 @dataclass(frozen=True)
@@ -157,7 +168,7 @@ def _run_catgt_extraction(
         gate=npx.gate,
         trigger=npx.trigger,
         probes=(probe,),
-        dest=config.paths.sync / "catgt",
+        dest=config.paths.sync_for("neuropixels") / "catgt",
     )
     report.catgt_commands.append("runit " + " ".join(args))
 
@@ -169,7 +180,7 @@ def _run_catgt_extraction(
         return {}
 
     catgt.run_catgt(machine.catgt_dir, args)
-    produced = catgt.find_edge_files(config.paths.sync / "catgt")
+    produced = catgt.find_edge_files(config.paths.sync_for("neuropixels") / "catgt")
 
     result: dict[str, np.ndarray] = {}
     for spec in specs:
@@ -196,7 +207,7 @@ def extract_neuropixels_edges(
     and writes the canonical edge files.
     """
     report = ExtractionReport()
-    sync_dir = config.paths.sync
+    sync_dir = config.paths.sync_for("neuropixels")
     sync_dir.mkdir(parents=True, exist_ok=True)
 
     catgt_times = _run_catgt_extraction(config, report, probe)
@@ -274,7 +285,7 @@ def extract_blackrock_edges(
         report.note("Blackrock extraction skipped: no blackrock.sync_file configured.")
         return report
 
-    sync_dir = config.paths.sync
+    sync_dir = config.paths.sync_for("blackrock")
     sync_dir.mkdir(parents=True, exist_ok=True)
     reader = blackrock.open_reader(spec.sync_file)
 
@@ -349,11 +360,15 @@ def _finalize(
 
 
 def extract_session_edges(config: SessionConfig, probe: int = 0) -> ExtractionReport:
-    """Run both systems' extraction, honouring the session's skip flags."""
+    """Run both systems' extraction, for whichever systems have data.
+
+    Gated on ``has_*_data`` rather than on sorting: pulses and LFP are read from
+    the same recordings whether or not those recordings get sorted.
+    """
     report = ExtractionReport()
 
-    if config.skip_neuropixels:
-        report.note("Neuropixels extraction skipped (skip_neuropixels).")
+    if not config.has_neuropixels_data:
+        report.note("Neuropixels extraction skipped (has_neuropixels_data is false).")
     else:
         npx_report = extract_neuropixels_edges(config, probe)
         report.edge_sets.update(npx_report.edge_sets)
@@ -361,8 +376,8 @@ def extract_session_edges(config: SessionConfig, probe: int = 0) -> ExtractionRe
         report.notes.extend(npx_report.notes)
         report.catgt_commands.extend(npx_report.catgt_commands)
 
-    if config.skip_blackrock:
-        report.note("Blackrock extraction skipped (skip_blackrock).")
+    if not config.has_blackrock_data:
+        report.note("Blackrock extraction skipped (has_blackrock_data is false).")
     else:
         br_report = extract_blackrock_edges(config)
         report.edge_sets.update(br_report.edge_sets)

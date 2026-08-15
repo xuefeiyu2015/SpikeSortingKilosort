@@ -17,7 +17,7 @@ SRC = REPO_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from spikesorting.config import SessionConfig, load_session  # noqa: E402
+from spikesorting.config import SessionConfig, load_session_config  # noqa: E402
 from spikesorting.pipeline import StepResult  # noqa: E402
 
 
@@ -58,12 +58,16 @@ def build_parser(description: str) -> argparse.ArgumentParser:
 
 def load(args: argparse.Namespace, require_inputs: bool = True) -> SessionConfig:
     """Load the session config and create its output folders."""
-    config = load_session(args.config, args.machine)
+    config = load_session_config(args.config, args.machine)
     config.paths.mkdirs()
     if require_inputs and not getattr(args, "skip_checks", False):
         config.require_inputs()
     print(f"session '{config.session}' on machine '{config.machine.name}'")
-    print(f"  outputs: {config.output_root}")
+    # Each system writes beside its own recording, so there are up to two trees.
+    for system in ("blackrock", "neuropixels"):
+        directory = config.paths.dir_for(system)
+        if directory is not None:
+            print(f"  {system}: {directory}")
     return config
 
 

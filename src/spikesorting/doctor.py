@@ -1163,18 +1163,15 @@ def check_machine_paths(machine: MachineProfile) -> list[Check]:
 
 
 def check_session(config: SessionConfig) -> list[Check]:
-    """Session input files, delegated to the existing validator."""
+    """Session input files, delegated to the existing validator, plus geometry.
+
+    A Utah array with no channel map still sorts -- on a placeholder 10x10 grid
+    in channel order, which is almost certainly not how the array is wired. That
+    is a warning rather than a failure, but it must not be silent: units would be
+    attributed to the wrong electrodes and nothing downstream could tell.
+    """
     problems = config.missing_inputs()
-    if not problems:
-        return [
-            Check(
-                name=f"session:{config.session}",
-                status=OK,
-                detail="all declared inputs present",
-                section=SECTION_SESSION,
-            )
-        ]
-    return [
+    checks = [
         Check(
             name=f"session:{config.session}",
             status=MISSING,
@@ -1183,6 +1180,36 @@ def check_session(config: SessionConfig) -> list[Check]:
         )
         for problem in problems
     ]
+    if not problems:
+        checks.append(
+            Check(
+                name=f"session:{config.session}",
+                status=OK,
+                detail="all declared inputs present",
+                section=SECTION_SESSION,
+            )
+        )
+
+    brk = config.blackrock
+    if config.sorts_blackrock and brk.probe_file is None and brk.cmp_file is None:
+        checks.append(
+            Check(
+                name=f"session:{config.session}:probe",
+                status=WARN,
+                detail=(
+                    "no blackrock.probe_file or cmp_file: sorting will use a "
+                    "PLACEHOLDER 10x10 grid in channel order, so units will be "
+                    "attributed to the wrong electrodes"
+                ),
+                fix=(
+                    "python scripts/make_probe.py utah --cmp array.cmp "
+                    "--out configs/probes/utah_<array>.json --plot, then set "
+                    "blackrock.probe_file to it"
+                ),
+                section=SECTION_SESSION,
+            )
+        )
+    return checks
 
 
 def run_all(

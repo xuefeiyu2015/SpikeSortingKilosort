@@ -1,13 +1,13 @@
 # Demo session -- an ordinary session config that happens to point at the
 # official Kilosort4 example recording.
 #
-# Nothing about it is special-cased in the code: it names a binary and sets the
-# skip flags for the stages that need data it does not have.
+# Nothing about it is special-cased in the code: it names a binary and declares
+# which systems recorded, which is what turns off the stages it has no data for.
 #
 # Fetch the file once (separate from the pipeline, not a pipeline stage):
 #   python scripts/fetch_demo_data.py --dest ~/ephys/demo_data
 # Then:
-#   python scripts/run_pipeline.py --config configs/demo.yaml
+#   python run_sorting_pipeline.py --config configs/demo.yaml
 session: demo
 
 # No second system to align to, so steps 8-9 are skipped. Sync *extraction* still
@@ -15,12 +15,15 @@ session: demo
 skip_sync: true
 
 # No NSP-*.ns5 / HUB-*.ns6, so step 4 and the Blackrock half of steps 8-10 skip.
-skip_blackrock: true
+has_blackrock_data: false
 
-output_dir: "~/ephys/sorted/demo"
+# This recording has no monkey/date structure to build a path from, so its
+# directory is stated outright instead of coming from a root. Everything the
+# demo produces lands beside the binary: neuropixels/kilosort4/, sync/, lfp/.
+neuropixels_dir: "~/ephys/demo_data"
 
 neuropixels:
-  bin_file: "~/ephys/demo_data/ZFM-02370_mini.imec0.ap.short.bin"
+  bin_file: "{neuropixels_dir}/ZFM-02370_mini.imec0.ap.short.bin"
   # This download is a bare .bin with no .meta beside it, so the channel count
   # and rate have to be stated here. 384 AP channels + 1 SY word.
   n_chan_bin: 385

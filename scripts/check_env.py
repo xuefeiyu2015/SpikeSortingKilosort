@@ -42,7 +42,7 @@ from pathlib import Path
 from _cli import default_machine
 
 from spikesorting import doctor
-from spikesorting.config import EnvLocation, load_machine, load_session
+from spikesorting.config import EnvLocation, load_machine, load_session_config
 
 MARKERS = {doctor.OK: "[ok]", doctor.WARN: "[--]", doctor.MISSING: "[!!]"}
 
@@ -148,7 +148,7 @@ def main() -> int:
     args = parser.parse_args()
 
     machine = load_machine(args.machine)
-    config = load_session(args.config, machine) if args.config else None
+    config = load_session_config(args.config, machine) if args.config else None
     overrides = {}
     for spec in doctor.ENV_SPECS:
         name = getattr(args, f"{spec.role}_env")

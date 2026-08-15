@@ -1,16 +1,12 @@
-"""Kilosort4 entry points (pipeline steps 3 and 4).
+"""Running Kilosort4 (pipeline steps 3 and 4).
 
-Two routes, because the two systems arrive in different shapes:
+One route for both systems. They arrive as SpikeInterface recordings with their
+probes already attached -- see :func:`spikesorting.api.load_data` -- so nothing
+here needs to know which system produced the samples.
 
-* **Neuropixels** is already a flat int16 binary, so it goes straight into
-  ``kilosort.run_kilosort``.
-* **Blackrock** is read through SpikeInterface (which handles the ``.nsX``
-  container and any preprocessing), then handed to Kilosort via
-  ``spikeinterface.sorters.run_sorter``.
-
-Both run inside the machine's SSD cache and copy their results out afterwards.
-Kilosort writes a whitened copy of the whole recording next to its results; on a
-network share that is both slow and rude to everyone else on the share.
+Sorting runs inside the machine's SSD cache and the results are copied out
+afterwards. Kilosort writes a whitened copy of the whole recording next to its
+results; on a network share that is both slow and rude to everyone else on it.
 """
 
 from __future__ import annotations
@@ -25,7 +21,7 @@ import numpy as np
 
 from .config import SessionConfig
 
-__all__ = ["SortResult", "sort_neuropixels", "sort_blackrock", "summarize_results"]
+__all__ = ["SortResult", "sort_recording", "summarize_results"]
 
 
 @dataclass
@@ -41,10 +37,19 @@ class SortResult:
     notes: list[str] = field(default_factory=list)
 
 
-def _torch_device(name: str) -> Any:
-    import torch  # lazy
+def _lift(root: Path, subdir: str) -> None:
+    """Move ``root/subdir``'s contents up into ``root`` and drop the husk.
 
-    return torch.device(name)
+    The in-place counterpart of publishing a subdirectory, for the no-cache
+    fallback: both branches must leave the same tree behind, or a machine
+    without a ``cache_dir`` would quietly produce a layout nothing can read.
+    """
+    source = root / subdir
+    if not source.is_dir():
+        raise FileNotFoundError(f"expected sorter output at {source}")
+    for item in source.iterdir():
+        shutil.move(str(item), str(root / item.name))
+    shutil.rmtree(root / Path(subdir).parts[0], ignore_errors=True)
 
 
 def _run_in_cache(
@@ -53,18 +58,27 @@ def _run_in_cache(
     tag: str,
     body: Callable[[Path], Any],
     keep_dat: bool = False,
+    publish_from: str | None = None,
 ) -> tuple[Any, Path]:
     """Run ``body(work_dir)`` on fast local storage, then publish the results.
 
     Returns ``(body_result, work_dir)``. The cache is deleted afterwards, which is
     the "released after kilosort4 is done" behaviour the path setup calls for.
     Falls back to sorting in place when the machine has no cache configured.
+
+    ``publish_from`` names a subdirectory of the work dir to publish *as*
+    ``final_dir``, for writers that nest their output. SpikeInterface is the one
+    that does: it puts Kilosort's own files under ``<folder>/sorter_output/``,
+    two levels below where every consumer looks for ``spike_times.npy``.
     """
     final_dir = Path(final_dir)
     final_dir.mkdir(parents=True, exist_ok=True)
 
     if cache_dir is None:
-        return body(final_dir), final_dir
+        result = body(final_dir)
+        if publish_from:
+            _lift(final_dir, publish_from)
+        return result, final_dir
 
     work_dir = Path(cache_dir) / tag
     if work_dir.exists():
@@ -74,132 +88,41 @@ def _run_in_cache(
     try:
         result = body(work_dir)
         ignore = None if keep_dat else shutil.ignore_patterns("*.dat")
-        shutil.copytree(work_dir, final_dir, dirs_exist_ok=True, ignore=ignore)
+        source = work_dir / publish_from if publish_from else work_dir
+        if not source.is_dir():
+            raise FileNotFoundError(f"expected sorter output at {source}")
+        shutil.copytree(source, final_dir, dirs_exist_ok=True, ignore=ignore)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
     return result, work_dir
 
 
-def sort_neuropixels(
+def sort_recording(
     config: SessionConfig,
-    probe: dict | None = None,
-    probe_index: int = 0,
+    system: str,
+    recording: Any,
     results_dir: Path | None = None,
 ) -> SortResult:
-    """Sort the Neuropixels AP binary with Kilosort4.
+    """Sort an already-loaded, already-preprocessed recording. One path, both systems.
 
-    ``probe`` overrides the channel map; otherwise the session's ``probe_name``
-    is used, or the map is built from the run's ``.meta``.
+    This is what :func:`spikesorting.api.sort` calls. The recording arrives with
+    its probe attached, so nothing here needs to know which system produced it --
+    which is the whole point of loading both through SpikeInterface.
+
+    SpikeInterface writes Kilosort's output under ``<folder>/sorter_output/``, so
+    only that subdirectory is published: the result is a plain Kilosort/Phy
+    directory holding ``spike_times.npy``, which is what every consumer expects.
+    Sorting into a subdirectory of the work dir rather than the work dir itself is
+    deliberate -- ``remove_existing_folder`` would otherwise wipe it, and in the
+    no-cache fallback that directory *is* the final one.
     """
-    from kilosort import run_kilosort  # lazy: pulls in torch
+    import spikeinterface.sorters as ss
 
-    from .io import spikeglx
-    from .probes import neuropixels as np_probes
+    final_dir = Path(results_dir) if results_dir else config.paths.sorted_for(system)
 
-    npx = config.neuropixels
-
-    if npx.bin_file is not None:
-        info = spikeglx.stream_info(npx.bin_file, npx.n_chan_bin, npx.sample_rate)
-    else:
-        files = spikeglx.find_run_files(
-            npx.run_dir, npx.run_name, npx.gate, npx.trigger, probe_index
-        )
-        if files["ap"] is None:
-            raise FileNotFoundError(
-                f"no AP binary found for run {npx.run_name} g{npx.gate} imec{probe_index}"
-            )
-        info = spikeglx.stream_info(files["ap"])
-
-    probe_name = npx.probe_name
-    if probe is None and probe_name is None:
-        probe = np_probes.probe_from_meta(info.meta)
-
-    settings: dict[str, Any] = {
-        "filename": str(info.path),
-        "n_chan_bin": info.n_chan,
-        "fs": info.fs,
-    }
-    settings.update(config.kilosort_settings)
-
-    final_dir = Path(results_dir) if results_dir else config.paths.sorted_np
-    save_preprocessed = bool(settings.pop("save_preprocessed_copy", False))
-
-    def body(work_dir: Path) -> Any:
-        kwargs: dict[str, Any] = {
-            "settings": settings,
-            "results_dir": str(work_dir),
-            "device": _torch_device(config.machine.device),
-            "save_preprocessed_copy": save_preprocessed,
-        }
-        # run_kilosort accepts a probe dict OR a probe file name, never both.
-        if probe is not None:
-            kwargs["probe"] = probe
-        else:
-            kwargs["probe_name"] = probe_name
-        return run_kilosort(**kwargs)
-
-    outputs, work_dir = _run_in_cache(
-        final_dir,
-        config.cache_dir,
-        f"{config.session}_kilosort4_np",
-        body,
-        keep_dat=save_preprocessed,
-    )
-
-    st, clu = outputs[1], outputs[2]
-    result = SortResult(
-        results_dir=final_dir,
-        n_units=int(np.unique(clu).size) if clu is not None else None,
-        n_spikes=int(np.asarray(st).size) if st is not None else None,
-        fs=info.fs,
-        work_dir=work_dir,
-        probe={"source": "dict" if probe is not None else f"probe_name={probe_name}"},
-    )
-    _write_run_info(final_dir, config, result, stream=str(info.path))
-    return result
-
-
-def sort_blackrock(
-    config: SessionConfig,
-    probe: dict | None = None,
-    results_dir: Path | None = None,
-) -> SortResult:
-    """Sort the Utah array file with Kilosort4 through SpikeInterface.
-
-    A probe with real geometry must be attached before sorting -- see the warning
-    in :mod:`spikesorting.probes.utah` about placeholder maps.
-    """
-    import spikeinterface.sorters as ss  # lazy
-
-    from .io import blackrock
-    from .preprocess import describe_preprocessing, preprocess_recording
-    from .probes.common import probe_summary, to_probeinterface
-
-    spec = config.blackrock
-    if spec.spike_file is None:
-        raise ValueError("blackrock.spike_file is required to sort Blackrock data")
-
-    recording = blackrock.read_recording(
-        spec.spike_file, stream_id=spec.stream_id, exclude_channels=spec.exclude_channels
-    )
-
-    notes: list[str] = []
-    if probe is not None:
-        if probe.get("_placeholder"):
-            notes.append(
-                "PLACEHOLDER Utah geometry in use -- channel positions are a guess. "
-                "Supply the array's .cmp map before interpreting these results spatially."
-            )
-        recording = recording.set_probe(to_probeinterface(probe))
-
-    pre = describe_preprocessing(config.preprocess)
-    if pre.pop("apply", False):
-        recording, pre_info = preprocess_recording(recording, **pre)
-        notes.append(f"preprocessing applied: {pre_info}")
-
-    final_dir = Path(results_dir) if results_dir else config.paths.sorted_br
-    sorter_params = dict(config.kilosort_settings)
+    params = {"device": config.machine.device}
+    params.update(config.kilosort_settings)
 
     def body(work_dir: Path) -> Any:
         return ss.run_sorter(
@@ -207,23 +130,27 @@ def sort_blackrock(
             recording,
             folder=str(work_dir / "kilosort4"),
             remove_existing_folder=True,
-            **sorter_params,
+            **params,
         )
 
     sorting, work_dir = _run_in_cache(
-        final_dir, config.cache_dir, f"{config.session}_kilosort4_br", body
+        final_dir,
+        config.cache_dir,
+        f"{config.session}_kilosort4_{system}",
+        body,
+        publish_from="kilosort4/sorter_output",
     )
 
+    probe = recording.get_probe() if hasattr(recording, "get_probe") else None
     result = SortResult(
         results_dir=final_dir,
         n_units=int(len(sorting.unit_ids)) if sorting is not None else None,
         n_spikes=None,
         fs=float(recording.get_sampling_frequency()),
         work_dir=work_dir,
-        probe=probe_summary(probe) if probe else {},
-        notes=notes,
+        probe={"n_contacts": int(probe.get_contact_count())} if probe is not None else {},
     )
-    _write_run_info(final_dir, config, result, stream=str(spec.spike_file))
+    _write_run_info(final_dir, config, result, stream=system)
     return result
 
 

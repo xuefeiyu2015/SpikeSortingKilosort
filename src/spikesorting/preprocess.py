@@ -7,8 +7,27 @@ nothing.
 
 Kilosort4 already high-pass filters and (by default) common-average-references
 internally. Applying both here and there is not harmful but is wasted work, so
-``apply: false`` in the session config is a reasonable default for Neuropixels;
-Blackrock Utah data more often benefits from an explicit median reference.
+``apply: false`` is a reasonable default for Neuropixels; Blackrock Utah data more
+often benefits from an explicit median reference. Because the right answer differs
+per system, each declares its own block:
+
+.. code-block:: yaml
+
+    preprocess:                 # shared default for both
+      bandpass: [300, 6000]
+    neuropixels:
+      preprocess: {apply: false}
+    blackrock:
+      preprocess: {apply: true, common_reference: median}
+
+A system's block is merged *over* the shared one key by key, so overriding one
+setting does not discard the rest. :meth:`SessionConfig.preprocess_for` resolves it.
+
+Requesting preprocessing is always honoured. On the Blackrock route that is free
+-- it already goes through SpikeInterface. On Neuropixels it switches the sort off
+the direct ``run_kilosort(filename=...)`` path, which cannot preprocess because
+Kilosort opens the file itself, onto the SpikeInterface path; that costs a second
+copy of the recording in the cache. Leaving ``apply: false`` keeps the fast route.
 """
 
 from __future__ import annotations
@@ -60,6 +79,29 @@ def preprocess_recording(
     return result, info
 
 
+#: What SpikeInterface's ``common_reference`` accepts, plus the spelling people
+#: actually use. "mean subtraction" and "common average reference" are the same
+#: operation; SpikeInterface only answers to ``"average"``.
+_REFERENCE_OPERATORS = {"median": "median", "average": "average", "mean": "average"}
+
+
+def _reference_operator(value: Any) -> str | None:
+    """Normalise ``common_reference``. ``None`` means do not reference at all.
+
+    Validated here rather than left to SpikeInterface so a typo fails at config
+    load, not inside ``run_sorter`` after the recording has been copied to cache.
+    """
+    if value is None:
+        return None
+    key = str(value).strip().lower()
+    if key not in _REFERENCE_OPERATORS:
+        raise ValueError(
+            f"common_reference must be 'median', 'average' (a.k.a. 'mean') or null, "
+            f"got {value!r}"
+        )
+    return _REFERENCE_OPERATORS[key]
+
+
 def describe_preprocessing(settings: dict[str, Any]) -> dict[str, Any]:
     """Normalise the ``preprocess:`` block of a session config into kwargs.
 
@@ -71,7 +113,7 @@ def describe_preprocessing(settings: dict[str, Any]) -> dict[str, Any]:
     return {
         "apply": True,
         "bandpass": tuple(float(x) for x in bandpass) if bandpass else None,
-        "common_reference": settings.get("common_reference"),
+        "common_reference": _reference_operator(settings.get("common_reference")),
         "detect_bad_channels": bool(settings.get("detect_bad_channels", False)),
         "dtype": settings.get("dtype"),
     }

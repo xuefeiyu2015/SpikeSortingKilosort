@@ -3,10 +3,10 @@
 
 Run after curating in Phy. Writes ``units.csv``, aligned spike times, mean
 waveforms and ISI histograms, plus per-unit summary figures under
-``<output>/figures/``.
+``<blackrock_dir>/figures/`` (the Neuropixels dir for a single-system session).
 
 Picks up aligned spike times automatically when
-``<output>/aligned/<system>_spike_seconds_blackrock.npy`` exists, and reports
+``<blackrock_dir>/aligned/<system>_spike_seconds_blackrock.npy`` exists, and reports
 which timebase it exported in either way.
 
     python scripts/04_export_curated.py --config configs/demo.yaml

@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """Pipeline steps 2 and 4: extract sync-pulse rising edges from both systems.
 
-Writes ``<output>/sync/{npx_1hz,npx_burst,blackrock_1hz,blackrock_burst}.txt``,
+Writes ``<neuropixels_dir>/sync/{npx_1hz,npx_burst}.txt`` and
+``<blackrock_dir>/sync/{blackrock_1hz,blackrock_burst}.txt``,
 each one leading-edge time in seconds per line -- the format CatGT produces and
 TPrime consumes.
 
@@ -18,7 +19,7 @@ from __future__ import annotations
 
 from _cli import build_parser, load, report
 
-from spikesorting.pipeline import step_extract_sync
+from spikesorting.pipeline import step_extract_sync, step_lfp
 
 
 def main() -> int:
@@ -26,10 +27,15 @@ def main() -> int:
     parser.add_argument(
         "--lfp",
         action="store_true",
-        help="also export the Neuropixels LF band to <output>/lfp/",
+        help="also export the Neuropixels LF band to <neuropixels_dir>/lfp/ "
+        "(same as run_sorting_pipeline.py --steps lfp)",
     )
     parser.add_argument(
-        "--lfp-decimate", type=int, default=1, help="decimation factor for the LFP export"
+        "--lfp-decimate",
+        type=int,
+        default=1,
+        help="decimation for the LFP export. The LF band is hardware-limited to "
+        "~500 Hz at 2500 Hz sampling, so 2 is safe; higher aliases",
     )
     args = parser.parse_args()
     config = load(args)
@@ -38,26 +44,9 @@ def main() -> int:
     code = report(result)
 
     if args.lfp:
-        code = max(code, _export_lfp(config, args))
+        # Same stage run_sorting_pipeline.py drives, so they cannot drift.
+        code = max(code, report(step_lfp(config, probe=args.probe, decimate=args.lfp_decimate)))
     return code
-
-
-def _export_lfp(config, args) -> int:
-    from spikesorting.io import spikeglx
-
-    npx = config.neuropixels
-    if npx.run_dir is None or not npx.run_name:
-        print("[--] lfp_export\n       session has no SpikeGLX run; nothing to export")
-        return 0
-
-    files = spikeglx.find_run_files(npx.run_dir, npx.run_name, npx.gate, npx.trigger, args.probe)
-    if files["lf"] is None:
-        print("[--] lfp_export\n       no .lf.bin stream in this run")
-        return 0
-
-    path = spikeglx.export_lfp(files["lf"], config.paths.lfp, decimate=args.lfp_decimate)
-    print(f"[ok] lfp_export\n       {path}")
-    return 0
 
 
 if __name__ == "__main__":

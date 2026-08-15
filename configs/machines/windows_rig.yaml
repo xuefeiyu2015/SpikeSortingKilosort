@@ -31,8 +31,8 @@ conda_envs_dir: "C:/ProgramData/anaconda3/envs"
 #
 #   sorting: kilosort4          # shorthand for {name: kilosort4}; search for it
 #   sorting:
-#     name: ks5
-#     path: "D:/envs"           # -> D:/envs/ks5, used as given
+#     name: ks4
+#     path: "D:/envs"           # -> D:/envs/ks4, used as given
 conda_envs:
   sorting: kilosort4
   curation: phy

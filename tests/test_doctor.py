@@ -883,3 +883,31 @@ def test_importing_doctor_pulls_in_nothing_heavy():
 
     for module in ("torch", "kilosort", "spikeinterface"):
         assert module not in sys.modules
+
+
+def test_a_utah_session_with_no_channel_map_is_warned_about(tmp_path):
+    # The silent-wrong-geometry hole: the pipeline used to sort Blackrock with a
+    # placeholder grid and say nothing. It must still sort, so this warns rather
+    # than blocks -- but it must not be silent.
+    from spikesorting import config as cfg
+    from spikesorting import doctor
+
+    machines = tmp_path / "machines"
+    machines.mkdir(parents=True, exist_ok=True)
+    (machines / "m.yaml").write_text(f"cache_dir: '{tmp_path / 'c'}'\n", encoding="utf-8")
+    spike = tmp_path / "HUB.ns6"
+    spike.write_bytes(b"")
+    sync = tmp_path / "NSP.ns5"
+    sync.write_bytes(b"")
+    (tmp_path / "s.yaml").write_text(
+        f"session: s\nblackrock_dir: '{tmp_path}'\nhas_neuropixels_data: false\n"
+        f"blackrock:\n  sync_file: '{sync}'\n  spike_file: '{spike}'\n",
+        encoding="utf-8",
+    )
+
+    session = cfg.load_session_config(tmp_path / "s.yaml", "m", tmp_path)
+    checks = doctor.check_session(session)
+
+    warned = [c for c in checks if c.status == doctor.WARN and "probe" in c.detail.lower()]
+    assert warned, [(c.status, c.detail) for c in checks]
+    assert "placeholder" in warned[0].detail.lower()

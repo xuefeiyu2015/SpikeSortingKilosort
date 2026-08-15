@@ -54,7 +54,7 @@ def make_session(tmp_path, bin_file, **overrides):
     session_path = tmp_path / "configs" / "synthetic.yaml"
     session_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    session = cfg.load_session(session_path, "test", tmp_path / "configs")
+    session = cfg.load_session_config(session_path, "test", tmp_path / "configs")
     session.paths.mkdirs()
     return session
 
@@ -110,7 +110,7 @@ def test_extract_records_the_catgt_command_it_would_have_run(tmp_path):
         f"neuropixels:\n  run_dir: '{run_dir}'\n  run_name: run\n  gate: 0\n  trigger: 0\n",
         encoding="utf-8",
     )
-    session = cfg.load_session(session_path, "test", tmp_path / "configs")
+    session = cfg.load_session_config(session_path, "test", tmp_path / "configs")
     session.paths.mkdirs()
 
     report = extract.extract_neuropixels_edges(session)
@@ -128,7 +128,7 @@ def test_step_extract_sync_honours_skip_blackrock(tmp_path):
     result = step_extract_sync(session)
     assert result.ok
     assert any("Blackrock extraction skipped" in note for note in result.notes)
-    assert (session.paths.sync / "npx_1hz.txt").exists()
+    assert (session.paths.sync_for("neuropixels") / "npx_1hz.txt").exists()
 
 
 def test_alignment_recovers_a_known_offset_and_drift(tmp_path):

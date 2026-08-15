@@ -1,33 +1,70 @@
 # Template for a real recording session. Copy to configs/<session>.yaml and edit.
 # Copies are gitignored; this template is tracked.
 #
-#   python scripts/run_pipeline.py --config configs/Athos_2026_08_13.yaml \
+#   python run_sorting_pipeline.py --config configs/Athos_2026_08_13.yaml \
 #          --machine windows_rig
 #
-# Write every data path out in full. configs/machines/<machine>.yaml carries only
-# system facts (scratch disk, tool locations, device) and supplies no roots, so
-# {data_root} and {output_root} no longer expand -- a leftover one resolves to ""
-# silently rather than raising, turning "{data_root}/x" into "/x". output_dir is
-# therefore required. {session} still expands, to the `session:` value below.
+# Data paths live here, never in the machine profile: configs/machines/<machine>.yaml
+# carries only system facts (scratch disk, tool locations, device).
+#
+# A placeholder that names nothing raises on load rather than resolving to "" --
+# so a typo, or a {data_root} left over from the old two-layer config, fails
+# immediately instead of quietly producing "/Monkey Athos/...".
 
-session: Athos_2026_08_13
+monkey: "Monkey Athos"
+session: "2026-08-13"
 
-# Steps 8-9 (cross-system alignment) need both systems. Set skip_sync: true for
-# a single-system session; set skip_blackrock / skip_neuropixels when only one
-# system recorded.
+# Roots stop at the share. Each system's directory is built as
+# <root>/<monkey>/<session> and exposed as {blackrock_dir} / {neuropixels_dir}.
+# The two are separate because the systems are recorded by different machines and
+# need not land on the same share -- point them at the same place when they do.
+#
+# For a recording that predates this convention, skip roots entirely and state
+# `blackrock_dir:` / `neuropixels_dir:` outright.
+roots:
+  blackrock: "Z:/jeurissenlab.cns.nyu.edu/server"
+  neuropixels: "Z:/jeurissenlab.cns.nyu.edu/server"
+
+# {monkey}, {session}, {cache} and {downloads} are always available, and may be
+# used inside a root.
+
+# Names the directory below neuropixels/ and blackrock/ that results go into, so
+# re-sorting with another version writes beside this run instead of over it.
+sorter: kilosort4
+
+# Two independent questions per system.
+#
+# has_*_data      did this system record at all? False means its files are not
+#                 checked and none of its stages run -- not sync, not LFP.
+# kilosort_on_*   should its spike data be sorted? False with has_*_data true is
+#                 the "extract the LFP and the sync pulses, but do not sort"
+#                 case. Absent data always wins: has_*_data false forces the
+#                 matching kilosort_on_* to false whatever it says here.
+has_neuropixels_data: true
+has_blackrock_data: true
+kilosort_on_neuropixels: true
+kilosort_on_blackrock: true
+
+# Steps 8-9 (cross-system alignment) need both systems recording. Set true for a
+# single-system session.
 skip_sync: false
-skip_blackrock: false
-skip_neuropixels: false
 
-output_dir: "Z:/jeurissenlab.cns.nyu.edu/server/sorted/{session}"
+# Outputs sit beside the recording that produced them:
+#
+#   {blackrock_dir}/blackrock/kilosort4/    sorted Utah array
+#   {blackrock_dir}/sync/                   NSP edge files
+#   {blackrock_dir}/aligned/, figures/      cross-system, on the reference timebase
+#   {neuropixels_dir}/neuropixels/kilosort4/  sorted Neuropixels
+#   {neuropixels_dir}/sync/, lfp/           SpikeGLX edge files, per-channel LFP
 
 blackrock:
+
+  # HUB-*.ns6 carries the Utah array spike data.
+  spike_file: "{blackrock_dir}/HUB-Athos_001.ns6"
   # NSP-*.ns5 carries the two sync channels (see SynchronizePulse_setup.md):
   #   channel 1 = 1 Hz square wave from SpikeGLX SMA1
   #   channel 2 = 14 s coded burst from Blackrock DO1
-  sync_file: "Z:/jeurissenlab.cns.nyu.edu/server/Monkey Athos/2026-08-13/NSP-Athos_001.ns5"
-  # HUB-*.ns6 carries the Utah array spike data.
-  spike_file: "Z:/jeurissenlab.cns.nyu.edu/server/Monkey Athos/2026-08-13/HUB-Athos_001.ns6"
+  sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"
   sync_1hz_channel: 1
   burst_channel: 2
   # Thresholds in the units returned by the reader (volts after neo scaling).
@@ -37,16 +74,30 @@ blackrock:
   stream_id: null
   # Non-neural channels to drop before sorting.
   exclude_channels: []
+  # The array's channel map. Which array is in which monkey is a property of the
+  # session, so it is named here rather than passed as a flag.
+  #   probe_file  a JSON built once by make_probe.py and kept in configs/probes/
+  #   cmp_file    the array's own .cmp, parsed when no probe_file is given
+  # With neither, sorting falls back to a PLACEHOLDER 10x10 grid in channel order
+  # and check_env.py warns: units would land on the wrong electrodes.
+  probe_file: "configs/probes/utah_athos_A.json"
+  cmp_file: null
+  # At 400 um pitch no spike reaches two electrodes, so an explicit median
+  # reference and bandpass are worth applying before Kilosort sees the data.
+  preprocess:
+    apply: true
 
 neuropixels:
   # SpikeGLX run: <run_dir>/<run_name>_g<gate>/...
-  run_dir: "Z:/jeurissenlab.cns.nyu.edu/server/Monkey Athos/2026-08-13"
+  run_dir: "{neuropixels_dir}"
   run_name: "Athos_2026_08_13"
   gate: 0
   trigger: 0
   probes: [0]
-  # Leave null to build the channel map from the run's .meta (recommended for
-  # NP 1.0 NHP long -- the .meta is authoritative per run).
+  # Channel map, in precedence order: probe_file, then probe_name, then the run's
+  # own .meta. Leave both null for NP 1.0 NHP long -- ~snsGeomMap in the .meta is
+  # authoritative per run, since which sites are active is an imro choice.
+  probe_file: null
   probe_name: null
   n_chan_bin: null
   # SY-word bit carrying the SMA1 1 Hz square wave (SpikeGLX default is 6).
@@ -58,14 +109,29 @@ neuropixels:
   burst_threshold_v: [1.0, 0.0]
   # Expected burst pulse width in ms; 0 accepts any width.
   burst_pulse_ms: 0
+  # Kilosort filters and common-average-references internally, which is enough for
+  # a dense probe. Setting apply: true reroutes the sort through SpikeInterface and
+  # costs a second copy of the recording in cache_dir -- see the note below.
+  preprocess:
+    apply: false
 
 sync_period_s: 1.0
 burst_interval_s: 14.0
 # Step 9 passes when burst residuals stay under this (seconds).
 alignment_tolerance_s: 0.001
 
+# Shared defaults for both systems. Each system's own `preprocess:` block (above,
+# inside `neuropixels:` / `blackrock:`) is merged over this one key by key, so
+# overriding `apply` alone keeps the bandpass and reference set here.
+#
+# Requesting preprocessing is always honoured. On Blackrock that is free -- it
+# already goes through SpikeInterface. On Neuropixels `apply: true` switches the
+# sort off the direct run_kilosort path onto the SpikeInterface one, which costs a
+# second copy of the recording in cache_dir. That is why it defaults to false here
+# and true for Blackrock: Kilosort filters and common-average-references
+# internally, which is enough for a dense probe, while a 400 um Utah array
+# benefits from an explicit median reference.
 preprocess:
-  apply: true
   bandpass: [300, 6000]
   common_reference: "median"
   detect_bad_channels: true

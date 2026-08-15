@@ -5,7 +5,7 @@
 It is a one-off fetch that gives ``configs/demo.yaml`` something to point at:
 
     python scripts/fetch_demo_data.py                        # once
-    python scripts/run_pipeline.py --config configs/demo.yaml
+    python run_sorting_pipeline.py --config configs/demo.yaml
 
 The recording is a short excerpt of an IBL Neuropixels 1.0 session (385 channels:
 384 AP + the SY word), the same file the Kilosort documentation uses. It arrives

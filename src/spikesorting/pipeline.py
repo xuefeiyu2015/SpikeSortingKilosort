@@ -6,7 +6,12 @@ shelling out.
 
 Every step returns a ``StepResult`` and, crucially, *reports* what it skipped
 rather than failing. A demo session with no Blackrock data must still complete;
-so must a Blackrock-only session. That is what the ``skip_*`` config flags do.
+so must a Blackrock-only session. That is what the ``has_*_data`` and
+``kilosort_on_*`` config flags do.
+
+The stages are independent of each other: sorting reads no edge files, and
+extraction needs no sorter. Any subset can therefore run on any machine, which is
+what lets sorting go to a cluster while the CatGT/TPrime half stays on the rig.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ __all__ = [
     "step_align",
     "step_validate",
     "STEPS",
+    "step_lfp",
 ]
 
 
@@ -95,6 +101,48 @@ def step_extract_sync(config: SessionConfig, probe: int = 0) -> StepResult:
     return result
 
 
+def step_lfp(config: SessionConfig, probe: int = 0, decimate: int = 1) -> StepResult:
+    """Export the Neuropixels LF band (part of step 2, run on its own).
+
+    A stage of its own rather than a flag on extraction, because its cost is
+    unlike anything else here: no compute, no GPU, just bulk I/O. The LF band is
+    ~7 GB per hour for a 385-channel probe and ``decimate=1`` writes an output
+    the same size as the input, so this wants to run where the recording lives.
+
+    Deliberately *not* in the default order -- a full run should not silently
+    write another copy of the recording.
+    """
+    from .io import spikeglx
+
+    result = StepResult("lfp", "ok")
+    if not config.has_neuropixels_data:
+        result.status = "skipped"
+        result.note("has_neuropixels_data is false")
+        return result
+
+    npx = config.neuropixels
+    if npx.run_dir is None or not npx.run_name:
+        result.status = "skipped"
+        result.note("no SpikeGLX run (run_dir + run_name); nothing to export")
+        return result
+
+    try:
+        files = spikeglx.find_run_files(npx.run_dir, npx.run_name, npx.gate, npx.trigger, probe)
+    except FileNotFoundError as error:
+        result.status = "skipped"
+        result.note(f"no .lf.bin stream to export: {error}")
+        return result
+    if files["lf"] is None:
+        result.status = "skipped"
+        result.note("no .lf.bin stream in this run")
+        return result
+
+    path = spikeglx.export_lfp(files["lf"], config.paths.lfp, decimate=decimate)
+    result.note(f"wrote {path}" + (f" (decimated {decimate}x)" if decimate > 1 else ""))
+    result.data["lfp"] = path
+    return result
+
+
 # ----------------------------------------------------------------------------
 # Step 3 + 4: sorting
 # ----------------------------------------------------------------------------
@@ -114,20 +162,26 @@ def _sorting_environment_note(error: ImportError) -> str:
 def step_sort_neuropixels(config: SessionConfig, probe_index: int = 0) -> StepResult:
     """Run Kilosort4 on the Neuropixels AP binary."""
     result = StepResult("sort_neuropixels", "ok")
-    if config.skip_neuropixels:
+    if not config.sorts_neuropixels:
         result.status = "skipped"
-        result.note("skip_neuropixels is set")
+        result.note(
+            "has_neuropixels_data is false"
+            if not config.has_neuropixels_data
+            else "kilosort_on_neuropixels is false"
+        )
         return result
 
     try:
-        from .sort import sort_neuropixels
+        from .api import load_data, preprocess, sort
     except ImportError as error:
         result.status = "failed"
         result.note(_sorting_environment_note(error))
         return result
 
     try:
-        sorted_result = sort_neuropixels(config, probe_index=probe_index)
+        recording = load_data(config, "neuropixels", probe_index=probe_index)
+        recording = preprocess(recording, config, "neuropixels")
+        sorted_result = sort(recording, config, "neuropixels")
     except ImportError as error:
         result.status = "failed"
         result.note(_sorting_environment_note(error))
@@ -144,9 +198,13 @@ def step_sort_neuropixels(config: SessionConfig, probe_index: int = 0) -> StepRe
 def step_sort_blackrock(config: SessionConfig, probe: dict | None = None) -> StepResult:
     """Run Kilosort4 on the Utah array file through SpikeInterface."""
     result = StepResult("sort_blackrock", "ok")
-    if config.skip_blackrock:
+    if not config.sorts_blackrock:
         result.status = "skipped"
-        result.note("skip_blackrock is set")
+        result.note(
+            "has_blackrock_data is false"
+            if not config.has_blackrock_data
+            else "kilosort_on_blackrock is false"
+        )
         return result
     if config.blackrock.spike_file is None:
         result.status = "skipped"
@@ -154,9 +212,11 @@ def step_sort_blackrock(config: SessionConfig, probe: dict | None = None) -> Ste
         return result
 
     try:
-        from .sort import sort_blackrock
+        from .api import load_data, preprocess, sort
 
-        sorted_result = sort_blackrock(config, probe=probe)
+        recording = load_data(config, "blackrock", probe=probe)
+        recording = preprocess(recording, config, "blackrock")
+        sorted_result = sort(recording, config, "blackrock")
     except ImportError as error:
         result.status = "failed"
         result.note(_sorting_environment_note(error))
@@ -293,7 +353,12 @@ def step_export(
 
 
 def _load_edges(config: SessionConfig, name: str) -> np.ndarray | None:
-    path = config.paths.sync / f"{name}.txt"
+    # Each system's edges sit beside its own recording, so the file to read
+    # depends on which system produced it.
+    system = extract.EDGE_SYSTEM[name]
+    if config.paths.dir_for(system) is None:
+        return None
+    path = config.paths.sync_for(system) / f"{name}.txt"
     return catgt.read_edge_file(path) if path.exists() else None
 
 
@@ -522,9 +587,10 @@ def step_validate(config: SessionConfig, figures: bool = True) -> StepResult:
     return result
 
 
-#: Step name -> callable, for ``run_pipeline.py --steps``.
+#: Step name -> callable, for the two ``run_*_pipeline.py --steps`` scripts.
 STEPS = {
     "extract_sync": step_extract_sync,
+    "lfp": step_lfp,
     "sort_neuropixels": step_sort_neuropixels,
     "sort_blackrock": step_sort_blackrock,
     "align": step_align,
