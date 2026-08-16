@@ -1197,12 +1197,13 @@ def check_session(config: SessionConfig) -> list[Check]:
                 name=f"session:{config.session}:probe",
                 status=WARN,
                 detail=(
-                    "no blackrock.probe_file or cmp_file: sorting will use a "
-                    "PLACEHOLDER 10x10 grid in channel order, so units will be "
+                    "no blackrock.cmp_file or probe_file: sorting will use a "
+                    "PLACEHOLDER grid in channel order, so units will be "
                     "attributed to the wrong electrodes"
                 ),
                 fix=(
-                    "python scripts/make_probe.py utah --cmp array.cmp "
+                    "set blackrock.cmp_file to the array's .cmp, or build a map "
+                    "once: python tools/make_probe.py utah --cmp array.cmp "
                     "--out configs/probes/utah_<array>.json --plot, then set "
                     "blackrock.probe_file to it"
                 ),

@@ -29,12 +29,20 @@ def test_demo_config_is_an_ordinary_session():
     assert session.neuropixels.sample_rate == 30000.0
 
 
-def test_demo_paths_are_written_out_in_the_session_config():
+def test_demo_paths_are_derived_the_same_way_a_real_session_is():
+    # The demo uses roots + monkey + session like anything else, rather than
+    # stating its directory outright -- so it exercises the derivation instead of
+    # side-stepping it, and the path it produces is the one the file references
+    # as {neuropixels_dir}.
     session = cfg.load_session_config(CONFIG_DIR / "demo.yaml", "mac", CONFIG_DIR)
+
+    assert session.neuropixels_dir == session.paths.dir_for("neuropixels")
+    assert session.neuropixels_dir.name == session.session
+    assert session.neuropixels_dir.parent.name == session.monkey
+
     binary = session.neuropixels.bin_file
     assert binary.name == "ZFM-02370_mini.imec0.ap.short.bin"
-    assert binary.parent.name == "demo_data"
-    # "~/..." went through _as_path().expanduser() rather than a machine root.
+    assert binary.parent == session.neuropixels_dir
     assert binary.is_absolute()
     assert session.output_root.is_absolute()
 
@@ -516,8 +524,9 @@ def test_each_system_can_name_its_own_probe_file(tmp_path):
         "neuropixels:\n  probe_file: 'configs/probes/np1_nhp_long.json'\n",
     )
 
-    assert session.blackrock.probe_file == Path("configs/probes/utah_athos_A.json")
-    assert session.neuropixels.probe_file == Path("configs/probes/np1_nhp_long.json")
+    # Written relative, resolved against the repo so it works from any cwd.
+    assert session.blackrock.probe_file == cfg.REPO_ROOT / "configs/probes/utah_athos_A.json"
+    assert session.neuropixels.probe_file == cfg.REPO_ROOT / "configs/probes/np1_nhp_long.json"
 
 
 def test_a_utah_array_can_name_its_cmp_instead(tmp_path):
@@ -638,3 +647,70 @@ def test_a_null_reference_means_do_not_reference(tmp_path):
 
     settings = describe_preprocessing(session.preprocess_for("blackrock"))
     assert settings["common_reference"] is None
+
+
+def test_a_duplicate_key_is_rejected_rather_than_silently_dropped(tmp_path):
+    # PyYAML keeps the last occurrence and says nothing, so pasting a template on
+    # top of an existing file silently discards half of it -- the whole first
+    # `neuropixels:` block, say. That is a wrong sort, not a wrong path.
+    path = tmp_path / "s.yaml"
+    path.write_text(
+        "session: s\n"
+        f"neuropixels_dir: '{tmp_path}'\n"
+        "has_blackrock_data: false\n"
+        "neuropixels:\n  run_dir: '/a'\n  run_name: r\n"
+        "neuropixels:\n  bin_file: '/b/x.bin'\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        cfg.load_session_config(path, "mac", CONFIG_DIR)
+
+    assert "neuropixels" in str(excinfo.value)
+    assert "duplicate" in str(excinfo.value).lower()
+
+
+def test_a_duplicate_key_nested_in_a_block_is_also_rejected(tmp_path):
+    path = tmp_path / "s.yaml"
+    path.write_text(
+        "session: s\n"
+        f"neuropixels_dir: '{tmp_path}'\n"
+        "has_blackrock_data: false\n"
+        "neuropixels:\n  bin_file: '/a/x.bin'\n  bin_file: '/b/y.bin'\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="[Dd]uplicate"):
+        cfg.load_session_config(path, "mac", CONFIG_DIR)
+
+
+def test_probe_name_is_gone(tmp_path):
+    # Kilosort ships no probe files -- its own API takes a path too -- and the
+    # three it can download do not include NP 1.0 NHP. Naming a "probe type"
+    # could only ever hand a real NHP session the standard 384-site layout:
+    # plausible, wrong, and silent.
+    assert not hasattr(cfg.NeuropixelsSpec(), "probe_name")
+
+    session = _flags(tmp_path, "neuropixels:\n  probe_name: 'NeuroPix1_default.mat'\n")
+    assert not hasattr(session.neuropixels, "probe_name")
+
+
+def test_a_relative_probe_file_resolves_against_the_repo_not_the_cwd(tmp_path, monkeypatch):
+    # Every example writes "configs/probes/x.json". Left cwd-relative that works
+    # from the repo root and nowhere else, which is not "consistently used".
+    session = _flags(tmp_path, "blackrock:\n  probe_file: 'configs/probes/np1_default.json'\n")
+
+    assert session.blackrock.probe_file.is_absolute()
+    assert session.blackrock.probe_file == cfg.REPO_ROOT / "configs/probes/np1_default.json"
+
+    monkeypatch.chdir(tmp_path)  # a different cwd must not change the answer
+    again = _flags(tmp_path, "blackrock:\n  probe_file: 'configs/probes/np1_default.json'\n")
+    assert again.blackrock.probe_file == session.blackrock.probe_file
+
+
+def test_an_absolute_probe_file_is_left_alone(tmp_path):
+    probe = tmp_path / "utah_A.json"
+    probe.write_text("{}", encoding="utf-8")
+    session = _flags(tmp_path, f"blackrock:\n  probe_file: '{probe}'\n")
+
+    assert session.blackrock.probe_file == probe

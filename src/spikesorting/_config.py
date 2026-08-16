@@ -69,6 +69,21 @@ def _as_path(value: Any) -> Path | None:
     return Path(str(value)).expanduser()
 
 
+def _as_config_path(value: Any) -> Path | None:
+    """A path that may be written relative to the repo, like ``configs/probes/x.json``.
+
+    Every other path in a session file is absolute or built from
+    ``{blackrock_dir}`` / ``{neuropixels_dir}``. Probe files are the exception --
+    they live in the repo, so the examples all write them relative -- and left
+    relative to the *working directory* they would resolve only when the pipeline
+    happens to be run from the repo root.
+    """
+    path = _as_path(value)
+    if path is None or path.is_absolute():
+        return path
+    return REPO_ROOT / path
+
+
 @dataclass(frozen=True)
 class EnvLocation:
     """Where a machine keeps one conda environment: a name, optionally a place.
@@ -216,11 +231,11 @@ class BlackrockSpec:
     stream_id: str | None = None
     #: Channel ids to exclude from sorting (sync / analog inputs sharing the file).
     exclude_channels: tuple[str, ...] = ()
-    #: Probe JSON built once by make_probe.py, preferred over cmp_file. Which array
-    #: is in which monkey is a property of the session, so it is named here.
-    probe_file: Path | None = None
-    #: The array's own .cmp map, parsed when no probe_file is given.
+    #: The array's own .cmp wiring map. Preferred, because it describes *this*
+    #: array rather than a map that might have been built from another one.
     cmp_file: Path | None = None
+    #: Probe JSON from make_probe.py, used when no cmp_file is given.
+    probe_file: Path | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "BlackrockSpec":
@@ -233,8 +248,8 @@ class BlackrockSpec:
             burst_threshold=float(data.get("burst_threshold", 2.5)),
             stream_id=data.get("stream_id"),
             exclude_channels=tuple(str(c) for c in data.get("exclude_channels", ())),
-            probe_file=_as_path(data.get("probe_file")),
-            cmp_file=_as_path(data.get("cmp_file")),
+            probe_file=_as_config_path(data.get("probe_file")),
+            cmp_file=_as_config_path(data.get("cmp_file")),
         )
 
 
@@ -261,9 +276,6 @@ class NeuropixelsSpec:
     #: Sampling rate. Only needed for a bare binary with no .meta beside it
     #: (the Kilosort demo file); otherwise read from the meta.
     sample_rate: float | None = None
-    #: Kilosort probe file name (e.g. "NeuroPix1_default.mat"), or None to build
-    #: the channel map from the run's .meta.
-    probe_name: str | None = None
     #: SY-word bit carrying the SMA1 1 Hz square wave. 6 is the SpikeGLX default.
     sync_bit: int = 6
     #: High duration of the 1 Hz square wave, in ms (1 s period, 50% duty).
@@ -274,8 +286,9 @@ class NeuropixelsSpec:
     burst_threshold_v: tuple[float, float] = (1.0, 0.0)
     #: Expected burst pulse width in ms; 0 accepts any width.
     burst_pulse_ms: int = 0
-    #: Probe JSON built once by make_probe.py. Takes precedence over probe_name and
-    #: over building the map from the run's .meta.
+    #: Probe JSON from make_probe.py, used when the run has no ``.meta`` to build
+    #: the map from. The .meta wins where it exists: it records which sites were
+    #: actually active, which a file built from another run cannot know.
     probe_file: Path | None = None
 
     @classmethod
@@ -294,13 +307,12 @@ class NeuropixelsSpec:
             bin_file=_as_path(data.get("bin_file")),
             n_chan_bin=int(n_chan) if n_chan is not None else None,
             sample_rate=float(rate) if rate is not None else None,
-            probe_name=data.get("probe_name"),
             sync_bit=int(data.get("sync_bit", 6)),
             sync_pulse_ms=int(data.get("sync_pulse_ms", 500)),
             burst_word=int(data.get("burst_word", 1)),
             burst_threshold_v=(float(thresh[0]), float(thresh[1])),
             burst_pulse_ms=int(data.get("burst_pulse_ms", 0)),
-            probe_file=_as_path(data.get("probe_file")),
+            probe_file=_as_config_path(data.get("probe_file")),
         )
 
 
@@ -579,11 +591,44 @@ def _first_unresolved(value: Any) -> str | None:
     return None
 
 
+class _StrictLoader(yaml.SafeLoader):
+    """A SafeLoader that refuses duplicate keys instead of keeping the last one.
+
+    PyYAML's default silently keeps the last occurrence, which makes pasting a
+    template on top of an existing config *look* fine while discarding whole
+    blocks -- an entire ``neuropixels:`` section, say, taking ``run_dir`` and
+    ``run_name`` with it. That is a wrong sort, not a wrong path, and nothing
+    downstream could tell.
+    """
+
+
+def _no_duplicate_keys(loader: yaml.Loader, node: yaml.MappingNode) -> dict:
+    seen: set = set()
+    for key_node, _ in node.value:
+        key = loader.construct_object(key_node, deep=True)
+        if key in seen:
+            raise ValueError(
+                f"duplicate key {key!r} at line {key_node.start_mark.line + 1}. "
+                "YAML keeps only the last one, so everything the earlier block set "
+                "would be silently discarded."
+            )
+        seen.add(key)
+    return loader.construct_mapping(node, deep=True)
+
+
+_StrictLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicate_keys
+)
+
+
 def _read_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"config file not found: {path}")
     with open(path, "r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle)
+        try:
+            data = yaml.load(handle, Loader=_StrictLoader)
+        except ValueError as error:
+            raise ValueError(f"{path}: {error}") from None
     if data is None:
         return {}
     if not isinstance(data, dict):

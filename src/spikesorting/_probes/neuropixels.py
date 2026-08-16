@@ -65,15 +65,15 @@ def probe_from_meta(meta: dict[str, str]) -> dict:
     Raises if the meta has no ``~snsGeomMap`` -- older SpikeGLX versions wrote
     ``~snsShankMap`` instead, which carries column/row indices rather than
     micrometres and needs the probe's pitch to convert. Rather than guess a pitch,
-    point ``neuropixels.probe_name`` at an explicit Kilosort probe file for those
-    runs.
+    build the map once with ``tools/make_probe.py`` and name it in
+    ``neuropixels.probe_file`` for those runs.
     """
     geom = spikeglx.parse_geom_map(meta)
     if geom is None:
         raise ValueError(
             "meta has no ~snsGeomMap (older SpikeGLX writes ~snsShankMap). "
-            "Set neuropixels.probe_name in the session config to an explicit "
-            "Kilosort probe file for this run."
+            "Build the map once with tools/make_probe.py and set "
+            "neuropixels.probe_file to it for this run."
         )
     header = spikeglx.parse_geom_header(meta)
     pitch = float(header["shank_pitch_um"]) if header else 0.0

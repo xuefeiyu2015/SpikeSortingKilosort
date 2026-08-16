@@ -1,44 +1,67 @@
 # Demo session -- an ordinary session config that happens to point at the
 # official Kilosort4 example recording.
 #
-# Nothing about it is special-cased in the code: it names a binary and declares
-# which systems recorded, which is what turns off the stages it has no data for.
+# Nothing about it is special-cased in the code. It has the same keys as
+# session_template.yaml and differs only in where the data is and in three
+# settings a bare .bin needs (bin_file, n_chan_bin, sample_rate) where a real
+# SpikeGLX run has run_dir/run_name and reads the rest from its .meta.
 #
-# Fetch the file once (separate from the pipeline, not a pipeline stage):
-#   python scripts/fetch_demo_data.py --dest ~/ephys/demo_data
-# Then:
-#   python run_sorting_pipeline.py --config configs/demo.yaml
-session: demo
+# Set it up once with notebooks/setup_demo_data.ipynb, then:
+#   python run_sorting_pipeline.py   --config configs/demo.yaml
+#   python run_exporting_pipeline.py --config configs/demo.yaml
+
+monkey: "Monkey neuropixel_demo"
+session: "demo"
+
+# Roots stop at the share; each system's directory is built as
+# <root>/<monkey>/<session> and exposed as {blackrock_dir} / {neuropixels_dir}.
+roots:
+  blackrock: "/Volumes/server"
+  neuropixels: "/Volumes/server"
+
+# Names the directory below neuropixels/ and blackrock/ that results go into.
+sorter: kilosort4
+
+# Two independent questions per system. No NSP-*.ns5 / HUB-*.ns6 here, so nothing
+# Blackrock runs at all.
+has_neuropixels_data: true
+has_blackrock_data: false
+kilosort_on_neuropixels: true
+kilosort_on_blackrock: false
 
 # No second system to align to, so steps 8-9 are skipped. Sync *extraction* still
 # runs: this recording's SY word does carry the 1 Hz square wave.
 skip_sync: true
 
-# No NSP-*.ns5 / HUB-*.ns6, so step 4 and the Blackrock half of steps 8-10 skip.
-has_blackrock_data: false
-
-# This recording has no monkey/date structure to build a path from, so its
-# directory is stated outright instead of coming from a root. Everything the
-# demo produces lands beside the binary: neuropixels/kilosort4/, sync/, lfp/.
-neuropixels_dir: "~/ephys/demo_data"
-
 neuropixels:
+  # The one place this differs from a real session. The download is a bare .bin:
+  # no .meta beside it and no SpikeGLX run folder, so there is no run_dir/run_name
+  # and the channel count and rate have to be stated.
   bin_file: "{neuropixels_dir}/ZFM-02370_mini.imec0.ap.short.bin"
-  # This download is a bare .bin with no .meta beside it, so the channel count
-  # and rate have to be stated here. 384 AP channels + 1 SY word.
-  n_chan_bin: 385
+  n_chan_bin: 385          # 384 AP channels + the SY word
   sample_rate: 30000
-  probe_name: "NeuroPix1_default.mat"
+  # With no .meta there is no geometry to derive, so the map is named here. Built
+  # once by notebooks/setup_demo_data.ipynb; a real run leaves this null and lets
+  # setup_probe read ~snsGeomMap from the .meta instead.
+  probe_file: "configs/probes/np1_default.json"
+  # SY-word bit carrying the SMA1 1 Hz square wave (SpikeGLX default is 6).
   sync_bit: 6
   sync_pulse_ms: 500
 
+sync_period_s: 1.0
+burst_interval_s: 14.0
+# Step 9 passes when burst residuals stay under this (seconds).
+alignment_tolerance_s: 0.001
+
 # Kilosort filters and common-average-references internally, which is enough for a
-# dense probe, so nothing extra is applied here. Stated rather than omitted so the
-# setting is visible: apply: true would reroute the sort through SpikeInterface and
-# cost a second copy of the recording in cache_dir.
+# dense probe, so nothing extra is applied. Stated rather than omitted so the
+# setting is visible: apply: true would reroute the sort through SpikeInterface
+# and cost a second copy of the recording in cache_dir.
 preprocess:
   apply: false
   bandpass: [300, 6000]
   common_reference: "median"
+  detect_bad_channels: true
 
+# Merged into Kilosort4's settings dict.
 kilosort_settings: {}

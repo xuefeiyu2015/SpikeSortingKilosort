@@ -94,11 +94,12 @@ neuropixels:
   gate: 0
   trigger: 0
   probes: [0]
-  # Channel map, in precedence order: probe_file, then probe_name, then the run's
-  # own .meta. Leave both null for NP 1.0 NHP long -- ~snsGeomMap in the .meta is
-  # authoritative per run, since which sites are active is an imro choice.
+  # Channel map. The run's own .meta wins where it has ~snsGeomMap -- it records
+  # which sites were actually active for this recording, which no external file
+  # can know. probe_file is the fallback for a run with no usable .meta; with
+  # neither, setup_probe raises rather than guess a layout. Leave null for NP 1.0
+  # NHP long: the .meta is authoritative per run.
   probe_file: null
-  probe_name: null
   n_chan_bin: null
   # SY-word bit carrying the SMA1 1 Hz square wave (SpikeGLX default is 6).
   sync_bit: 6

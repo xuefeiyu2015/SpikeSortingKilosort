@@ -133,18 +133,28 @@ def setup_probe(config: SessionConfig, system: str) -> dict | None:
     """The channel map for one system, as a Kilosort probe dict.
 
     An explicit step rather than something hidden inside loading, because this is
-    where a wrong choice does the most damage: units land on the wrong
-    electrodes and nothing downstream can tell.
+    where a wrong choice does the most damage: units land on the wrong electrodes
+    and nothing downstream can tell.
 
-    Resolution order, the same for both systems:
+    **The recording's own geometry wins.** A SpikeGLX ``.meta`` records which
+    sites were actually active for *that* run -- an imro choice made per recording
+    -- so it cannot be wrong in the way a file built from another run can. A
+    ``.cmp`` is the same thing for a Utah array: it describes how this array is
+    wired.
 
-    1. ``<system>.probe_file`` -- a JSON built once by ``tools/make_probe.py``
-       and kept in ``configs/probes/``. Which array is in which monkey is a
-       property of the session, so that is where it is named.
-    2. the recording's own geometry: ``~snsGeomMap`` in the SpikeGLX ``.meta``,
-       or the ``.cmp`` named by ``blackrock.cmp_file``.
-    3. for Utah only, a placeholder 10x10 grid flagged ``_placeholder``. Sorting
-       still runs and says so loudly, because a silently wrong map is worse.
+    ============================== ===========================================
+    Neuropixels                    Blackrock
+    ============================== ===========================================
+    1. the run's ``.meta``         1. ``blackrock.cmp_file``
+    2. ``neuropixels.probe_file``  2. ``blackrock.probe_file``
+    3. raises: no honest default   3. placeholder grid, flagged and warned
+    ============================== ===========================================
+
+    Kilosort has no probe library to fall back on: it ships no probe files, and
+    its own API (``kilosort.io.load_probe``) also takes a path. There is nothing
+    to guess a Neuropixels layout from, which is why step 3 raises rather than
+    inventing one -- unlike a Utah array, where a square grid is at least a
+    recognisably wrong answer.
     """
     _check(system)
     if not getattr(config, f"has_{system}_data"):
@@ -152,55 +162,58 @@ def setup_probe(config: SessionConfig, system: str) -> dict | None:
 
     spec = getattr(config, system)
 
-    if spec.probe_file is not None:
-        from ._probes.io import load_probe_json
-
-        return load_probe_json(spec.probe_file)
-
     if system == "neuropixels":
-        from ._probes import neuropixels as np_probes
+        probe = _probe_from_meta(config)
+        if probe is not None:
+            return probe
+        if spec.probe_file is not None:
+            from ._probes.io import load_probe_json
 
-        if spec.probe_name is not None:
-            return _probe_from_kilosort_library(spec.probe_name)
-        return np_probes.probe_from_meta(_neuropixels_stream(config).meta)
+            log.info("no usable .meta; using neuropixels.probe_file %s", spec.probe_file)
+            return load_probe_json(spec.probe_file)
+        raise FileNotFoundError(
+            "no channel map for neuropixels: this run has no .meta to build one "
+            "from, and neuropixels.probe_file is not set. Build one once and name "
+            "it in the session:\n"
+            "    python tools/make_probe.py from-mat --mat <probe>.mat "
+            "--out configs/probes/<name>.json --plot\n"
+            "then set  neuropixels.probe_file: configs/probes/<name>.json"
+        )
 
     from ._probes.utah import probe_from_cmp, utah_grid_probe
 
     if spec.cmp_file is not None:
         return probe_from_cmp(spec.cmp_file, independent=True)
+    if spec.probe_file is not None:
+        from ._probes.io import load_probe_json
+
+        return load_probe_json(spec.probe_file)
     log.warning(
-        "no blackrock.probe_file or cmp_file: using a PLACEHOLDER grid in channel "
+        "no blackrock.cmp_file or probe_file: using a PLACEHOLDER grid in channel "
         "order, so units will be attributed to the wrong electrodes"
     )
     return utah_grid_probe(96, independent=True)
 
 
-def _probe_from_kilosort_library(name: str) -> dict:
-    """Resolve a ``probe_name`` against Kilosort's own probe directory.
+def _probe_from_meta(config: SessionConfig, probe_index: int = 0) -> dict | None:
+    """The map from the run's own ``.meta``, or None when there is not one.
 
-    ``run_kilosort(probe_name=...)`` used to do this itself, downloading the file
-    when missing. Loading now goes through SpikeInterface, so the map has to be
-    resolved *before* Kilosort is involved -- on a machine that may not have it.
-    Say so plainly rather than failing on a guessed path.
+    Returns None rather than raising for the two ordinary cases -- a bare binary
+    with no ``.meta`` beside it, and a run predating ``~snsGeomMap`` -- so the
+    caller can fall through to ``probe_file``.
     """
-    from ._probes.io import probe_from_mat
+    from ._probes import neuropixels as np_probes
 
     try:
-        from kilosort.utils import PROBE_DIR  # type: ignore[import-not-found]
-
-        directory = Path(PROBE_DIR)
-    except Exception:
-        directory = Path.home() / ".kilosort" / "probes"
-
-    path = directory / name
-    if not path.exists():
-        raise FileNotFoundError(
-            f"probe_name '{name}' not found at {path}. Kilosort ships these and "
-            "downloads them on first use, so this needs the kilosort4 env. On a "
-            "machine without it, set neuropixels.probe_file to a JSON built by "
-            "tools/make_probe.py instead."
-        )
-    return probe_from_mat(path)
+        meta = _neuropixels_stream(config, probe_index).meta
+    except FileNotFoundError:
+        return None
+    if not meta:
+        return None
+    try:
+        return np_probes.probe_from_meta(meta)
+    except ValueError:
+        return None
 
 
 def _neuropixels_stream(config: SessionConfig, probe: int = 0) -> Any:

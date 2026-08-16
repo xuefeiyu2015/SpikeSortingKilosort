@@ -129,5 +129,11 @@ def _describe(value) -> str:
         if callable(getattr(value, attr, None)):
             return getattr(value, attr)()
     if isinstance(value, dict):
+        # A probe dict is mostly a 384-element chanMap; printing it verbatim buries
+        # the run. probe_summary is the loggable form the repo already has.
+        if {"chanMap", "xc", "yc"} <= set(value):
+            from spikesorting._probes.common import probe_summary
+
+            value = probe_summary(value)
         return ", ".join(f"{k}={v}" for k, v in value.items() if not k.startswith("_"))
     return str(value)

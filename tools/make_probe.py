@@ -2,28 +2,28 @@
 """Build Kilosort probe configuration files. Desk work, run locally.
 
 **Not a pipeline stage** -- deliberately outside the numbered ``NN_`` sequence,
-like ``fetch_demo_data.py``. Probe files are built once per array (Utah) or per
+like the demo setup notebook. Probe files are built once per array (Utah) or per
 run (Neuropixels), checked by eye, then referenced from a session config. Nothing
 here needs a GPU, Kilosort, torch or the HPC: a probe file is plain JSON.
 
     # Neuropixels, from the run's own .meta (recommended -- authoritative per run)
-    python scripts/make_probe.py neuropixels --meta /data/run_g0_t0.imec0.ap.meta \\
+    python tools/make_probe.py neuropixels --meta /data/run_g0_t0.imec0.ap.meta \\
            --out configs/probes/np_athos_2026_08_13.json --plot
 
     # Neuropixels, from a SpikeGLX run folder
-    python scripts/make_probe.py neuropixels --run-dir /data --run-name Athos_2026_08_13 \\
+    python tools/make_probe.py neuropixels --run-dir /data --run-name Athos_2026_08_13 \\
            --out configs/probes/np_athos.json
 
     # Utah array, from the array's .cmp map file
-    python scripts/make_probe.py utah --cmp /data/array.cmp \\
+    python tools/make_probe.py utah --cmp /data/array.cmp \\
            --out configs/probes/utah_athos.json --plot
 
     # Convert an older Kilosort .mat channel map
-    python scripts/make_probe.py from-mat --mat ~/.kilosort/probes/NeuroPix1_default.mat \\
+    python tools/make_probe.py from-mat --mat ~/.kilosort/probes/NeuroPix1_default.mat \\
            --out configs/probes/np1_default.json
 
     # Inspect an existing probe file
-    python scripts/make_probe.py show --probe configs/probes/utah_athos.json --plot
+    python tools/make_probe.py show --probe configs/probes/utah_athos.json --plot
 
 Always pass ``--plot`` the first time. No code can verify that a channel map is
 *correct*; a picture of the geometry usually can.

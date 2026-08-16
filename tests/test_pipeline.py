@@ -91,27 +91,114 @@ def test_importing_the_package_pulls_in_no_heavy_dependency():
 # ---------------------------------------------------------------------------
 
 
-def test_a_probe_file_is_used_for_either_system(tmp_path):
-    probe = _probe_json(tmp_path / "probes" / "utah_A.json")
-    session = _session(tmp_path, f"blackrock:\n  probe_file: '{probe}'\n")
+def _meta_run(tmp_path, n_chan=4, with_geom=True):
+    """A minimal SpikeGLX run whose .meta may or may not carry ~snsGeomMap."""
+    import numpy as np
 
-    loaded = ss.setup_probe(session, "blackrock")
+    run = tmp_path / "np" / "r_g0" / "r_g0_imec0"
+    run.mkdir(parents=True, exist_ok=True)
+    data = np.zeros((100, n_chan), dtype=np.int16)
+    (run / "r_g0_t0.imec0.ap.bin").write_bytes(data.tobytes())
+    meta = [
+        f"nSavedChans={n_chan}",
+        "imSampRate=30000",
+        f"fileSizeBytes={data.nbytes}",
+        "typeThis=imec",
+        "imAiRangeMax=0.6",
+        "imMaxInt=512",
+    ]
+    if with_geom:
+        # (shank, x, y, used) per channel -- the format probe_from_meta parses.
+        meta.append("~snsGeomMap=(NP1000,1,0,70)" + "".join(
+            f"(0:{11 + 16 * (i % 2)}:{20 * (i // 2)}:1)" for i in range(n_chan)
+        ))
+    (run / "r_g0_t0.imec0.ap.meta").write_text("\n".join(meta) + "\n", encoding="utf-8")
+    return tmp_path / "np"
 
-    assert loaded["n_chan"] == 4
-    assert list(loaded["chanMap"]) == [0, 1, 2, 3]
+
+def test_the_runs_own_meta_wins_over_a_probe_file(tmp_path):
+    # The .meta records which sites were actually active for *this* run, which a
+    # file built from another run cannot know. So it is not an override target.
+    _meta_run(tmp_path)
+    other = _probe_json(tmp_path / "probes" / "other.json", n=99)
+    session = _session(
+        tmp_path,
+        f"neuropixels:\n  run_dir: '{tmp_path / 'np'}'\n  run_name: r\n"
+        f"  probe_file: '{other}'\n",
+    )
+
+    probe = ss.setup_probe(session, "neuropixels")
+
+    assert probe["n_chan"] == 4          # from the .meta
+    assert probe["n_chan"] != 99         # not the probe_file
 
 
-def test_a_probe_file_beats_the_cmp_it_was_built_from(tmp_path):
+def test_probe_file_is_used_when_the_run_has_no_meta(tmp_path):
+    # A bare binary, which is the demo's situation.
+    binary = tmp_path / "np" / "bare.imec0.ap.bin"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_bytes(b"\x00" * 800)
+    named = _probe_json(tmp_path / "probes" / "np1.json", n=4)
+    session = _session(
+        tmp_path,
+        f"neuropixels:\n  bin_file: '{binary}'\n  n_chan_bin: 4\n"
+        f"  sample_rate: 30000\n  probe_file: '{named}'\n",
+    )
+
+    assert ss.setup_probe(session, "neuropixels")["n_chan"] == 4
+
+
+def test_a_meta_without_geometry_falls_through_to_probe_file(tmp_path):
+    # Runs predating ~snsGeomMap: the .meta exists but carries no geometry, so it
+    # must fall through rather than raise past the configured fallback.
+    _meta_run(tmp_path, with_geom=False)
+    named = _probe_json(tmp_path / "probes" / "np1.json", n=4)
+    session = _session(
+        tmp_path,
+        f"neuropixels:\n  run_dir: '{tmp_path / 'np'}'\n  run_name: r\n"
+        f"  probe_file: '{named}'\n",
+    )
+
+    assert ss.setup_probe(session, "neuropixels")["n_chan"] == 4
+
+
+def test_neuropixels_with_neither_raises_and_names_the_fix(tmp_path):
+    # No honest default exists for a Neuropixels layout, so this must not guess.
+    binary = tmp_path / "np" / "bare.imec0.ap.bin"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_bytes(b"\x00" * 800)
+    session = _session(
+        tmp_path,
+        f"neuropixels:\n  bin_file: '{binary}'\n  n_chan_bin: 4\n  sample_rate: 30000\n",
+    )
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        ss.setup_probe(session, "neuropixels")
+
+    assert "make_probe.py" in str(excinfo.value)
+    assert "probe_file" in str(excinfo.value)
+
+
+def test_a_utah_cmp_wins_over_a_probe_file(tmp_path):
+    # Same rule: the array's own wiring map beats a file built from another one.
     probe = _probe_json(tmp_path / "probes" / "utah_A.json")
     session = _session(
         tmp_path, f"blackrock:\n  probe_file: '{probe}'\n  cmp_file: '/nope/missing.cmp'\n"
     )
 
-    # Resolves without touching the .cmp, which does not exist.
+    # cmp_file is tried first, so a missing one surfaces rather than being skipped.
+    with pytest.raises(Exception):
+        ss.setup_probe(session, "blackrock")
+
+
+def test_a_utah_probe_file_is_used_when_no_cmp_is_named(tmp_path):
+    probe = _probe_json(tmp_path / "probes" / "utah_A.json")
+    session = _session(tmp_path, f"blackrock:\n  probe_file: '{probe}'\n")
+
     assert ss.setup_probe(session, "blackrock")["n_chan"] == 4
 
 
-def test_a_utah_array_without_a_map_falls_back_to_the_flagged_placeholder(tmp_path):
+def test_a_utah_array_with_no_map_at_all_falls_back_to_the_flagged_placeholder(tmp_path):
     # It must still sort -- and must still say the geometry is a guess.
     assert ss.setup_probe(_session(tmp_path), "blackrock")["_placeholder"] is True
 
