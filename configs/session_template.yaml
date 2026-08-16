@@ -68,6 +68,10 @@ blackrock:
   stream_id: null
   # Non-neural channels to drop before sorting.
   exclude_channels: []
+  # Merged over the shared `kilosort:` block at the end of this file. A failed
+  # electrode goes here -- Kilosort removes what you list but cannot find them.
+  kilosort:
+    bad_channels: []
   # The array's channel map. Which array is in which monkey is a property of the
   # session, so it is named here rather than passed as a flag.
   #   probe_file  a JSON built once by make_probe.py and kept in configs/probes/
@@ -76,10 +80,6 @@ blackrock:
   # and check_env.py warns: units would land on the wrong electrodes.
   probe_file: "configs/probes/utah_athos_A.json"
   cmp_file: null
-  # At 400 um pitch no spike reaches two electrodes, so an explicit median
-  # reference and bandpass are worth applying before Kilosort sees the data.
-  preprocess:
-    apply: true
 
 neuropixels:
   # SpikeGLX run: <run_dir>/<run_name>_g<gate>/...
@@ -104,32 +104,35 @@ neuropixels:
   burst_threshold_v: [1.0, 0.0]
   # Expected burst pulse width in ms; 0 accepts any width.
   burst_pulse_ms: 0
-  # Kilosort filters and common-average-references internally, which is enough for
-  # a dense probe. Setting apply: true reroutes the sort through SpikeInterface and
-  # costs a second copy of the recording in cache_dir -- see the note below.
-  preprocess:
-    apply: false
+  # Merged over the shared `kilosort:` block at the end of this file. A dense probe
+  # usually wants Kilosort's defaults, so this is normally empty.
+  kilosort: {}
 
 sync_period_s: 1.0
 burst_interval_s: 14.0
 # Step 9 passes when burst residuals stay under this (seconds).
 alignment_tolerance_s: 0.001
 
-# Shared defaults for both systems. Each system's own `preprocess:` block (above,
-# inside `neuropixels:` / `blackrock:`) is merged over this one key by key, so
-# overriding `apply` alone keeps the bandpass and reference set here.
+# Passed straight to Kilosort. A system's own `kilosort:` block above is merged
+# over this one, key by key. Empty means Kilosort's defaults.
 #
-# Requesting preprocessing is always honoured. On Blackrock that is free -- it
-# already goes through SpikeInterface. On Neuropixels `apply: true` switches the
-# sort off the direct run_kilosort path onto the SpikeInterface one, which costs a
-# second copy of the recording in cache_dir. That is why it defaults to false here
-# and true for Blackrock: Kilosort filters and common-average-references
-# internally, which is enough for a dense probe, while a 400 um Utah array
-# benefits from an explicit median reference.
-preprocess:
-  bandpass: [300, 6000]
-  common_reference: "median"
-  detect_bad_channels: true
-
-# Merged into Kilosort4's settings dict.
-kilosort_settings: {}
+# There is no preprocessing outside Kilosort, because Kilosort already does it on
+# every batch: it subtracts the median across channels when do_CAR is set, then
+# highpasses at highpass_cutoff, whitens, and drift-corrects. The question is
+# which of *those* to turn on, not what to do beforehand.
+#
+#   do_CAR                       true    subtract the median across channels
+#                                        (the name says average; the code takes a
+#                                        median, which is what a Utah array wants)
+#   highpass_cutoff              300     Hz
+#   nblocks                      1       drift correction blocks; 0 disables
+#   whitening_range              32      channels used for local whitening
+#   artifact_threshold           inf     zero out any batch exceeding this
+#   bad_channels                 null    channels to exclude. Kilosort removes what
+#                                        you list; it does not detect them, so look
+#                                        at the data and name them per array
+#   skip_kilosort_preprocessing  false   only if you filtered the data yourself
+#
+# Every other Kilosort parameter passes through unchanged.
+kilosort:
+  nblocks: 1

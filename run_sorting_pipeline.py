@@ -84,7 +84,6 @@ def main() -> int:
             if run.last_failed:
                 continue  # no map, so loading would fail the same way
             rec = run(ss.load_spike_continuous, config, system, probe, system=system)
-            rec = run(ss.preprocess, rec, config, system, system=system)
             run(ss.sort_with_kilosort, rec, config, system, system=system)
 
     code = run.finish("sorting pipeline")

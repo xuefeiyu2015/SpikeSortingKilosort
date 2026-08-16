@@ -70,7 +70,6 @@ def test_the_package_exports_the_workflow_and_nothing_else():
         "load_session_config",
         "setup_probe",
         "load_spike_continuous",
-        "preprocess",
         "sort_with_kilosort",
         "extract_sync",
         "extract_lfp",
@@ -223,7 +222,6 @@ def test_none_propagates_so_a_sequence_needs_no_branching(tmp_path):
     # This is what lets the runner be a flat list of calls.
     session = _session(tmp_path)
 
-    assert ss.preprocess(None, session, "neuropixels") is None
     assert ss.sort_with_kilosort(None, session, "neuropixels") is None
 
 

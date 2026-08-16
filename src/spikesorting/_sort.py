@@ -104,7 +104,7 @@ def sort_recording(
     recording: Any,
     results_dir: Path | None = None,
 ) -> SortResult:
-    """Sort an already-loaded, already-preprocessed recording. One path, both systems.
+    """Sort an already-loaded recording. One path, both systems.
 
     This is what :func:`spikesorting.api.sort` calls. The recording arrives with
     its probe attached, so nothing here needs to know which system produced it --
@@ -123,7 +123,7 @@ def sort_recording(
 
     name = config.sorter  # SORTER_NAME; the directory and the sorter agree by construction
     params = {"device": config.machine.device}
-    params.update(config.kilosort_settings)
+    params.update(config.kilosort_for(system))
 
     def body(work_dir: Path) -> Any:
         return ss.run_sorter(
@@ -151,24 +151,24 @@ def sort_recording(
         work_dir=work_dir,
         probe={"n_contacts": int(probe.get_contact_count())} if probe is not None else {},
     )
-    _write_run_info(final_dir, config, result, stream=system)
+    _write_run_info(final_dir, config, result, system=system)
     return result
 
 
 def _write_run_info(
-    final_dir: Path, config: SessionConfig, result: SortResult, stream: str
+    final_dir: Path, config: SessionConfig, result: SortResult, system: str
 ) -> None:
     """Record what produced this sorting, beside the sorting itself."""
     payload = {
         "session": config.session,
         "machine": config.machine.name,
         "device": config.machine.device,
-        "source": stream,
+        "system": system,
         "n_units": result.n_units,
         "n_spikes": result.n_spikes,
         "fs": result.fs,
         "probe": result.probe,
-        "kilosort_settings": config.kilosort_settings,
+        "kilosort": config.kilosort_for(system),
         "notes": result.notes,
     }
     with open(Path(final_dir) / "run_info.json", "w", encoding="utf-8") as handle:

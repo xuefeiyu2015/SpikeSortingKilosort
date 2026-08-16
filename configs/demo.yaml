@@ -41,15 +41,8 @@ burst_interval_s: 14.0
 # Step 9 passes when burst residuals stay under this (seconds).
 alignment_tolerance_s: 0.001
 
-# Kilosort filters and common-average-references internally, which is enough for a
-# dense probe, so nothing extra is applied. Stated rather than omitted so the
-# setting is visible: apply: true would reroute the sort through SpikeInterface
-# and cost a second copy of the recording in cache_dir.
-preprocess:
-  apply: false
-  bandpass: [300, 6000]
-  common_reference: "median"
-  detect_bad_channels: true
-
-# Merged into Kilosort4's settings dict.
-kilosort_settings: {}
+# Passed straight to Kilosort. Empty means its defaults, which already highpass at
+# 300 Hz and subtract the median across channels on every batch -- there is no
+# preprocessing step outside Kilosort, and nothing to turn on here for a stock
+# recording like this one.
+kilosort: {}

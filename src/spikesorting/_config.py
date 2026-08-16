@@ -437,17 +437,12 @@ class SessionConfig:
     burst_interval_s: float = 14.0
     #: Alignment is considered good when residuals stay below this (seconds).
     alignment_tolerance_s: float = 1e-3
-    #: Preprocessing applied before sorting.
-    #: Shared default for both systems; see :meth:`preprocess_for`.
-    preprocess: dict[str, Any] = field(default_factory=dict)
-    #: Per-system ``preprocess:`` blocks, merged over the shared one. Keyed by
-    #: "neuropixels" / "blackrock". The two systems genuinely want different
-    #: treatment -- an explicit median reference suits a 400 um Utah array, while
-    #: a dense probe is usually better left to Kilosort's own internals -- so one
-    #: shared block cannot express what a real session needs.
-    preprocess_by_system: dict[str, dict[str, Any]] = field(default_factory=dict)
-    #: Extra settings merged into Kilosort4's settings dict.
-    kilosort_settings: dict[str, Any] = field(default_factory=dict)
+    #: Kilosort settings shared by both systems; see :meth:`kilosort_for`.
+    kilosort: dict[str, Any] = field(default_factory=dict)
+    #: Per-system ``kilosort:`` blocks, merged over the shared one. The two
+    #: systems genuinely want different answers -- a 400 um Utah array and a dense
+    #: probe are not the same problem -- but they share most settings.
+    kilosort_by_system: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def paths(self) -> OutputPaths:
@@ -462,15 +457,20 @@ class SessionConfig:
     def cache_dir(self) -> Path | None:
         return self.machine.cache_dir
 
-    def preprocess_for(self, system: str) -> dict[str, Any]:
-        """Preprocessing settings for one system: shared block, then its override.
+    def kilosort_for(self, system: str) -> dict[str, Any]:
+        """Kilosort settings for one system: shared block, then its override.
 
-        Merged key by key rather than replaced, so ``neuropixels: {preprocess:
-        {apply: false}}`` turns it off without also discarding the bandpass and
-        reference the shared block set.
+        Merged key by key rather than replaced, so a system can change ``nblocks``
+        without discarding the rest of the shared block. Everything here is passed
+        straight to ``run_sorter`` -- Kilosort's own parameters plus the ones
+        SpikeInterface adds (``do_CAR``, ``bad_channels``, ``invert_sign``,
+        ``skip_kilosort_preprocessing``, ``save_preprocessed_copy``).
+
+        Empty means Kilosort's defaults, which already highpass at 300 Hz and
+        subtract the median across channels on every batch.
         """
-        merged = dict(self.preprocess)
-        merged.update(self.preprocess_by_system.get(system) or {})
+        merged = dict(self.kilosort)
+        merged.update(self.kilosort_by_system.get(system) or {})
         return merged
 
     def has_data(self, system: str) -> bool:
@@ -666,12 +666,31 @@ _REMOVED_KEYS = {
     "skip_blackrock": "remove the blackrock: block instead",
     "skip_sync": "derived: alignment runs when both systems are declared",
     "sorter": "which sorter ran is a property of the code, not the recording",
+    "preprocess": (
+        "Kilosort highpasses and subtracts the median across channels itself on "
+        "every batch; set do_CAR / highpass_cutoff under 'kilosort:' instead"
+    ),
+    "kilosort_settings": "renamed to 'kilosort:', and settable per system",
 }
 
 
 def _reject_removed_keys(data: dict[str, Any], path: Path) -> None:
-    for key in sorted(set(data) & set(_REMOVED_KEYS)):
-        raise ValueError(f"{path}: '{key}' is no longer a session setting -- {_REMOVED_KEYS[key]}")
+    """Refuse a removed key at the top level or inside a system's block.
+
+    ``preprocess:`` was settable per system, so checking only the top level would
+    drop one in silence -- exactly what this exists to prevent.
+    """
+    blocks = [("", data)] + [
+        (f"{system}.", data[system])
+        for system in ("neuropixels", "blackrock")
+        if isinstance(data.get(system), dict)
+    ]
+    for prefix, block in blocks:
+        for key in sorted(set(block) & set(_REMOVED_KEYS)):
+            raise ValueError(
+                f"{path}: '{prefix}{key}' is no longer a session setting "
+                f"-- {_REMOVED_KEYS[key]}"
+            )
 
 
 def load_machine(name: str, config_dir: Path | None = None) -> MachineProfile:
@@ -788,13 +807,12 @@ def load_session_config(
         sync_period_s=float(data.get("sync_period_s", 1.0)),
         burst_interval_s=float(data.get("burst_interval_s", 14.0)),
         alignment_tolerance_s=float(data.get("alignment_tolerance_s", 1e-3)),
-        preprocess=dict(data.get("preprocess") or {}),
-        preprocess_by_system={
-            system: dict((data.get(system) or {}).get("preprocess") or {})
+        kilosort=dict(data.get("kilosort") or {}),
+        kilosort_by_system={
+            system: dict((data.get(system) or {}).get("kilosort") or {})
             for system in ("neuropixels", "blackrock")
-            if (data.get(system) or {}).get("preprocess")
+            if (data.get(system) or {}).get("kilosort")
         },
-        kilosort_settings=dict(data.get("kilosort_settings") or {}),
     )
 
 

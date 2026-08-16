@@ -12,7 +12,6 @@ both through SpikeInterface::
 
     probe  = setup_probe(config, "blackrock")
     rec    = load_spike_continuous(config, "blackrock", probe)
-    rec    = preprocess(rec, config, "blackrock")
     sort_with_kilosort(rec, config, "blackrock")
 
     extract_sync(config, "blackrock")
@@ -61,7 +60,6 @@ __all__ = [
     "load_session_config",
     "setup_probe",
     "load_spike_continuous",
-    "preprocess",
     "sort_with_kilosort",
     "extract_sync",
     "extract_lfp",
@@ -99,8 +97,7 @@ def skip_reason(config: SessionConfig, verb: Any, system: str | None = None) -> 
     if system is not None and name in {
         "setup_probe",
         "load_spike_continuous",
-        "preprocess",
-        "sort_with_kilosort",
+            "sort_with_kilosort",
         "extract_sync",
         "extract_lfp",
         "export_results",
@@ -280,37 +277,7 @@ def load_spike_continuous(
 
 
 # ----------------------------------------------------------------------------
-# Step 3: preprocessing
-# ----------------------------------------------------------------------------
-
-
-def preprocess(recording: Any, config: SessionConfig, system: str) -> Any | None:
-    """Apply this system's ``preprocess:`` block.
-
-    Returns the recording unchanged when the block says ``apply: false``, and
-    ``None`` when given ``None``, so it is always safe to call in a sequence.
-
-    Order matters: bad-channel detection *drops* channels, then bandpass, then
-    the common reference. ``common_reference`` is ``"median"`` (CMR),
-    ``"average"``/``"mean"`` (CAR), or ``null`` for none.
-    """
-    _check(system)
-    if recording is None:
-        return None
-
-    from ._preprocess import describe_preprocessing, preprocess_recording
-
-    settings = describe_preprocessing(config.preprocess_for(system))
-    if not settings.pop("apply", False):
-        return recording
-
-    result, info = preprocess_recording(recording, **settings)
-    log.info("preprocessing applied to %s: %s", system, info)
-    return result
-
-
-# ----------------------------------------------------------------------------
-# Step 4: sorting
+# Step 3: sorting
 # ----------------------------------------------------------------------------
 
 
@@ -320,11 +287,17 @@ def sort_with_kilosort(
     system: str,
     results_dir: Path | None = None,
 ) -> Any | None:
-    """Run Kilosort4 on a loaded, preprocessed recording. Returns a ``SortResult``.
+    """Run Kilosort4 on a loaded recording. Returns a ``SortResult``.
 
     Returns ``None`` without sorting when ``kilosort_on_<system>`` is false --
     the "extract the pulses and the LFP but do not sort" case -- or when given no
     recording.
+
+    There is no preprocessing step before this. Kilosort does its own on every
+    batch: it subtracts the median across channels when ``do_CAR`` is set (the
+    default), highpasses at ``highpass_cutoff`` (300 Hz), then whitens and
+    drift-corrects. Those are settings, named under ``kilosort:`` in the session
+    and resolved by :meth:`SessionConfig.kilosort_for`.
     """
     _check(system)
     if recording is None or not getattr(config, f"sorts_{system}"):
@@ -336,7 +309,7 @@ def sort_with_kilosort(
 
 
 # ----------------------------------------------------------------------------
-# Step 5: sync pulses and LFP
+# Step 4: sync pulses and LFP
 # ----------------------------------------------------------------------------
 
 
@@ -400,7 +373,7 @@ def _load_edges(config: SessionConfig, name: str) -> np.ndarray | None:
 
 
 # ----------------------------------------------------------------------------
-# Step 6: onto the Blackrock timebase
+# Step 5: onto the Blackrock timebase
 # ----------------------------------------------------------------------------
 
 
@@ -651,7 +624,7 @@ def validate_remapping(config: SessionConfig, figures: bool = True) -> Any | Non
 
 
 # ----------------------------------------------------------------------------
-# Step 7: export
+# Step 6: export
 # ----------------------------------------------------------------------------
 
 

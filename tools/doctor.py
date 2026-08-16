@@ -270,8 +270,8 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
             ),
             PackageSpec(
                 "spikeinterface",
-                "sort.py:173, io/blackrock.py:189, preprocess.py:33",
-                ("sort_blackrock", "preprocessing"),
+                "_sort.py:130, _io/blackrock.py:189",
+                ("sort_blackrock", "loading either system"),
                 docs=SPIKEINTERFACE_DOCS,
             ),
             # Only io/blackrock.py reaches neo. align and validate read the edge

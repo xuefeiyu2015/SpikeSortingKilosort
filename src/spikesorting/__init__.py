@@ -10,12 +10,11 @@ Everything you run is a verb in :mod:`spikesorting.pipeline`, re-exported here::
     config = ss.load_session_config("configs/athos.yaml", "windows_rig")
     probe  = ss.setup_probe(config, "blackrock")
     rec    = ss.load_spike_continuous(config, "blackrock", probe)
-    rec    = ss.preprocess(rec, config, "blackrock")
     ss.sort_with_kilosort(rec, config, "blackrock")
 
 Modules prefixed with an underscore are the machinery those verbs call:
-``_config``, ``_io``, ``_probes``, ``_sync``, ``_preprocess``, ``_sort``,
-``_export``, ``_plots``. Read ``pipeline.py`` first; go below it only when you
+``_config``, ``_io``, ``_probes``, ``_sync``, ``_sort``, ``_export``,
+``_plots``. Read ``pipeline.py`` first; go below it only when you
 need to know how a step works.
 
 Environment checking lives in ``tools/`` (``doctor.py`` + ``check_env.py``): it
@@ -36,7 +35,6 @@ from .pipeline import (  # noqa: F401
     load_machine,
     load_session_config,
     load_spike_continuous,
-    preprocess,
     setup_probe,
     skip_reason,
     sort_with_kilosort,
@@ -51,7 +49,6 @@ __all__ = [
     "load_session_config",
     "setup_probe",
     "load_spike_continuous",
-    "preprocess",
     "sort_with_kilosort",
     "extract_sync",
     "extract_lfp",

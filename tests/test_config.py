@@ -391,62 +391,6 @@ neuropixels:
     assert session.paths.sorted_np == Path.home() / "ephys/demo_data/neuropixels/kilosort4"
 
 
-def test_preprocessing_defaults_to_the_shared_block(tmp_path):
-    session = _flags(
-        tmp_path,
-        "preprocess:\n  apply: true\n  bandpass: [300, 6000]\n  common_reference: median\n",
-    )
-
-    for system in ("neuropixels", "blackrock"):
-        assert session.preprocess_for(system)["apply"] is True
-        assert session.preprocess_for(system)["common_reference"] == "median"
-
-
-def test_a_system_can_override_the_shared_preprocessing(tmp_path):
-    # The case this exists for: an explicit median reference suits a 400 um Utah
-    # array, while a dense probe is better left to Kilosort's own internals.
-    session = _flags(
-        tmp_path,
-        "preprocess:\n  apply: true\n  bandpass: [300, 6000]\n  common_reference: median\n"
-        "neuropixels:\n  preprocess:\n    apply: false\n",
-    )
-
-    assert session.preprocess_for("blackrock")["apply"] is True
-    assert session.preprocess_for("neuropixels")["apply"] is False
-
-
-def test_a_system_override_merges_rather_than_replaces(tmp_path):
-    # Overriding one key must not silently drop the rest of the shared block.
-    session = _flags(
-        tmp_path,
-        "preprocess:\n  apply: true\n  bandpass: [300, 6000]\n  common_reference: median\n"
-        "neuropixels:\n  preprocess:\n    common_reference: average\n",
-    )
-
-    npx = session.preprocess_for("neuropixels")
-    assert npx["common_reference"] == "average"
-    assert npx["bandpass"] == [300, 6000]
-    assert npx["apply"] is True
-
-
-def test_preprocessing_can_be_asked_for_on_one_system_only(tmp_path):
-    session = _flags(
-        tmp_path,
-        "neuropixels:\n  preprocess:\n    apply: true\n    common_reference: average\n"
-        "blackrock:\n  preprocess:\n    apply: false\n",
-    )
-
-    assert session.preprocess_for("neuropixels")["apply"] is True
-    assert session.preprocess_for("blackrock")["apply"] is False
-
-
-def test_no_preprocessing_anywhere_is_the_default(tmp_path):
-    session = _flags(tmp_path, "")
-
-    assert session.preprocess_for("neuropixels") == {}
-    assert session.preprocess_for("blackrock") == {}
-
-
 def test_each_system_can_name_its_own_probe_file(tmp_path):
     # Which array is in which monkey is a property of the session, so the map
     # belongs here rather than in a --cmp flag on one script.
@@ -539,37 +483,6 @@ def test_tilde_in_machine_paths_is_expanded():
     machine = cfg.load_machine("mac", CONFIG_DIR)
     assert "~" not in str(machine.cache_dir)
     assert machine.cache_dir.is_absolute()
-
-
-def test_mean_is_accepted_as_the_name_everyone_actually_uses(tmp_path):
-    # SpikeInterface calls it "average"; people say "mean subtraction". Accept
-    # both spellings, store the one SpikeInterface understands.
-    from spikesorting._preprocess import describe_preprocessing
-
-    session = _flags(tmp_path, "preprocess:\n  apply: true\n  common_reference: mean\n")
-
-    settings = describe_preprocessing(session.preprocess_for("blackrock"))
-    assert settings["common_reference"] == "average"
-
-
-def test_an_unknown_reference_operator_is_rejected_before_sorting(tmp_path):
-    # Otherwise it surfaces inside run_sorter, after the recording is loaded and
-    # possibly after a long copy into the cache.
-    from spikesorting._preprocess import describe_preprocessing
-
-    session = _flags(tmp_path, "preprocess:\n  apply: true\n  common_reference: middle\n")
-
-    with pytest.raises(ValueError, match="median.*average"):
-        describe_preprocessing(session.preprocess_for("blackrock"))
-
-
-def test_a_null_reference_means_do_not_reference(tmp_path):
-    from spikesorting._preprocess import describe_preprocessing
-
-    session = _flags(tmp_path, "preprocess:\n  apply: true\n  common_reference: null\n")
-
-    settings = describe_preprocessing(session.preprocess_for("blackrock"))
-    assert settings["common_reference"] is None
 
 
 def test_a_duplicate_key_is_rejected_rather_than_silently_dropped(tmp_path):
@@ -751,3 +664,83 @@ def test_a_removed_key_raises_rather_than_being_ignored(tmp_path, key, value):
         cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
 
     assert key in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Kilosort settings, per system
+# ---------------------------------------------------------------------------
+
+
+def test_kilosort_settings_default_to_the_shared_block(tmp_path):
+    session = _flags(tmp_path, "kilosort:\n  nblocks: 1\n  highpass_cutoff: 300\n")
+
+    for system in ("neuropixels", "blackrock"):
+        assert session.kilosort_for(system)["nblocks"] == 1
+        assert session.kilosort_for(system)["highpass_cutoff"] == 300
+
+
+def test_a_system_overrides_the_shared_kilosort_block_key_by_key(tmp_path):
+    # The two systems want different answers -- a 400 um Utah array and a dense
+    # probe are not the same problem -- but they share most of the settings.
+    session = _flags(
+        tmp_path,
+        "kilosort:\n  nblocks: 1\n  highpass_cutoff: 300\n"
+        "blackrock:\n  sync_file: '/b/y.ns5'\n  kilosort:\n    nblocks: 0\n",
+    )
+
+    assert session.kilosort_for("neuropixels")["nblocks"] == 1
+    assert session.kilosort_for("blackrock")["nblocks"] == 0
+    # overriding one key keeps the rest of the shared block
+    assert session.kilosort_for("blackrock")["highpass_cutoff"] == 300
+
+
+def test_a_system_can_carry_settings_of_its_own(tmp_path):
+    # bad_channels is per-array by nature: Kilosort removes a list you supply and
+    # has no detection of its own.
+    session = _flags(
+        tmp_path,
+        "blackrock:\n  sync_file: '/b/y.ns5'\n  kilosort:\n    bad_channels: [191, 192]\n",
+    )
+
+    assert session.kilosort_for("blackrock")["bad_channels"] == [191, 192]
+    assert session.kilosort_for("neuropixels") == {}
+
+
+def test_no_kilosort_block_means_kilosorts_own_defaults(tmp_path):
+    session = _flags(tmp_path, "")
+
+    assert session.kilosort_for("neuropixels") == {}
+    assert session.kilosort_for("blackrock") == {}
+
+
+def test_an_external_preprocess_block_is_refused(tmp_path):
+    # Kilosort highpasses and subtracts the median across channels itself, on
+    # every batch. Doing it again outside was work done twice, and unsaid.
+    path = _write_session(
+        tmp_path,
+        f"session: s\nneuropixels_dir: '{tmp_path}'\n"
+        "neuropixels:\n  bin_file: '/a/x.bin'\n"
+        "preprocess:\n  apply: true\n  bandpass: [300, 6000]\n",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
+
+    assert "preprocess" in str(excinfo.value)
+    assert "kilosort" in str(excinfo.value)
+
+
+def test_a_removed_key_nested_in_a_system_block_is_also_refused(tmp_path):
+    # Per-system preprocess: blocks were a real thing. Checking only top-level
+    # keys would drop one silently -- the failure this rejection exists to stop.
+    path = _write_session(
+        tmp_path,
+        f"session: s\nneuropixels_dir: '{tmp_path}'\n"
+        "neuropixels:\n  bin_file: '/a/x.bin'\n  preprocess:\n    apply: true\n",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
+
+    assert "preprocess" in str(excinfo.value)
+    assert "neuropixels" in str(excinfo.value)
