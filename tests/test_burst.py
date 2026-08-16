@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from conftest import coded_burst_times
 
-from spikesorting.sync import burst
+from spikesorting._sync import burst
 
 
 def test_group_burst_onsets_collapses_dense_pulses():

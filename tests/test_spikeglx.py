@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 from conftest import square_wave
 
-from spikesorting.io import spikeglx
-from spikesorting.sync import edges
+from spikesorting._io import spikeglx
+from spikesorting._sync import edges
 
 GEOM_MAP = "(NP1000,1,0,70)(0:27:0:1)(0:59:0:1)(0:27:20:1)(0:59:20:0)"
 

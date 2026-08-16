@@ -37,8 +37,8 @@ from pathlib import Path
 
 from _cli import REPO_ROOT  # noqa: F401  (adds src/ to sys.path)
 
-from spikesorting.io import spikeglx
-from spikesorting.probes import (
+from spikesorting._io import spikeglx
+from spikesorting._probes import (
     load_probe_json,
     probe_from_cmp,
     probe_from_mat,
@@ -107,7 +107,7 @@ def render(probe: dict, out_path: Path | None, show: bool) -> None:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    from spikesorting.plots import plot_probe_channel_order, plot_probe_geometry
+    from spikesorting._plots import plot_probe_channel_order, plot_probe_geometry
 
     figure = plt.figure(figsize=(11, 7), dpi=110)
     left, right = figure.subplots(1, 2, width_ratios=[1, 1.4])

@@ -28,8 +28,8 @@ from typing import Iterator
 
 import numpy as np
 
-from ..config import SessionConfig
-from ..io import spikeglx
+from .._config import SessionConfig
+from .._io import spikeglx
 from . import catgt, edges
 
 __all__ = [
@@ -93,6 +93,22 @@ class ExtractionReport:
 
     def note(self, message: str) -> None:
         self.notes.append(message)
+
+    def summary(self) -> str:
+        """One line per edge set, then whatever was skipped and why."""
+        lines = [
+            f"{name}: {e.n} edges via {e.source} spanning {e.span_s:.1f} s <- {e.stream}"
+            for name, e in sorted(self.edge_sets.items())
+        ]
+        for name, c in sorted(self.comparisons.items()):
+            verdict = "agree" if c["agree"] else "DISAGREE"
+            lines.append(
+                f"{name}: CatGT vs NumPy {verdict} ({c['n_a']} vs {c['n_b']} edges, "
+                f"max |diff| {c['max_abs_diff_s'] * 1e6:.1f} us)"
+            )
+        lines.extend(self.notes)
+        lines.extend(f"CatGT command: {c}" for c in self.catgt_commands)
+        return "\n       ".join(lines) if lines else "no edges extracted"
 
 
 def _sy_bit_chunks(
@@ -277,7 +293,7 @@ def extract_blackrock_edges(
     It writes the same edge-file format, which is what lets TPrime align the two
     systems later.
     """
-    from ..io import blackrock  # lazy: neo is not installed everywhere
+    from .._io import blackrock  # lazy: neo is not installed everywhere
 
     report = ExtractionReport()
     spec = config.blackrock

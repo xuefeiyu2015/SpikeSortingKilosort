@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from spikesorting import sort
+from spikesorting import _sort as sort
 
 
 def _blackrock_body(work_dir: Path) -> str:

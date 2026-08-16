@@ -2,11 +2,11 @@
 
 Pure computation: every function takes arrays and returns numbers or arrays. No
 plotting, no file access, no printing -- the matching ``plot_*`` functions live in
-:mod:`spikesorting.plots.summary` and take these results as input.
+:mod:`spikesorting._plots.summary` and take these results as input.
 
 Spike times are in **seconds** throughout. Kilosort's own outputs are sample
 indices, so convert with
-:func:`spikesorting.sync.tprime.spike_times_to_seconds` first.
+:func:`spikesorting._sync.tprime.spike_times_to_seconds` first.
 """
 
 from __future__ import annotations

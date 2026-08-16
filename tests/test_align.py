@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from spikesorting.sync import align
+from spikesorting._sync import align
 
 
 def test_overlap_window_uses_the_later_start_and_earlier_end():

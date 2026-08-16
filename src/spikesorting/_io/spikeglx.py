@@ -212,7 +212,7 @@ def iter_channel(
 
 
 def read_sy_word(info: StreamInfo, start: int = 0, stop: int | None = None) -> np.ndarray:
-    """The SY word as uint16, ready for :func:`~spikesorting.sync.edges.digital_bit_signal`."""
+    """The SY word as uint16, ready for :func:`~spikesorting._sync.edges.digital_bit_signal`."""
     if info.sy_index is None:
         raise ValueError(f"{info.path.name} has no SY word")
     return read_channel(info, info.sy_index, start, stop).view(np.uint16)

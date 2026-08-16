@@ -41,8 +41,8 @@ from pathlib import Path
 
 from _cli import default_machine
 
-from spikesorting import doctor
-from spikesorting.config import EnvLocation, load_machine, load_session_config
+import doctor
+from spikesorting._config import EnvLocation, load_machine, load_session_config
 
 MARKERS = {doctor.OK: "[ok]", doctor.WARN: "[--]", doctor.MISSING: "[!!]"}
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from spikesorting.sync import catgt
+from spikesorting._sync import catgt
 
 
 def test_digital_flag_matches_the_documented_example():

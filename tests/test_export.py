@@ -7,7 +7,7 @@ import json
 import numpy as np
 import pytest
 
-from spikesorting.export import curated, final
+from spikesorting._export import curated, final
 
 
 def test_parse_params_py_reads_types(kilosort_results):

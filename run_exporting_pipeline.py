@@ -9,33 +9,33 @@ Kilosort's own ``cluster_KSLabel.tsv``, and every stage here reads the human
 labels when they exist. Running it before curating is not an error -- you get
 Kilosort's labels instead -- but it is rarely what you want.
 
-    align       coarse offset from the 14 s bursts, then a fine fit on the 1 Hz
-                train, onto Blackrock time. Blackrock is the reference timebase;
-                this maps onto it, never the reverse.
-    validate    the same map checked against the burst onsets, which were held
-                out of the fit. Exits non-zero past the tolerance, so it can gate
-                a batch job.
-    export      aligned spike times, metrics, waveforms and summary figures.
+    time_remapping       coarse offset from the 14 s bursts, then a fine fit on
+                         the 1 Hz train, onto Blackrock time. Blackrock is the
+                         reference timebase; this maps onto it, never the reverse.
+    validate_remapping   the same map checked against the burst onsets, which
+                         were held out of the fit. Non-zero past tolerance, so it
+                         can gate a batch job.
+    export_results       aligned spike times, metrics, waveforms, figures.
 
 **Needs no GPU and no sorter** -- only the edge files and the sorted output. It
-does use CatGT/TPrime when the machine has them, so this is the half that wants
+does use CatGT/TPrime where the machine has them, so this is the half that wants
 to run on the rig even when sorting went to a cluster.
 """
 
 from __future__ import annotations
 
+import logging
 import sys
-import traceback
 from pathlib import Path
 
-# The shared CLI helpers live with the numbered stages; _cli adds src/ itself.
-sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+# The shared CLI helpers live in tools/; _cli adds src/ itself.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 
-from _cli import build_parser, load  # noqa: E402
+from _cli import Runner, build_parser, load  # noqa: E402
 
-from spikesorting.pipeline import step_align, step_export, step_validate  # noqa: E402
+import spikesorting as ss  # noqa: E402
 
-ORDER = ["align", "validate", "export"]
+STAGES = ["time_remapping", "validate_remapping", "export_results"]
 
 
 def main() -> int:
@@ -43,9 +43,9 @@ def main() -> int:
     parser.add_argument(
         "--steps",
         nargs="+",
-        default=ORDER,
-        choices=ORDER,
-        help="stages to run, in the given order (default: all)",
+        default=STAGES,
+        choices=STAGES,
+        help="stages to run (default: all)",
     )
     parser.add_argument(
         "--keep-going",
@@ -60,49 +60,34 @@ def main() -> int:
     )
     parser.add_argument("--no-figures", action="store_true", help="skip figure generation")
     args = parser.parse_args()
-    config = load(args)
+    logging.basicConfig(level=logging.INFO, format="       %(message)s")
 
-    systems = [s for s in ("neuropixels", "blackrock") if getattr(config, f"has_{s}_data")]
+    config = load(args, require_inputs=False)
+    run = Runner(config, keep_going=args.keep_going)
     figures = not args.no_figures
-
-    runners = {
-        "align": lambda: [step_align(config, system=s) for s in systems],
-        "validate": lambda: [step_validate(config, figures=figures)],
-        "export": lambda: [
-            step_export(config, system=s, groups=tuple(args.groups), figures=figures)
-            for s in systems
-        ],
-    }
-
     print()
-    failures = 0
-    for name in args.steps:
-        try:
-            results = runners[name]()
-        except Exception as error:  # a stage that blows up should not hide the rest
-            failures += 1
-            print(f"[!!] {name}\n       {type(error).__name__}: {error}")
-            traceback.print_exc()
-            if not args.keep_going:
-                break
-            continue
 
-        stop = False
-        for result in results:
-            print(result.render())
-            if result.status == "failed":
-                failures += 1
-                stop = not args.keep_going
-        if stop:
-            break
+    # The pipeline, in order. Blackrock is the reference timebase, so it is what
+    # the other system is mapped *onto* rather than a system to remap.
+    if "time_remapping" in args.steps:
+        for system in ss.SYSTEMS:
+            run(ss.time_remapping, config, system, system=system)
 
-    print()
-    print(
-        "exporting pipeline finished"
-        if not failures
-        else f"exporting pipeline finished with {failures} failure(s)"
-    )
-    return 1 if failures else 0
+    if "validate_remapping" in args.steps:
+        run(ss.validate_remapping, config, figures)
+
+    if "export_results" in args.steps:
+        for system in ss.SYSTEMS:
+            run(
+                ss.export_results,
+                config,
+                system,
+                tuple(args.groups),
+                figures,
+                system=system,
+            )
+
+    return run.finish("exporting pipeline")
 
 
 if __name__ == "__main__":

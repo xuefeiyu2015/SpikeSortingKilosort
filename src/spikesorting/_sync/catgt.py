@@ -1,8 +1,8 @@
 """CatGT wrapper and edge-file IO.
 
 CatGT is SpikeGLX's command-line extractor. It is optional: every extraction it
-performs has a pure-NumPy equivalent in :mod:`spikesorting.sync.edges`, and the
-two are cross-checked in :mod:`spikesorting.sync.extract`.
+performs has a pure-NumPy equivalent in :mod:`spikesorting._sync.edges`, and the
+two are cross-checked in :mod:`spikesorting._sync.extract`.
 
 Edge files are the interchange format for the whole alignment stage -- one
 leading-edge time in seconds per line, relative to stream start. TPrime consumes

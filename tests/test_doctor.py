@@ -18,8 +18,8 @@ from pathlib import Path
 
 import pytest
 
-from spikesorting import doctor
-from spikesorting.config import EnvLocation, MachineProfile, load_machine
+import doctor  # from tools/, added to sys.path by conftest
+from spikesorting._config import EnvLocation, MachineProfile, load_machine
 
 KS = doctor.ENV_SPECS[0]
 PHY = doctor.ENV_SPECS[1]
@@ -903,8 +903,8 @@ def test_a_utah_session_with_no_channel_map_is_warned_about(tmp_path):
     # The silent-wrong-geometry hole: the pipeline used to sort Blackrock with a
     # placeholder grid and say nothing. It must still sort, so this warns rather
     # than blocks -- but it must not be silent.
-    from spikesorting import config as cfg
-    from spikesorting import doctor
+    from spikesorting import _config as cfg
+    import doctor  # from tools/, added to sys.path by conftest
 
     machines = tmp_path / "machines"
     machines.mkdir(parents=True, exist_ok=True)

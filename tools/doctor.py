@@ -18,7 +18,7 @@ keeps the multi-second ``import torch`` inside a throwaway subprocess, leaving
 the lazy-import guarantee of this package intact.
 
 **No single source knows about every environment.** Each role ("sorting",
-"curation") is configured as an :class:`~spikesorting.config.EnvLocation` -- a
+"curation") is configured as an :class:`~spikesorting._config.EnvLocation` -- a
 *name* and, optionally, a *path* to the directory holding it -- taken from
 ``machine.conda_envs[role]``, or an override from the caller, falling back to the
 :class:`EnvSpec` default name.
@@ -64,7 +64,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .config import EnvLocation, MachineProfile, SessionConfig
+from spikesorting._config import EnvLocation, MachineProfile, SessionConfig
 
 __all__ = [
     "Check",
@@ -938,7 +938,7 @@ def check_gpu(
 
 def check_external_tools(machine: MachineProfile) -> list[Check]:
     """CatGT and TPrime. Never fatal -- both have pure-NumPy fallbacks."""
-    from .sync import catgt, tprime
+    from spikesorting._sync import catgt, tprime
 
     checks: list[Check] = []
     for label, directory, locator, docs, fallback in (
@@ -1219,7 +1219,7 @@ def run_all(
 ) -> list[Check]:
     """Every check, in report order.
 
-    ``env_overrides`` maps a role to an :class:`~spikesorting.config.EnvLocation`
+    ``env_overrides`` maps a role to an :class:`~spikesorting._config.EnvLocation`
     and outranks the machine profile, so a one-off run can be pointed at another
     env without editing it.
     """

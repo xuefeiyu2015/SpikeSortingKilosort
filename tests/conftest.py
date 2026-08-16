@@ -1,7 +1,9 @@
 """Test configuration.
 
-Puts ``src/`` on the path so the suite runs from a checkout without installing,
-and provides the synthetic-recording fixtures the pure-compute tests use.
+Puts ``src/`` and ``tools/`` on the path so the suite runs from a checkout
+without installing, and provides the synthetic-recording fixtures the
+pure-compute tests use. ``tools/`` is there for ``doctor``, which checks the
+environment rather than running the pipeline and so lives outside the package.
 
 Nothing here needs a GPU, Kilosort, SpikeInterface or real recordings -- that is
 the point. These tests cover the layer that must be correct before any rig time
@@ -18,6 +20,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
+sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 
 @pytest.fixture

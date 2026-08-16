@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from spikesorting import config as cfg
+from spikesorting import _config as cfg
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 
@@ -612,7 +612,7 @@ def test_tilde_in_machine_paths_is_expanded():
 def test_mean_is_accepted_as_the_name_everyone_actually_uses(tmp_path):
     # SpikeInterface calls it "average"; people say "mean subtraction". Accept
     # both spellings, store the one SpikeInterface understands.
-    from spikesorting.preprocess import describe_preprocessing
+    from spikesorting._preprocess import describe_preprocessing
 
     session = _flags(tmp_path, "preprocess:\n  apply: true\n  common_reference: mean\n")
 
@@ -623,7 +623,7 @@ def test_mean_is_accepted_as_the_name_everyone_actually_uses(tmp_path):
 def test_an_unknown_reference_operator_is_rejected_before_sorting(tmp_path):
     # Otherwise it surfaces inside run_sorter, after the recording is loaded and
     # possibly after a long copy into the cache.
-    from spikesorting.preprocess import describe_preprocessing
+    from spikesorting._preprocess import describe_preprocessing
 
     session = _flags(tmp_path, "preprocess:\n  apply: true\n  common_reference: middle\n")
 
@@ -632,7 +632,7 @@ def test_an_unknown_reference_operator_is_rejected_before_sorting(tmp_path):
 
 
 def test_a_null_reference_means_do_not_reference(tmp_path):
-    from spikesorting.preprocess import describe_preprocessing
+    from spikesorting._preprocess import describe_preprocessing
 
     session = _flags(tmp_path, "preprocess:\n  apply: true\n  common_reference: null\n")
 

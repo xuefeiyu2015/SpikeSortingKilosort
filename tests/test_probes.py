@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from spikesorting.probes import common, neuropixels, utah
+from spikesorting._probes import common, neuropixels, utah
 
 
 def test_probe_from_geom_keeps_every_site():

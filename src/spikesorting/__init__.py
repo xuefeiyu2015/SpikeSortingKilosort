@@ -1,20 +1,66 @@
-"""Kilosort4 spike sorting pipeline for Blackrock and Neuropixels recordings.
+"""Kilosort4 spike sorting for Blackrock Utah arrays and Neuropixels.
 
-Layout of the package mirrors the pipeline stages documented in ``CLAUDE.md``:
+Two acquisition systems, one timebase. Blackrock is the reference: Neuropixels
+times are mapped onto it, never the reverse.
 
-``config``   session + machine configuration (step 1)
-``io``       readers for SpikeGLX and Blackrock files (steps 2, 4)
-``sync``     sync pulse edge extraction and cross-system alignment (steps 2, 4, 8, 9)
-``probes``   channel maps / probe geometry for each array type (step 3)
-``sort``     Kilosort4 entry points (steps 3, 4)
-``export``   post-curation metrics and final export (steps 7, 10)
-``plots``    rendering only; never computes
-``doctor``   environment health check; reports what is missing, installs nothing
+Everything you run is a verb in :mod:`spikesorting.pipeline`, re-exported here::
 
-Only ``numpy``/``scipy``/``pandas``/``yaml`` are imported at package import time.
-Heavyweight, GPU-bound dependencies (``kilosort``, ``torch``, ``spikeinterface``,
-``neo``) are imported lazily inside the modules that need them so that the config,
-sync and export layers stay usable on a machine without a CUDA GPU.
+    import spikesorting as ss
+
+    config = ss.load_session_config("configs/athos.yaml", "windows_rig")
+    probe  = ss.setup_probe(config, "blackrock")
+    rec    = ss.load_spike_continuous(config, "blackrock", probe)
+    rec    = ss.preprocess(rec, config, "blackrock")
+    ss.sort_with_kilosort(rec, config, "blackrock")
+
+Modules prefixed with an underscore are the machinery those verbs call:
+``_config``, ``_io``, ``_probes``, ``_sync``, ``_preprocess``, ``_sort``,
+``_export``, ``_plots``. Read ``pipeline.py`` first; go below it only when you
+need to know how a step works.
+
+Environment checking lives in ``tools/`` (``doctor.py`` + ``check_env.py``): it
+inspects the machine rather than running the pipeline, so it is not part of this
+package.
 """
 
-__version__ = "0.1.0"
+from .pipeline import (  # noqa: F401
+    REFERENCE_SYSTEM,
+    SYSTEMS,
+    MachineProfile,
+    OutputPaths,
+    SessionConfig,
+    TimeMap,
+    export_results,
+    extract_lfp,
+    extract_sync,
+    load_machine,
+    load_session_config,
+    load_spike_continuous,
+    preprocess,
+    setup_probe,
+    skip_reason,
+    sort_with_kilosort,
+    time_remapping,
+    validate_remapping,
+)
+
+__all__ = [
+    "SYSTEMS",
+    "REFERENCE_SYSTEM",
+    "skip_reason",
+    "load_session_config",
+    "setup_probe",
+    "load_spike_continuous",
+    "preprocess",
+    "sort_with_kilosort",
+    "extract_sync",
+    "extract_lfp",
+    "time_remapping",
+    "validate_remapping",
+    "export_results",
+    "TimeMap",
+    "SessionConfig",
+    "MachineProfile",
+    "OutputPaths",
+    "load_machine",
+]

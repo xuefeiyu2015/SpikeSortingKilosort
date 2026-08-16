@@ -1,378 +1,384 @@
-"""Pipeline steps, one function per stage.
+"""The pipeline: one verb per thing you do, in the order you do it.
 
-The ``scripts/`` entry points are thin argparse wrappers around these, so the same
-stages can be driven from a notebook, a batch job, or another script without
-shelling out.
+This is the only file you need to read to understand the workflow. Everything
+below it -- ``_io``, ``_probes``, ``_sync``, ``_export``, ``_plots`` -- is
+machinery these verbs call.
 
-Every step returns a ``StepResult`` and, crucially, *reports* what it skipped
-rather than failing. A demo session with no Blackrock data must still complete;
-so must a Blackrock-only session. That is what the ``has_*_data`` and
-``kilosort_on_*`` config flags do.
+Every per-system verb takes ``system``: ``"neuropixels"`` or ``"blackrock"``. The
+two acquisition systems therefore read identically, which is the point of loading
+both through SpikeInterface::
 
-The stages are independent of each other: sorting reads no edge files, and
-extraction needs no sorter. Any subset can therefore run on any machine, which is
-what lets sorting go to a cluster while the CatGT/TPrime half stays on the rig.
+    config = load_session_config("configs/athos.yaml", "windows_rig")
+
+    probe  = setup_probe(config, "blackrock")
+    rec    = load_spike_continuous(config, "blackrock", probe)
+    rec    = preprocess(rec, config, "blackrock")
+    sort_with_kilosort(rec, config, "blackrock")
+
+    extract_sync(config, "blackrock")
+    time_remapping(config, "neuropixels")
+    validate_remapping(config)
+    export_results(config, "neuropixels")
+
+**Verbs return values, not status wrappers** -- a recording, a report, a path --
+so a notebook cell shows the real object and the next verb takes it directly.
+
+**The session config decides whether a verb does anything.** Each one returns
+``None`` when the YAML says not to: ``sort_with_kilosort`` returns immediately if
+``kilosort_on_<system>`` is false. ``None`` propagates, so a sequence of calls
+needs no branching. :func:`skip_reason` says *why*, for callers that report.
+
+Heavy imports (``kilosort``, ``torch``, ``spikeinterface``) stay inside the
+functions that need them, so importing this module costs nothing and it loads on
+a machine with none of them installed.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from .config import SessionConfig
-from .sync import align, burst, catgt, extract
+from ._config import (  # noqa: F401  (re-exported: the config verb and its types)
+    MachineProfile,
+    OutputPaths,
+    SessionConfig,
+    load_machine,
+    load_session_config,
+)
+from ._sync import align, burst, catgt, extract
+
+log = logging.getLogger("spikesorting")
 
 __all__ = [
-    "StepResult",
-    "step_extract_sync",
-    "step_sort_neuropixels",
-    "step_sort_blackrock",
-    "step_export",
-    "step_align",
-    "step_validate",
-    "STEPS",
-    "step_lfp",
+    "SYSTEMS",
+    "REFERENCE_SYSTEM",
+    "skip_reason",
+    "load_session_config",
+    "setup_probe",
+    "load_spike_continuous",
+    "preprocess",
+    "sort_with_kilosort",
+    "extract_sync",
+    "extract_lfp",
+    "time_remapping",
+    "validate_remapping",
+    "export_results",
+    "TimeMap",
+    "SessionConfig",
+    "MachineProfile",
+    "OutputPaths",
+    "load_machine",
 ]
 
+SYSTEMS = ("neuropixels", "blackrock")
 
-@dataclass
-class StepResult:
-    """Outcome of one pipeline stage."""
-
-    name: str
-    status: str  # "ok" | "skipped" | "failed"
-    notes: list[str] = field(default_factory=list)
-    data: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def ok(self) -> bool:
-        return self.status == "ok"
-
-    def note(self, message: str) -> None:
-        self.notes.append(message)
-
-    def render(self) -> str:
-        marker = {"ok": "[ok]", "skipped": "[--]", "failed": "[!!]"}.get(self.status, "[??]")
-        lines = [f"{marker} {self.name}"]
-        lines.extend(f"       {note}" for note in self.notes)
-        return "\n".join(lines)
+#: The timebase everything else is mapped onto. Never the other way round.
+REFERENCE_SYSTEM = "blackrock"
 
 
-# ----------------------------------------------------------------------------
-# Step 2 + 4: sync extraction
-# ----------------------------------------------------------------------------
+def _check(system: str) -> str:
+    if system not in SYSTEMS:
+        raise ValueError(f"system must be one of {SYSTEMS}, got {system!r}")
+    return system
 
 
-def step_extract_sync(config: SessionConfig, probe: int = 0) -> StepResult:
-    """Extract sync edges from both systems and write the canonical edge files.
+def skip_reason(config: SessionConfig, verb: Any, system: str | None = None) -> str | None:
+    """Why ``verb`` will do nothing for ``system``, or None if it will run.
 
-    Runs even when ``skip_sync`` is set: ``skip_sync`` skips cross-system
-    *alignment*, not extraction. Extracting anyway is cheap, and it is what
-    exercises the CatGT path and the NumPy fallback against each other.
+    The verbs guard themselves and return ``None``; this exists so a caller can
+    *report* the reason without re-deriving it, which keeps status formatting out
+    of the pipeline and in the runner scripts.
     """
-    result = StepResult("extract_sync", "ok")
-    report = extract.extract_session_edges(config, probe)
+    name = getattr(verb, "__name__", str(verb))
 
-    for name, edge_set in sorted(report.edge_sets.items()):
-        result.note(
-            f"{name}: {edge_set.n} edges via {edge_set.source} "
-            f"spanning {edge_set.span_s:.1f} s <- {edge_set.stream}"
-        )
-    for name, comparison in sorted(report.comparisons.items()):
-        verdict = "agree" if comparison["agree"] else "DISAGREE"
-        result.note(
-            f"{name}: CatGT vs NumPy {verdict} "
-            f"({comparison['n_a']} vs {comparison['n_b']} edges, "
-            f"max |diff| {comparison['max_abs_diff_s'] * 1e6:.1f} us)"
-        )
-    for note in report.notes:
-        result.note(note)
-    for command in report.catgt_commands:
-        result.note(f"CatGT command: {command}")
+    if system is not None and name in {
+        "setup_probe",
+        "load_spike_continuous",
+        "preprocess",
+        "sort_with_kilosort",
+        "extract_sync",
+        "extract_lfp",
+        "export_results",
+    }:
+        if not getattr(config, f"has_{system}_data"):
+            return f"has_{system}_data is false"
 
-    result.data["edge_sets"] = report.edge_sets
-    result.data["comparisons"] = report.comparisons
-    if not report.edge_sets:
-        result.status = "skipped"
+    if name == "sort_with_kilosort" and system is not None:
+        if not getattr(config, f"kilosort_on_{system}"):
+            return f"kilosort_on_{system} is false"
+
+    if name == "extract_lfp" and system == "blackrock":
+        return "Blackrock LFPs are saved separately by Central"
+
+    if name in {"time_remapping", "validate_remapping"} and config.skip_sync:
+        return "skip_sync is set (no cross-system alignment for this session)"
+
+    if name == "time_remapping" and system == REFERENCE_SYSTEM:
+        return f"{REFERENCE_SYSTEM} is the reference timebase; nothing to map it onto"
+
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Step 1: the channel map
+# ----------------------------------------------------------------------------
+
+
+def setup_probe(config: SessionConfig, system: str) -> dict | None:
+    """The channel map for one system, as a Kilosort probe dict.
+
+    An explicit step rather than something hidden inside loading, because this is
+    where a wrong choice does the most damage: units land on the wrong
+    electrodes and nothing downstream can tell.
+
+    Resolution order, the same for both systems:
+
+    1. ``<system>.probe_file`` -- a JSON built once by ``tools/make_probe.py``
+       and kept in ``configs/probes/``. Which array is in which monkey is a
+       property of the session, so that is where it is named.
+    2. the recording's own geometry: ``~snsGeomMap`` in the SpikeGLX ``.meta``,
+       or the ``.cmp`` named by ``blackrock.cmp_file``.
+    3. for Utah only, a placeholder 10x10 grid flagged ``_placeholder``. Sorting
+       still runs and says so loudly, because a silently wrong map is worse.
+    """
+    _check(system)
+    if not getattr(config, f"has_{system}_data"):
+        return None
+
+    spec = getattr(config, system)
+
+    if spec.probe_file is not None:
+        from ._probes.io import load_probe_json
+
+        return load_probe_json(spec.probe_file)
+
+    if system == "neuropixels":
+        from ._probes import neuropixels as np_probes
+
+        if spec.probe_name is not None:
+            return _probe_from_kilosort_library(spec.probe_name)
+        return np_probes.probe_from_meta(_neuropixels_stream(config).meta)
+
+    from ._probes.utah import probe_from_cmp, utah_grid_probe
+
+    if spec.cmp_file is not None:
+        return probe_from_cmp(spec.cmp_file, independent=True)
+    log.warning(
+        "no blackrock.probe_file or cmp_file: using a PLACEHOLDER grid in channel "
+        "order, so units will be attributed to the wrong electrodes"
+    )
+    return utah_grid_probe(96, independent=True)
+
+
+def _probe_from_kilosort_library(name: str) -> dict:
+    """Resolve a ``probe_name`` against Kilosort's own probe directory.
+
+    ``run_kilosort(probe_name=...)`` used to do this itself, downloading the file
+    when missing. Loading now goes through SpikeInterface, so the map has to be
+    resolved *before* Kilosort is involved -- on a machine that may not have it.
+    Say so plainly rather than failing on a guessed path.
+    """
+    from ._probes.io import probe_from_mat
+
+    try:
+        from kilosort.utils import PROBE_DIR  # type: ignore[import-not-found]
+
+        directory = Path(PROBE_DIR)
+    except Exception:
+        directory = Path.home() / ".kilosort" / "probes"
+
+    path = directory / name
+    if not path.exists():
+        raise FileNotFoundError(
+            f"probe_name '{name}' not found at {path}. Kilosort ships these and "
+            "downloads them on first use, so this needs the kilosort4 env. On a "
+            "machine without it, set neuropixels.probe_file to a JSON built by "
+            "tools/make_probe.py instead."
+        )
+    return probe_from_mat(path)
+
+
+def _neuropixels_stream(config: SessionConfig, probe: int = 0) -> Any:
+    """The AP stream this session points at, however it was specified."""
+    from ._io import spikeglx
+
+    npx = config.neuropixels
+    if npx.bin_file is not None:
+        return spikeglx.stream_info(npx.bin_file, npx.n_chan_bin, npx.sample_rate)
+    files = spikeglx.find_run_files(npx.run_dir, npx.run_name, npx.gate, npx.trigger, probe)
+    if files["ap"] is None:
+        raise FileNotFoundError(
+            f"no AP binary for run {npx.run_name} g{npx.gate} imec{probe}"
+        )
+    return spikeglx.stream_info(files["ap"])
+
+
+# ----------------------------------------------------------------------------
+# Step 2: the recording
+# ----------------------------------------------------------------------------
+
+
+def load_spike_continuous(
+    config: SessionConfig,
+    system: str,
+    probe: dict | None = None,
+    probe_index: int = 0,
+) -> Any | None:
+    """The spike-band continuous data for one system, as a SpikeInterface recording.
+
+    Not the LFP and not the sync channels -- those have verbs of their own. The
+    probe is attached here, so everything downstream stops caring which system
+    produced the samples. Pass ``probe`` to override the configured map for one
+    run, for trying a map before committing it to the session file.
+    """
+    _check(system)
+    if not getattr(config, f"has_{system}_data"):
+        return None
+
+    import spikeinterface.full as si
+
+    from ._probes.common import to_probeinterface
+
+    if system == "blackrock":
+        from ._io import blackrock
+
+        spec = config.blackrock
+        if spec.spike_file is None:
+            raise ValueError("blackrock.spike_file is required to load Blackrock data")
+        recording = blackrock.read_recording(
+            spec.spike_file, stream_id=spec.stream_id, exclude_channels=spec.exclude_channels
+        )
+    else:
+        info = _neuropixels_stream(config, probe_index)
+        recording = si.read_binary(
+            file_paths=[str(info.path)],
+            sampling_frequency=float(info.fs),
+            num_channels=int(info.n_chan),
+            dtype="int16",
+        )
+
+    probe = probe if probe is not None else setup_probe(config, system)
+    return recording.set_probe(to_probeinterface(probe))
+
+
+# ----------------------------------------------------------------------------
+# Step 3: preprocessing
+# ----------------------------------------------------------------------------
+
+
+def preprocess(recording: Any, config: SessionConfig, system: str) -> Any | None:
+    """Apply this system's ``preprocess:`` block.
+
+    Returns the recording unchanged when the block says ``apply: false``, and
+    ``None`` when given ``None``, so it is always safe to call in a sequence.
+
+    Order matters: bad-channel detection *drops* channels, then bandpass, then
+    the common reference. ``common_reference`` is ``"median"`` (CMR),
+    ``"average"``/``"mean"`` (CAR), or ``null`` for none.
+    """
+    _check(system)
+    if recording is None:
+        return None
+
+    from ._preprocess import describe_preprocessing, preprocess_recording
+
+    settings = describe_preprocessing(config.preprocess_for(system))
+    if not settings.pop("apply", False):
+        return recording
+
+    result, info = preprocess_recording(recording, **settings)
+    log.info("preprocessing applied to %s: %s", system, info)
     return result
 
 
-def step_lfp(config: SessionConfig, probe: int = 0, decimate: int = 1) -> StepResult:
-    """Export the Neuropixels LF band (part of step 2, run on its own).
+# ----------------------------------------------------------------------------
+# Step 4: sorting
+# ----------------------------------------------------------------------------
 
-    A stage of its own rather than a flag on extraction, because its cost is
-    unlike anything else here: no compute, no GPU, just bulk I/O. The LF band is
-    ~7 GB per hour for a 385-channel probe and ``decimate=1`` writes an output
-    the same size as the input, so this wants to run where the recording lives.
 
-    Deliberately *not* in the default order -- a full run should not silently
-    write another copy of the recording.
+def sort_with_kilosort(
+    recording: Any,
+    config: SessionConfig,
+    system: str,
+    results_dir: Path | None = None,
+) -> Any | None:
+    """Run Kilosort4 on a loaded, preprocessed recording. Returns a ``SortResult``.
+
+    Returns ``None`` without sorting when ``kilosort_on_<system>`` is false --
+    the "extract the pulses and the LFP but do not sort" case -- or when given no
+    recording.
     """
-    from .io import spikeglx
+    _check(system)
+    if recording is None or not getattr(config, f"sorts_{system}"):
+        return None
 
-    result = StepResult("lfp", "ok")
-    if not config.has_neuropixels_data:
-        result.status = "skipped"
-        result.note("has_neuropixels_data is false")
-        return result
+    from ._sort import sort_recording
+
+    return sort_recording(config, system, recording, results_dir=results_dir)
+
+
+# ----------------------------------------------------------------------------
+# Step 5: sync pulses and LFP
+# ----------------------------------------------------------------------------
+
+
+def extract_sync(config: SessionConfig, system: str, probe: int = 0) -> Any | None:
+    """Extract one system's sync edges to its own ``sync/``. Returns a report.
+
+    Runs CatGT where the machine has it, always runs the NumPy detector, and
+    compares them -- that agreement is what lets the fallback be trusted on a
+    machine without CatGT.
+    """
+    _check(system)
+    if not getattr(config, f"has_{system}_data"):
+        return None
+
+    if system == "neuropixels":
+        return extract.extract_neuropixels_edges(config, probe)
+    return extract.extract_blackrock_edges(config)
+
+
+def extract_lfp(
+    config: SessionConfig, system: str, decimate: int = 1, probe: int = 0
+) -> Path | None:
+    """Export one system's LFP. Returns the path written, or ``None``.
+
+    Blackrock always returns ``None``: Central already saves those separately.
+
+    Bulk I/O, no compute -- the LF band is ~7 GB/hour at 385 channels and
+    ``decimate=1`` writes an output the size of the input, so run this where the
+    recording lives. Decimation is a plain stride with no anti-alias filter; the
+    LF band is hardware-limited to ~500 Hz at 2500 Hz sampling, so 2 is safe and
+    more aliases.
+    """
+    _check(system)
+    if system == "blackrock" or not config.has_neuropixels_data:
+        return None
+
+    from ._io import spikeglx
 
     npx = config.neuropixels
     if npx.run_dir is None or not npx.run_name:
-        result.status = "skipped"
-        result.note("no SpikeGLX run (run_dir + run_name); nothing to export")
-        return result
-
+        return None
     try:
         files = spikeglx.find_run_files(npx.run_dir, npx.run_name, npx.gate, npx.trigger, probe)
-    except FileNotFoundError as error:
-        result.status = "skipped"
-        result.note(f"no .lf.bin stream to export: {error}")
-        return result
+    except FileNotFoundError:
+        return None
     if files["lf"] is None:
-        result.status = "skipped"
-        result.note("no .lf.bin stream in this run")
-        return result
+        return None
 
     path = spikeglx.export_lfp(files["lf"], config.paths.lfp, decimate=decimate)
-    result.note(f"wrote {path}" + (f" (decimated {decimate}x)" if decimate > 1 else ""))
-    result.data["lfp"] = path
-    return result
-
-
-# ----------------------------------------------------------------------------
-# Step 3 + 4: sorting
-# ----------------------------------------------------------------------------
-
-
-def _sorting_environment_note(error: Exception) -> str:
-    """A missing sorter is an environment problem; say which one and how to fix it."""
-    return (
-        f"cannot sort here ({error}). Sorting needs the 'kilosort4' "
-        "conda environment with a CUDA build of torch:\n"
-        "         conda activate kilosort4\n"
-        "       Every other stage -- sync extraction, alignment, export -- runs "
-        "without it."
-    )
-
-
-def _is_environment_problem(error: Exception) -> bool:
-    """Is this "the machine is not set up" rather than "the data is wrong"?
-
-    SpikeInterface reports a missing sorter as a plain ``Exception`` carrying
-    "is not installed", so an ImportError check alone misses it and the stage
-    dies with a traceback instead of the note telling you which env to activate.
-    """
-    return isinstance(error, ImportError) or "not installed" in str(error)
-
-
-def step_sort_neuropixels(config: SessionConfig, probe_index: int = 0) -> StepResult:
-    """Run Kilosort4 on the Neuropixels AP binary."""
-    result = StepResult("sort_neuropixels", "ok")
-    if not config.sorts_neuropixels:
-        result.status = "skipped"
-        result.note(
-            "has_neuropixels_data is false"
-            if not config.has_neuropixels_data
-            else "kilosort_on_neuropixels is false"
-        )
-        return result
-
-    try:
-        from .api import load_data, preprocess, sort
-    except ImportError as error:
-        result.status = "failed"
-        result.note(_sorting_environment_note(error))
-        return result
-
-    try:
-        recording = load_data(config, "neuropixels", probe_index=probe_index)
-        recording = preprocess(recording, config, "neuropixels")
-        sorted_result = sort(recording, config, "neuropixels")
-    except Exception as error:
-        result.status = "failed"
-        result.note(
-            _sorting_environment_note(error)
-            if _is_environment_problem(error)
-            else f"{type(error).__name__}: {error}"
-        )
-        return result
-    result.note(
-        f"{sorted_result.n_units} units, {sorted_result.n_spikes} spikes "
-        f"-> {sorted_result.results_dir}"
-    )
-    result.notes.extend(sorted_result.notes)
-    result.data["sort"] = sorted_result
-    return result
-
-
-def step_sort_blackrock(config: SessionConfig, probe: dict | None = None) -> StepResult:
-    """Run Kilosort4 on the Utah array file through SpikeInterface."""
-    result = StepResult("sort_blackrock", "ok")
-    if not config.sorts_blackrock:
-        result.status = "skipped"
-        result.note(
-            "has_blackrock_data is false"
-            if not config.has_blackrock_data
-            else "kilosort_on_blackrock is false"
-        )
-        return result
-    if config.blackrock.spike_file is None:
-        result.status = "skipped"
-        result.note("no blackrock.spike_file configured")
-        return result
-
-    try:
-        from .api import load_data, preprocess, sort
-
-        recording = load_data(config, "blackrock", probe=probe)
-        recording = preprocess(recording, config, "blackrock")
-        sorted_result = sort(recording, config, "blackrock")
-    except Exception as error:
-        result.status = "failed"
-        result.note(
-            _sorting_environment_note(error)
-            if _is_environment_problem(error)
-            else f"{type(error).__name__}: {error}"
-        )
-        return result
-    result.note(f"{sorted_result.n_units} units -> {sorted_result.results_dir}")
-    result.notes.extend(sorted_result.notes)
-    result.data["sort"] = sorted_result
-    return result
-
-
-# ----------------------------------------------------------------------------
-# Step 7 + 10: export
-# ----------------------------------------------------------------------------
-
-
-def step_export(
-    config: SessionConfig,
-    system: str = "neuropixels",
-    groups: tuple[str, ...] = ("good", "mua"),
-    figures: bool = True,
-    max_unit_figures: int = 40,
-) -> StepResult:
-    """Export metrics, figures and the final bundle for a sorted folder.
-
-    Uses aligned spike times when ``aligned/spike_seconds_blackrock.npy`` exists
-    (written by :func:`step_align`), and says which timebase it used.
-    """
-    from .export import final, metrics
-    from .export.curated import load_phy_results, select_units
-    from .plots import summary as plots
-
-    result = StepResult(f"export_{system}", "ok")
-    results_dir = config.paths.sorted_np if system == "neuropixels" else config.paths.sorted_br
-    if not (results_dir / "spike_times.npy").exists():
-        result.status = "skipped"
-        result.note(f"no sorting results in {results_dir}")
-        return result
-
-    phy = load_phy_results(results_dir)
-    unit_ids = select_units(phy, groups)
-    result.note(
-        f"{phy.unit_ids.size} units total, {unit_ids.size} selected "
-        f"({'curated' if phy.curated else 'not curated in Phy'}; groups={groups})"
-    )
-
-    aligned_path = config.paths.aligned / f"{system}_spike_seconds_blackrock.npy"
-    spike_times_s: dict[int, np.ndarray] | None = None
-    timebase = "sorter"
-    if aligned_path.exists():
-        aligned = np.load(aligned_path)
-        if aligned.size != phy.spike_samples.size:
-            result.note(
-                f"aligned times ({aligned.size}) do not match spike count "
-                f"({phy.spike_samples.size}); exporting in the sorter timebase instead"
-            )
-        else:
-            spike_times_s = {
-                int(uid): aligned[phy.spike_clusters == uid] for uid in unit_ids
-            }
-            timebase = "blackrock"
-    result.note(f"timebase: {timebase}")
-
-    out_dir = config.paths.aligned if timebase == "blackrock" else results_dir / "export"
-    paths = final.export_units(
-        out_dir,
-        phy,
-        unit_ids=unit_ids,
-        spike_times_s=spike_times_s,
-        timebase=timebase,
-        provenance={"session": config.session, "system": system, "machine": config.machine.name},
-    )
-    result.note(f"exported {len(unit_ids)} units -> {out_dir}")
-    result.data["paths"] = paths
-    result.data["timebase"] = timebase
-
-    if figures and unit_ids.size:
-        figure_dir = config.paths.figures / system
-        duration = phy.duration_s
-        drawn = 0
-        for unit_id in unit_ids[:max_unit_figures]:
-            unit_id = int(unit_id)
-            times = (
-                spike_times_s[unit_id] if spike_times_s is not None else phy.times_for(unit_id)
-            )
-            waveform, channel = final.mean_template_waveform(phy, unit_id)
-            isi = metrics.compute_isi(times)
-            isi_counts, isi_edges = metrics.compute_isi_histogram(isi)
-            centers, rate = metrics.compute_firing_rate(times, duration, bin_s=max(1.0, duration / 100))
-            amps = phy.amplitudes_for(unit_id)
-
-            figure = plots.plot_unit_summary(
-                {
-                    "unit_id": unit_id,
-                    "label": phy.labels.get(unit_id, "unsorted"),
-                    "channel": channel,
-                    "n_spikes": int(times.size),
-                    "waveform": waveform,
-                    "waveform_t_ms": (
-                        np.arange(waveform.size) / phy.fs * 1000.0 if waveform.size else None
-                    ),
-                    "isi_counts": isi_counts,
-                    "isi_edges_ms": isi_edges,
-                    "rate_centers_s": centers,
-                    "rate_hz": rate,
-                    "amp_times_s": times,
-                    "amplitudes": amps,
-                }
-            )
-            plots.save_figure(figure, figure_dir / f"unit_{unit_id:04d}.png")
-            drawn += 1
-
-        table = final.build_unit_table(phy, unit_ids, spike_times_s)
-        overview = plots.plot_sorting_overview(
-            table["firing_rate_hz"].to_numpy(),
-            amplitudes=table["amp_median"].to_numpy() if "amp_median" in table else None,
-            contamination_pct=(
-                table["isi_fraction"].to_numpy() * 100 if "isi_fraction" in table else None
-            ),
-        )
-        plots.save_figure(overview, figure_dir / "overview.png")
-        result.note(f"wrote {drawn} unit figures + overview -> {figure_dir}")
-        if unit_ids.size > max_unit_figures:
-            result.note(
-                f"NOTE: only the first {max_unit_figures} of {unit_ids.size} units were plotted "
-                f"(--max-unit-figures to change)"
-            )
-
-    return result
-
-
-# ----------------------------------------------------------------------------
-# Step 8: alignment
-# ----------------------------------------------------------------------------
+    log.info("wrote %s%s", path, f" (decimated {decimate}x)" if decimate > 1 else "")
+    return path
 
 
 def _load_edges(config: SessionConfig, name: str) -> np.ndarray | None:
-    # Each system's edges sit beside its own recording, so the file to read
-    # depends on which system produced it.
+    """One edge file. Each system's edges sit beside its own recording."""
     system = extract.EDGE_SYSTEM[name]
     if config.paths.dir_for(system) is None:
         return None
@@ -380,20 +386,54 @@ def _load_edges(config: SessionConfig, name: str) -> np.ndarray | None:
     return catgt.read_edge_file(path) if path.exists() else None
 
 
-def step_align(config: SessionConfig, system: str = "neuropixels") -> StepResult:
-    """Map sorted spike times onto the Blackrock timebase (step 8).
+# ----------------------------------------------------------------------------
+# Step 6: onto the Blackrock timebase
+# ----------------------------------------------------------------------------
 
-    Coarse offset from the 14 s bursts, then fine alignment on the 1 Hz train --
-    by TPrime when it is installed, otherwise by a least-squares fit of the same
-    matched edges. Both paths write the same output file.
+
+@dataclass
+class TimeMap:
+    """The fitted map from one system's clock onto Blackrock time."""
+
+    mapping: align.LinearMap
+    coarse_offset_s: float
+    #: "tprime", "linear_fit", or "map_only" when there was no sorting to map.
+    method: str
+    aligned_path: Path | None = None
+    burst_match: Any | None = None
+
+    def summary(self) -> str:
+        m = self.mapping
+        return (
+            f"coarse offset {self.coarse_offset_s:.6f} s; "
+            f"slope {m.slope:.9f} ({m.drift_ppm:+.1f} ppm), "
+            f"intercept {m.intercept:.6f} s, from {m.n_points} edges "
+            f"[{self.method}]"
+        )
+
+
+def time_remapping(config: SessionConfig, system: str = "neuropixels") -> TimeMap | None:
+    """Map ``system``'s spike times onto Blackrock time. Returns a :class:`TimeMap`.
+
+    Blackrock is the reference timebase, so it is not an argument -- this maps
+    onto it, never the reverse.
+
+    Coarse offset from the 14 s coded bursts first: their onsets alone are
+    periodic and ambiguous, so the full pulse trains are matched on the coded
+    intra-burst pattern to pick the right cycle. Then both 1 Hz trains are
+    trimmed to their overlap and a linear map is fitted -- by TPrime where it is
+    installed, otherwise by least squares on the same matched edges. Both paths
+    write the same output file.
+
+    Returns ``None`` when ``skip_sync`` is set, when asked for Blackrock itself
+    (there is nothing to map the reference onto), or when the edge files are
+    missing.
     """
-    from .sync import tprime as tprime_mod
+    _check(system)
+    if config.skip_sync or system == REFERENCE_SYSTEM:
+        return None
 
-    result = StepResult("align", "ok")
-    if config.skip_sync:
-        result.status = "skipped"
-        result.note("skip_sync is set (no cross-system alignment for this session)")
-        return result
+    from ._sync import tprime as tprime_mod
 
     br_1hz = _load_edges(config, extract.BR_1HZ)
     npx_1hz = _load_edges(config, extract.NPX_1HZ)
@@ -402,84 +442,83 @@ def step_align(config: SessionConfig, system: str = "neuropixels") -> StepResult
 
     missing = [
         name
-        for name, values in [
-            (extract.BR_1HZ, br_1hz),
-            (extract.NPX_1HZ, npx_1hz),
-        ]
+        for name, values in ((extract.BR_1HZ, br_1hz), (extract.NPX_1HZ, npx_1hz))
         if values is None or values.size == 0
     ]
     if missing:
-        result.status = "skipped"
-        result.note(f"missing or empty edge files: {', '.join(missing)}; run extract_sync first")
-        return result
+        log.warning(
+            "missing or empty edge files: %s; run extract_sync first", ", ".join(missing)
+        )
+        return None
 
     # 1. Coarse offset from the 14 s coded bursts.
-    offset = 0.0
+    match = None
     if br_burst is not None and npx_burst is not None and br_burst.size and npx_burst.size:
         match = burst.match_bursts(br_burst, npx_burst, min_gap_s=config.burst_interval_s / 2)
         offset = match.offset_s
-        result.note(
-            f"coarse offset {offset:.6f} s from {match.n_matched} matched bursts "
-            f"(of {match.n_reference} Blackrock / {match.n_other} SpikeGLX), "
-            f"max residual {match.max_residual_s * 1e3:.3f} ms"
+        log.info(
+            "coarse offset %.6f s from %d matched bursts (of %d Blackrock / %d SpikeGLX), "
+            "max residual %.3f ms",
+            offset, match.n_matched, match.n_reference, match.n_other,
+            match.max_residual_s * 1e3,
         )
-        result.data["burst_match"] = match
     else:
-        result.note(
+        log.warning(
             "no burst edges on one or both systems; falling back to a 1 Hz-only offset "
             "estimate, which cannot resolve whole-cycle ambiguity"
         )
         offset = burst.estimate_offset(br_1hz, npx_1hz, tolerance_s=0.1)
-        result.note(f"coarse offset {offset:.6f} s from the 1 Hz trains")
+        log.info("coarse offset %.6f s from the 1 Hz trains", offset)
 
-    # 2. Trim both 1 Hz trains to their overlapping window.
+    # 2. Trim both 1 Hz trains to their overlapping window. TPrime aligns edge
+    #    *sequences*, so an edge present in only one recording shifts the
+    #    correspondence by whole cycles.
     br_trim, npx_trim = align.trim_pair_to_overlap(
         br_1hz, npx_1hz, offset, margin_s=config.sync_period_s / 4
     )
-    result.note(
-        f"1 Hz trains trimmed to overlap: Blackrock {br_1hz.size} -> {br_trim.size}, "
-        f"SpikeGLX {npx_1hz.size} -> {npx_trim.size}"
+    log.info(
+        "1 Hz trains trimmed to overlap: Blackrock %d -> %d, SpikeGLX %d -> %d",
+        br_1hz.size, br_trim.size, npx_1hz.size, npx_trim.size,
     )
     aligned_dir = config.paths.aligned
     aligned_dir.mkdir(parents=True, exist_ok=True)
     br_trim_path = catgt.write_edge_file(aligned_dir / "blackrock_1hz_trimmed.txt", br_trim)
     npx_trim_path = catgt.write_edge_file(aligned_dir / "npx_1hz_trimmed.txt", npx_trim)
 
-    # 3. Pair the trimmed edges and fit the linear map (also the TPrime fallback).
+    # 3. Pair the trimmed edges and fit the map (also the TPrime fallback).
     ref_idx, other_idx = burst.match_times(
         br_trim, npx_trim, offset, tolerance_s=config.sync_period_s / 4
     )
     if ref_idx.size < 2:
-        result.status = "failed"
-        result.note(f"only {ref_idx.size} matched 1 Hz edges; cannot fit a time map")
-        return result
+        raise ValueError(f"only {ref_idx.size} matched 1 Hz edges; cannot fit a time map")
 
     mapping = align.fit_linear_map(npx_trim[other_idx], br_trim[ref_idx])
-    result.note(
-        f"linear map from {mapping.n_points} matched edges: "
-        f"slope {mapping.slope:.9f} ({mapping.drift_ppm:+.1f} ppm), "
-        f"intercept {mapping.intercept:.6f} s, "
-        f"fit residual max {np.abs(mapping.residuals_s).max() * 1e6:.1f} us"
+    log.info(
+        "linear map from %d matched edges: slope %.9f (%+.1f ppm), intercept %.6f s, "
+        "fit residual max %.1f us",
+        mapping.n_points, mapping.slope, mapping.drift_ppm, mapping.intercept,
+        np.abs(mapping.residuals_s).max() * 1e6,
     )
-    result.data["map"] = mapping
 
     # 4. Convert Kilosort sample indices to seconds, then map them.
-    results_dir = config.paths.sorted_np if system == "neuropixels" else config.paths.sorted_br
+    results_dir = config.paths.sorted_for(system)
     spike_times_path = results_dir / "spike_times.npy"
     if not spike_times_path.exists():
-        result.note(f"no sorting at {results_dir}; wrote the time map only")
+        log.info("no sorting at %s; wrote the time map only", results_dir)
         _save_map(aligned_dir, mapping, offset, config)
-        return result
+        return TimeMap(mapping, offset, "map_only", burst_match=match)
 
-    from .export.curated import parse_params_py
+    from ._export.curated import parse_params_py
 
     params = parse_params_py(results_dir / "params.py")
     fs = float(params.get("sample_rate", 0.0) or 0.0)
     if not fs:
-        result.status = "failed"
-        result.note(f"no sample_rate in {results_dir / 'params.py'}; cannot convert spike times")
-        return result
+        raise ValueError(
+            f"no sample_rate in {results_dir / 'params.py'}; cannot convert spike times"
+        )
 
+    # Kilosort writes sample indices; TPrime needs seconds. Skipping this is the
+    # easiest way to produce a confidently wrong alignment.
     spike_seconds = tprime_mod.spike_times_to_seconds(np.load(spike_times_path), fs)
     seconds_path = aligned_dir / f"{system}_spike_seconds.npy"
     np.save(seconds_path, spike_seconds)
@@ -492,24 +531,26 @@ def step_align(config: SessionConfig, system: str = "neuropixels") -> StepResult
             events=[tprime_mod.TPrimeEvent(1, seconds_path, out_path)],
             sync_period_s=config.sync_period_s,
         )
-        result.note("TPrime command: " + " ".join(args))
+        log.info("TPrime command: %s", " ".join(args))
         tprime_mod.run_tprime(config.machine.tprime_dir, args)
-        result.note(f"TPrime mapped {spike_seconds.size} spike times -> {out_path.name}")
-        result.data["method"] = "tprime"
+        log.info("TPrime mapped %d spike times -> %s", spike_seconds.size, out_path.name)
+        method = "tprime"
     else:
         np.save(out_path, mapping.apply(spike_seconds))
-        result.note(
-            f"TPrime not available on machine '{config.machine.name}'; applied the "
-            f"least-squares map to {spike_seconds.size} spike times instead"
+        log.info(
+            "TPrime not available on machine '%s'; applied the least-squares map to "
+            "%d spike times instead",
+            config.machine.name, spike_seconds.size,
         )
-        result.data["method"] = "linear_fit"
+        method = "linear_fit"
 
     _save_map(aligned_dir, mapping, offset, config)
-    result.data["aligned_path"] = out_path
-    return result
+    return TimeMap(mapping, offset, method, aligned_path=out_path, burst_match=match)
 
 
-def _save_map(aligned_dir: Path, mapping: align.LinearMap, offset: float, config: SessionConfig) -> None:
+def _save_map(
+    aligned_dir: Path, mapping: align.LinearMap, offset: float, config: SessionConfig
+) -> None:
     payload = {
         "session": config.session,
         "reference_timebase": "blackrock",
@@ -525,42 +566,36 @@ def _save_map(aligned_dir: Path, mapping: align.LinearMap, offset: float, config
         json.dump(payload, handle, indent=2)
 
 
-# ----------------------------------------------------------------------------
-# Step 9: validation
-# ----------------------------------------------------------------------------
+def validate_remapping(config: SessionConfig, figures: bool = True) -> Any | None:
+    """Check the map against the 14 s burst onsets. Returns a ``ValidationReport``.
 
+    A real check precisely because the bursts were **held out** of the 1 Hz fit.
+    Uncorrected clock drift of tens of ppm is 72 ms/hour at 20 ppm and fails the
+    1 ms tolerance, which is the point.
 
-def step_validate(config: SessionConfig, figures: bool = True) -> StepResult:
-    """Check the alignment against the 14 s bursts (step 9).
-
-    This is the independent check: the mapping was fit on the 1 Hz train, so the
-    bursts are held-out data. Residuals must stay under
-    ``alignment_tolerance_s``.
+    Returns ``None`` when ``skip_sync`` is set, no map has been fitted, or
+    neither system recorded bursts -- in which case the 1 Hz fit residuals in
+    ``time_map.json`` are the only quality measure, and they are not held-out.
     """
-    from .plots import summary as plots
+    from ._plots import summary as plots
 
-    result = StepResult("validate_alignment", "ok")
     if config.skip_sync:
-        result.status = "skipped"
-        result.note("skip_sync is set")
-        return result
+        return None
 
     map_path = config.paths.aligned / "time_map.json"
     if not map_path.exists():
-        result.status = "skipped"
-        result.note(f"no time map at {map_path}; run align first")
-        return result
+        log.warning("no time map at %s; run time_remapping first", map_path)
+        return None
 
     br_burst = _load_edges(config, extract.BR_BURST)
     npx_burst = _load_edges(config, extract.NPX_BURST)
     if br_burst is None or npx_burst is None or not br_burst.size or not npx_burst.size:
-        result.status = "skipped"
-        result.note(
+        log.warning(
             "no 14 s burst edges on one or both systems, so the alignment cannot be "
             "independently validated. The 1 Hz fit residuals in time_map.json are the "
             "only available quality measure, and they are not held-out data."
         )
-        return result
+        return None
 
     with open(map_path, "r", encoding="utf-8") as handle:
         payload = json.load(handle)
@@ -573,14 +608,10 @@ def step_validate(config: SessionConfig, figures: bool = True) -> StepResult:
 
     br_onsets = burst.group_burst_onsets(br_burst, config.burst_interval_s / 2)
     npx_onsets = burst.group_burst_onsets(npx_burst, config.burst_interval_s / 2)
-    mapped = mapping.apply(npx_onsets)
-
     report = align.validate_alignment(
-        mapped, br_onsets, tolerance_s=config.alignment_tolerance_s
+        mapping.apply(npx_onsets), br_onsets, tolerance_s=config.alignment_tolerance_s
     )
-    result.note(report.summary())
-    result.status = "ok" if report.passed else "failed"
-    result.data["report"] = report
+    log.info("%s", report.summary())
 
     with open(config.paths.aligned / "validation.json", "w", encoding="utf-8") as handle:
         json.dump(
@@ -599,19 +630,127 @@ def step_validate(config: SessionConfig, figures: bool = True) -> StepResult:
         axes = plots.plot_alignment_residuals(
             report.times_s, report.residuals_s, report.tolerance_s
         )
-        plots.save_figure(axes.figure, config.paths.figures / "alignment_residuals.png")
-        result.note(f"wrote {config.paths.figures / 'alignment_residuals.png'}")
+        path = config.paths.figures / "alignment_residuals.png"
+        plots.save_figure(axes.figure, path)
+        log.info("wrote %s", path)
 
-    return result
+    return report
 
 
-#: Step name -> callable, for the two ``run_*_pipeline.py --steps`` scripts.
-STEPS = {
-    "extract_sync": step_extract_sync,
-    "lfp": step_lfp,
-    "sort_neuropixels": step_sort_neuropixels,
-    "sort_blackrock": step_sort_blackrock,
-    "align": step_align,
-    "validate": step_validate,
-    "export": step_export,
-}
+# ----------------------------------------------------------------------------
+# Step 7: export
+# ----------------------------------------------------------------------------
+
+
+def export_results(
+    config: SessionConfig,
+    system: str = "neuropixels",
+    groups: tuple[str, ...] = ("good", "mua"),
+    figures: bool = True,
+    max_unit_figures: int = 40,
+) -> dict | None:
+    """Export metrics, figures and the final bundle for a sorted folder.
+
+    Uses aligned spike times when ``time_remapping`` has written them, and
+    records which timebase it used. Reads Phy's ``cluster_group.tsv`` where it
+    exists, so curated labels override Kilosort's own.
+
+    Returns ``None`` when that system has no sorting output.
+    """
+    _check(system)
+    from ._export import final, metrics
+    from ._export.curated import load_phy_results, select_units
+    from ._plots import summary as plots
+
+    if not getattr(config, f"has_{system}_data"):
+        return None
+
+    results_dir = config.paths.sorted_for(system)
+    if not (results_dir / "spike_times.npy").exists():
+        log.info("no sorting results in %s", results_dir)
+        return None
+
+    phy = load_phy_results(results_dir)
+    unit_ids = select_units(phy, groups)
+    log.info(
+        "%d units total, %d selected (%s; groups=%s)",
+        phy.unit_ids.size, unit_ids.size,
+        "curated" if phy.curated else "not curated in Phy", groups,
+    )
+
+    aligned_path = config.paths.aligned / f"{system}_spike_seconds_blackrock.npy"
+    spike_times_s: dict[int, np.ndarray] | None = None
+    timebase = "sorter"
+    if aligned_path.exists():
+        aligned = np.load(aligned_path)
+        if aligned.size != phy.spike_samples.size:
+            log.warning(
+                "aligned times (%d) do not match spike count (%d); exporting in the "
+                "sorter timebase instead",
+                aligned.size, phy.spike_samples.size,
+            )
+        else:
+            spike_times_s = {int(uid): aligned[phy.spike_clusters == uid] for uid in unit_ids}
+            timebase = "blackrock"
+    log.info("timebase: %s", timebase)
+
+    out_dir = config.paths.aligned if timebase == "blackrock" else results_dir / "export"
+    paths = final.export_units(
+        out_dir,
+        phy,
+        unit_ids=unit_ids,
+        spike_times_s=spike_times_s,
+        timebase=timebase,
+        provenance={"session": config.session, "system": system, "machine": config.machine.name},
+    )
+    log.info("exported %d units -> %s", unit_ids.size, out_dir)
+
+    if figures and unit_ids.size:
+        figure_dir = config.paths.figures / system
+        duration = phy.duration_s
+        for unit_id in unit_ids[:max_unit_figures]:
+            unit_id = int(unit_id)
+            times = spike_times_s[unit_id] if spike_times_s is not None else phy.times_for(unit_id)
+            waveform, channel = final.mean_template_waveform(phy, unit_id)
+            isi_counts, isi_edges = metrics.compute_isi_histogram(metrics.compute_isi(times))
+            centers, rate = metrics.compute_firing_rate(
+                times, duration, bin_s=max(1.0, duration / 100)
+            )
+            figure = plots.plot_unit_summary(
+                {
+                    "unit_id": unit_id,
+                    "label": phy.labels.get(unit_id, "unsorted"),
+                    "channel": channel,
+                    "n_spikes": int(times.size),
+                    "waveform": waveform,
+                    "waveform_t_ms": (
+                        np.arange(waveform.size) / phy.fs * 1000.0 if waveform.size else None
+                    ),
+                    "isi_counts": isi_counts,
+                    "isi_edges_ms": isi_edges,
+                    "rate_centers_s": centers,
+                    "rate_hz": rate,
+                    "amp_times_s": times,
+                    "amplitudes": phy.amplitudes_for(unit_id),
+                }
+            )
+            plots.save_figure(figure, figure_dir / f"unit_{unit_id:04d}.png")
+
+        table = final.build_unit_table(phy, unit_ids, spike_times_s)
+        overview = plots.plot_sorting_overview(
+            table["firing_rate_hz"].to_numpy(),
+            amplitudes=table["amp_median"].to_numpy() if "amp_median" in table else None,
+            contamination_pct=(
+                table["isi_fraction"].to_numpy() * 100 if "isi_fraction" in table else None
+            ),
+        )
+        plots.save_figure(overview, figure_dir / "overview.png")
+        drawn = min(unit_ids.size, max_unit_figures)
+        log.info("wrote %d unit figures + overview -> %s", drawn, figure_dir)
+        if unit_ids.size > max_unit_figures:
+            log.warning(
+                "only the first %d of %d units were plotted (--max-unit-figures to change)",
+                max_unit_figures, unit_ids.size,
+            )
+
+    return {"paths": paths, "timebase": timebase, "n_units": int(unit_ids.size)}

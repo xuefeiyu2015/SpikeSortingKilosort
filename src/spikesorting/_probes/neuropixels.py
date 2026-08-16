@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..io import spikeglx
+from .._io import spikeglx
 
 __all__ = ["probe_from_geom", "probe_from_meta"]
 
@@ -30,7 +30,7 @@ def probe_from_geom(geom: np.ndarray, shank_pitch_um: float = 0.0) -> dict:
     """Build a Kilosort probe dict from a parsed ``~snsGeomMap`` array.
 
     ``geom`` is ``(n, 4)`` of ``[shank, x, z, used]`` as returned by
-    :func:`spikesorting.io.spikeglx.parse_geom_map`.
+    :func:`spikesorting._io.spikeglx.parse_geom_map`.
 
     ``shank_pitch_um`` shifts each shank's x by ``shank * pitch``. SpikeGLX
     reports x relative to each shank's own origin, so without this every shank of

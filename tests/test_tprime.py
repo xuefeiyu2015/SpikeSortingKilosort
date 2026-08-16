@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from spikesorting.sync import tprime
+from spikesorting._sync import tprime
 
 
 def test_build_args_matches_the_documented_shape():

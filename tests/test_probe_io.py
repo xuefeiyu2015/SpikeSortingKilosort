@@ -7,9 +7,9 @@ import json
 import numpy as np
 import pytest
 
-from spikesorting.io import spikeglx
-from spikesorting.probes import io as probe_io
-from spikesorting.probes import neuropixels, utah
+from spikesorting._io import spikeglx
+from spikesorting._probes import io as probe_io
+from spikesorting._probes import neuropixels, utah
 
 
 def linear_probe(n=8):

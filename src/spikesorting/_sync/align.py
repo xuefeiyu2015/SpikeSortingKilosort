@@ -8,7 +8,7 @@ Two mappings live here:
 * :func:`fit_linear_map` -- a least-squares fit of the matched 1 Hz edges. Enough
   on its own for most purposes, and the fallback when TPrime is unavailable
   (the HPC, macOS).
-* TPrime -- the authoritative fine alignment, run by :mod:`spikesorting.sync.tprime`.
+* TPrime -- the authoritative fine alignment, run by :mod:`spikesorting._sync.tprime`.
 
 Both are validated the same way: map the 14 s burst onsets and check the
 residuals, which is pipeline step 9.

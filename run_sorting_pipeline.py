@@ -14,8 +14,8 @@ Which systems run is the session's business, not this script's:
     has_<system>_data       false -> nothing for that system runs at all
     kilosort_on_<system>    false -> extract its pulses and LFP, but do not sort
 
-Only the sorting needs a GPU. Nothing here reads an edge file, so the whole thing
-can also be split across machines -- see --steps.
+Only the sorting needs a GPU. Nothing here reads an edge file, so the halves can
+also be split across machines -- see --steps.
 
 Exits non-zero if any stage fails. Stages that are skipped are reported and do
 not fail the run.
@@ -23,23 +23,18 @@ not fail the run.
 
 from __future__ import annotations
 
+import logging
 import sys
-import traceback
 from pathlib import Path
 
-# The shared CLI helpers live with the numbered stages; _cli adds src/ itself.
-sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+# The shared CLI helpers live in tools/; _cli adds src/ itself.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 
-from _cli import build_parser, load, report  # noqa: E402
+from _cli import Runner, build_parser, load  # noqa: E402
 
-from spikesorting.pipeline import (  # noqa: E402
-    step_extract_sync,
-    step_lfp,
-    step_sort_blackrock,
-    step_sort_neuropixels,
-)
+import spikesorting as ss  # noqa: E402
 
-ORDER = ["extract_sync", "sort_neuropixels", "sort_blackrock"]
+STAGES = ["extract_sync", "sort"]
 
 #: Selectable but not run by default: at decimate=1 the LFP export writes a copy
 #: of the LF band the size of the recording (~7 GB/hour at 385 channels).
@@ -51,9 +46,9 @@ def main() -> int:
     parser.add_argument(
         "--steps",
         nargs="+",
-        default=ORDER,
-        choices=ORDER + OPT_IN,
-        help="stages to run, in the given order (default: all but %s)" % ", ".join(OPT_IN),
+        default=STAGES,
+        choices=STAGES + OPT_IN,
+        help="stages to run (default: all but %s)" % ", ".join(OPT_IN),
     )
     parser.add_argument(
         "--keep-going",
@@ -68,47 +63,39 @@ def main() -> int:
         "at 2500 Hz sampling, so 2 is safe; higher aliases (no anti-alias filter)",
     )
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="       %(message)s")
+
     config = load(args)
-
-    runners = {
-        "extract_sync": lambda: step_extract_sync(config, probe=args.probe),
-        "lfp": lambda: step_lfp(config, probe=args.probe, decimate=args.lfp_decimate),
-        "sort_neuropixels": lambda: step_sort_neuropixels(config, probe_index=args.probe),
-        "sort_blackrock": lambda: step_sort_blackrock(config),
-    }
-
+    run = Runner(config, keep_going=args.keep_going)
     print()
-    failures = 0
-    for name in args.steps:
-        try:
-            result = runners[name]()
-        except Exception as error:  # a stage that blows up should not hide the rest
-            failures += 1
-            print(f"[!!] {name}\n       {type(error).__name__}: {error}")
-            traceback.print_exc()
-            if not args.keep_going:
-                break
-            continue
 
-        print(result.render())
-        if result.status == "failed":
-            failures += 1
-            if not args.keep_going:
-                break
+    # The pipeline, in order. Each verb returns what the next one takes, and
+    # returns None when the session config says not to do that work.
+    for system in ss.SYSTEMS:
+        if "extract_sync" in args.steps:
+            run(ss.extract_sync, config, system, system=system)
 
-    print()
-    if failures:
-        print(f"sorting pipeline finished with {failures} failure(s)")
-        return 1
+        if "lfp" in args.steps:
+            run(ss.extract_lfp, config, system, args.lfp_decimate, system=system)
 
-    print("sorting pipeline finished. Next, by hand:")
-    print("    conda activate phy")
-    for system in ("neuropixels", "blackrock"):
-        if getattr(config, f"sorts_{system}"):
-            print(f"    phy template-gui {config.paths.sorted_for(system)}/params.py")
-    print("then:")
-    print(f"    python run_exporting_pipeline.py --config {args.config}")
-    return 0
+        if "sort" in args.steps:
+            probe = run(ss.setup_probe, config, system, system=system)
+            if run.last_failed:
+                continue  # no map, so loading would fail the same way
+            rec = run(ss.load_spike_continuous, config, system, probe, system=system)
+            rec = run(ss.preprocess, rec, config, system, system=system)
+            run(ss.sort_with_kilosort, rec, config, system, system=system)
+
+    code = run.finish("sorting pipeline")
+    if code == 0:
+        print("\nNext, by hand:")
+        print("    conda activate phy")
+        for system in ss.SYSTEMS:
+            if getattr(config, f"sorts_{system}"):
+                print(f"    phy template-gui {config.paths.sorted_for(system)}/params.py")
+        print("then:")
+        print(f"    python run_exporting_pipeline.py --config {args.config}")
+    return code
 
 
 if __name__ == "__main__":

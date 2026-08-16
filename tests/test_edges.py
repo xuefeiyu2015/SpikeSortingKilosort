@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from conftest import square_wave
 
-from spikesorting.sync import edges
+from spikesorting._sync import edges
 
 
 def test_rising_edges_at_known_times(fs):

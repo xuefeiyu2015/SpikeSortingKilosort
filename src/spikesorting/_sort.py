@@ -19,7 +19,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from .config import SessionConfig
+from ._config import SessionConfig
 
 __all__ = ["SortResult", "sort_recording", "summarize_results"]
 

@@ -11,10 +11,10 @@ import numpy as np
 import pytest
 from conftest import coded_burst_times, square_wave
 
-from spikesorting import config as cfg
-from spikesorting.io import spikeglx
-from spikesorting.pipeline import step_extract_sync
-from spikesorting.sync import align, burst, catgt, extract
+from spikesorting import _config as cfg
+from spikesorting._io import spikeglx
+from spikesorting import extract_sync
+from spikesorting._sync import align, burst, catgt, extract
 
 FS = 30000.0
 CONFIG_DIR = None  # set per-test to the tmp config dir
@@ -121,13 +121,16 @@ def test_extract_records_the_catgt_command_it_would_have_run(tmp_path):
     assert any("no catgt_dir" in note for note in report.notes)
 
 
-def test_step_extract_sync_honours_skip_blackrock(tmp_path):
+def test_extract_sync_returns_none_for_a_system_that_never_recorded(tmp_path):
+    # Each system is extracted on its own now, so "Blackrock did not record" is a
+    # None from that call rather than a note buried in a combined report.
     bin_file = write_ap_with_sync(tmp_path / "s.imec0.ap.bin", duration_s=5.0)
     session = make_session(tmp_path, bin_file)
 
-    result = step_extract_sync(session)
-    assert result.ok
-    assert any("Blackrock extraction skipped" in note for note in result.notes)
+    assert extract_sync(session, "blackrock") is None
+
+    report = extract_sync(session, "neuropixels")
+    assert report is not None
     assert (session.paths.sync_for("neuropixels") / "npx_1hz.txt").exists()
 
 

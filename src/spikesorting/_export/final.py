@@ -13,7 +13,7 @@ sorting was produced:
 ===================== =========================================================
 
 Computation only -- figures are produced separately by
-:mod:`spikesorting.plots.summary` from these same arrays.
+:mod:`spikesorting._plots.summary` from these same arrays.
 """
 
 from __future__ import annotations

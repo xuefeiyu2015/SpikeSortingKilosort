@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from spikesorting.export import metrics
+from spikesorting._export import metrics
 
 
 def test_isi_from_regular_spikes():
