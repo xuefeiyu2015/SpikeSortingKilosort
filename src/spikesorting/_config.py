@@ -39,6 +39,11 @@ __all__ = [
     "downloads_dir",
 ]
 
+#: The sorter this pipeline runs, and the directory results land in. One value so
+#: the two cannot disagree -- a session file naming a different one would only
+#: mislabel a Kilosort4 sorting.
+SORTER_NAME = "kilosort4"
+
 # Repo root is two levels above src/spikesorting/config.py
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -336,7 +341,7 @@ class OutputPaths:
 
     blackrock_dir: Path | None = None
     neuropixels_dir: Path | None = None
-    sorter: str = "kilosort4"
+    sorter: str = SORTER_NAME
 
     def dir_for(self, system: str) -> Path | None:
         """That system's directory, or None when it never recorded."""
@@ -415,23 +420,15 @@ class SessionConfig:
     blackrock_dir: Path | None = None
     neuropixels_dir: Path | None = None
     #: Names the level below ``neuropixels/`` and ``blackrock/`` that results are
-    #: written to, so switching sorter versions does not overwrite a previous run.
-    sorter: str = "kilosort4"
+    #: written to. Not a session setting: which sorter ran is a property of the
+    #: code, so this comes from :data:`SORTER_NAME` and is not read from YAML.
+    sorter: str = SORTER_NAME
     blackrock: BlackrockSpec = field(default_factory=BlackrockSpec)
     neuropixels: NeuropixelsSpec = field(default_factory=NeuropixelsSpec)
-    #: Skip cross-system alignment (steps 8-9). True when only one system ran.
-    skip_sync: bool = False
-    # Two independent questions per system, deliberately not one flag:
-    #
-    #   has_*_data          did this system record at all?
-    #   kilosort_on_*       should its spike data be sorted?
-    #
-    # They come apart in a real case: a session that recorded Neuropixels but is
-    # only wanted for its LFP and sync pulses has data (so its inputs must be
-    # checked and extraction must run) yet no sorting. Absent data always wins --
-    # see :attr:`sorts_neuropixels`.
-    has_neuropixels_data: bool = True
-    has_blackrock_data: bool = True
+    # Whether a system recorded is *derived* from whether its paths are declared
+    # -- see :meth:`has_data`. Only the second question needs asking, because no
+    # path can express it: a session may have recorded Neuropixels and still be
+    # wanted for its LFP and sync pulses alone.
     kilosort_on_neuropixels: bool = True
     kilosort_on_blackrock: bool = True
     #: Period of the fine-alignment square wave, in seconds. TPrime -syncperiod.
@@ -476,15 +473,36 @@ class SessionConfig:
         merged.update(self.preprocess_by_system.get(system) or {})
         return merged
 
+    def has_data(self, system: str) -> bool:
+        """Did this system record? Derived from whether its paths are *declared*.
+
+        Declared, not present on disk. A share that is not mounted must stay
+        "this system recorded, and its files are missing" -- which
+        :meth:`missing_inputs` reports loudly -- rather than becoming "this
+        system never recorded", which would skip it in silence.
+        """
+        if system == "neuropixels":
+            npx = self.neuropixels
+            return npx.bin_file is not None or (
+                npx.run_dir is not None and bool(npx.run_name)
+            )
+        brk = self.blackrock
+        return brk.sync_file is not None or brk.spike_file is not None
+
+    @property
+    def aligns_systems(self) -> bool:
+        """Whether cross-system alignment applies: it needs both systems."""
+        return self.has_data("neuropixels") and self.has_data("blackrock")
+
     @property
     def sorts_neuropixels(self) -> bool:
         """Whether step 3 runs. ``kilosort_on_*`` is a request, not an override."""
-        return self.has_neuropixels_data and self.kilosort_on_neuropixels
+        return self.has_data("neuropixels") and self.kilosort_on_neuropixels
 
     @property
     def sorts_blackrock(self) -> bool:
         """Whether step 4 runs."""
-        return self.has_blackrock_data and self.kilosort_on_blackrock
+        return self.has_data("blackrock") and self.kilosort_on_blackrock
 
     def missing_inputs(self) -> list[str]:
         """Return human-readable problems with the *input* paths.
@@ -494,10 +512,10 @@ class SessionConfig:
         """
         problems: list[str] = []
 
-        # Gated on the data existing, not on sorting being wanted: the LFP and
-        # sync stages read the same files, so an unsortable session still needs
-        # them to be there.
-        if self.has_neuropixels_data:
+        # Gated on the data being *declared*, not on sorting being wanted: the
+        # LFP and sync stages read the same files, so an unsortable session still
+        # needs them to be there.
+        if self.has_data("neuropixels"):
             npx = self.neuropixels
             if npx.bin_file is not None:
                 if not npx.bin_file.exists():
@@ -509,16 +527,18 @@ class SessionConfig:
                     problems.append("neuropixels.run_name is required when run_dir is set")
             else:
                 problems.append(
-                    "neuropixels needs either bin_file or run_dir+run_name "
-                    "(or set has_neuropixels_data: false)"
+                    "neuropixels needs either bin_file or run_dir+run_name"
                 )
 
-        if self.has_blackrock_data:
+        if self.has_data("blackrock"):
             brk = self.blackrock
             if brk.sync_file is None:
-                problems.append(
-                    "blackrock.sync_file is required (or set has_blackrock_data: false)"
-                )
+                # Only needed to align against the other system. A Blackrock-only
+                # session has nothing to align to, so it needs no pulse train.
+                if self.aligns_systems:
+                    problems.append(
+                        "blackrock.sync_file is required to align against Neuropixels"
+                    )
             elif not brk.sync_file.exists():
                 problems.append(f"blackrock.sync_file does not exist: {brk.sync_file}")
             if brk.spike_file is not None and not brk.spike_file.exists():
@@ -529,7 +549,7 @@ class SessionConfig:
         # cache. Naming none at all is not: that means placeholder geometry, which
         # still sorts and is reported as a warning by doctor instead.
         for system in ("neuropixels", "blackrock"):
-            if not getattr(self, f"has_{system}_data"):
+            if not self.has_data(system):
                 continue
             spec = getattr(self, system)
             for key in ("probe_file", "cmp_file"):
@@ -636,17 +656,22 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
-def _has_data(data: dict[str, Any], system: str) -> bool:
-    """Read ``has_<system>_data``, honouring the older ``skip_<system>`` spelling.
+#: Keys a session file used to carry that are now derived or belong to the code.
+#: Ignoring one silently would change what a run does without a word, so each is
+#: refused with the thing to do instead.
+_REMOVED_KEYS = {
+    "has_neuropixels_data": "declare a neuropixels: block (or remove it) instead",
+    "has_blackrock_data": "declare a blackrock: block (or remove it) instead",
+    "skip_neuropixels": "remove the neuropixels: block instead",
+    "skip_blackrock": "remove the blackrock: block instead",
+    "skip_sync": "derived: alignment runs when both systems are declared",
+    "sorter": "which sorter ran is a property of the code, not the recording",
+}
 
-    ``skip_*`` meant "this system did not record", which is exactly
-    ``has_*_data: false``. Session copies are gitignored and live on the rig, so
-    the old key keeps working; the explicit new one wins where both appear.
-    """
-    explicit = data.get(f"has_{system}_data")
-    if explicit is not None:
-        return bool(explicit)
-    return not bool(data.get(f"skip_{system}", False))
+
+def _reject_removed_keys(data: dict[str, Any], path: Path) -> None:
+    for key in sorted(set(data) & set(_REMOVED_KEYS)):
+        raise ValueError(f"{path}: '{key}' is no longer a session setting -- {_REMOVED_KEYS[key]}")
 
 
 def load_machine(name: str, config_dir: Path | None = None) -> MachineProfile:
@@ -673,6 +698,7 @@ def load_session_config(
         session_path = candidate
 
     data = _read_yaml(session_path)
+    _reject_removed_keys(data, session_path)
     profile = load_machine(machine, config_dir) if isinstance(machine, str) else machine
 
     session_name = str(data.get("session") or session_path.stem)
@@ -739,7 +765,7 @@ def load_session_config(
     stated_output = _as_path(data.get("output_dir"))
     if stated_output is not None:
         for system in ("neuropixels", "blackrock"):
-            if system_dirs[system] is None and _has_data(data, system):
+            if system_dirs[system] is None and (data.get(system) or {}):
                 system_dirs[system] = stated_output
 
     if system_dirs["blackrock"] is None and system_dirs["neuropixels"] is None:
@@ -755,12 +781,8 @@ def load_session_config(
         monkey=monkey,
         blackrock_dir=system_dirs["blackrock"],
         neuropixels_dir=system_dirs["neuropixels"],
-        sorter=str(data.get("sorter") or "kilosort4"),
         blackrock=BlackrockSpec.from_dict(data.get("blackrock") or {}),
         neuropixels=NeuropixelsSpec.from_dict(data.get("neuropixels") or {}),
-        skip_sync=bool(data.get("skip_sync", False)),
-        has_neuropixels_data=_has_data(data, "neuropixels"),
-        has_blackrock_data=_has_data(data, "blackrock"),
         kilosort_on_neuropixels=bool(data.get("kilosort_on_neuropixels", True)),
         kilosort_on_blackrock=bool(data.get("kilosort_on_blackrock", True)),
         sync_period_s=float(data.get("sync_period_s", 1.0)),

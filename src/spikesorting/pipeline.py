@@ -105,8 +105,8 @@ def skip_reason(config: SessionConfig, verb: Any, system: str | None = None) -> 
         "extract_lfp",
         "export_results",
     }:
-        if not getattr(config, f"has_{system}_data"):
-            return f"has_{system}_data is false"
+        if not config.has_data(system):
+            return f"no {system} paths declared in the session"
 
     if name == "sort_with_kilosort" and system is not None:
         if not getattr(config, f"kilosort_on_{system}"):
@@ -115,8 +115,8 @@ def skip_reason(config: SessionConfig, verb: Any, system: str | None = None) -> 
     if name == "extract_lfp" and system == "blackrock":
         return "Blackrock LFPs are saved separately by Central"
 
-    if name in {"time_remapping", "validate_remapping"} and config.skip_sync:
-        return "skip_sync is set (no cross-system alignment for this session)"
+    if name in {"time_remapping", "validate_remapping"} and not config.aligns_systems:
+        return "only one system declared, so there is nothing to align against"
 
     if name == "time_remapping" and system == REFERENCE_SYSTEM:
         return f"{REFERENCE_SYSTEM} is the reference timebase; nothing to map it onto"
@@ -157,7 +157,7 @@ def setup_probe(config: SessionConfig, system: str) -> dict | None:
     recognisably wrong answer.
     """
     _check(system)
-    if not getattr(config, f"has_{system}_data"):
+    if not config.has_data(system):
         return None
 
     spec = getattr(config, system)
@@ -250,7 +250,7 @@ def load_spike_continuous(
     run, for trying a map before committing it to the session file.
     """
     _check(system)
-    if not getattr(config, f"has_{system}_data"):
+    if not config.has_data(system):
         return None
 
     import spikeinterface.full as si
@@ -348,7 +348,7 @@ def extract_sync(config: SessionConfig, system: str, probe: int = 0) -> Any | No
     machine without CatGT.
     """
     _check(system)
-    if not getattr(config, f"has_{system}_data"):
+    if not config.has_data(system):
         return None
 
     if system == "neuropixels":
@@ -370,7 +370,7 @@ def extract_lfp(
     more aliases.
     """
     _check(system)
-    if system == "blackrock" or not config.has_neuropixels_data:
+    if system == "blackrock" or not config.has_data("neuropixels"):
         return None
 
     from ._io import spikeglx
@@ -438,12 +438,12 @@ def time_remapping(config: SessionConfig, system: str = "neuropixels") -> TimeMa
     installed, otherwise by least squares on the same matched edges. Both paths
     write the same output file.
 
-    Returns ``None`` when ``skip_sync`` is set, when asked for Blackrock itself
+    Returns ``None`` when only one system is declared, when asked for Blackrock itself
     (there is nothing to map the reference onto), or when the edge files are
     missing.
     """
     _check(system)
-    if config.skip_sync or system == REFERENCE_SYSTEM:
+    if not config.aligns_systems or system == REFERENCE_SYSTEM:
         return None
 
     from ._sync import tprime as tprime_mod
@@ -586,13 +586,13 @@ def validate_remapping(config: SessionConfig, figures: bool = True) -> Any | Non
     Uncorrected clock drift of tens of ppm is 72 ms/hour at 20 ppm and fails the
     1 ms tolerance, which is the point.
 
-    Returns ``None`` when ``skip_sync`` is set, no map has been fitted, or
+    Returns ``None`` when only one system is declared, no map has been fitted, or
     neither system recorded bursts -- in which case the 1 Hz fit residuals in
     ``time_map.json`` are the only quality measure, and they are not held-out.
     """
     from ._plots import summary as plots
 
-    if config.skip_sync:
+    if not config.aligns_systems:
         return None
 
     map_path = config.paths.aligned / "time_map.json"
@@ -675,7 +675,7 @@ def export_results(
     from ._export.curated import load_phy_results, select_units
     from ._plots import summary as plots
 
-    if not getattr(config, f"has_{system}_data"):
+    if not config.has_data(system):
         return None
 
     results_dir = config.paths.sorted_for(system)

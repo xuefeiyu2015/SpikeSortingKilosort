@@ -21,8 +21,8 @@ def test_demo_config_is_an_ordinary_session():
     # the code branches on it being "the demo".
     session = cfg.load_session_config(CONFIG_DIR / "demo.yaml", "mac", CONFIG_DIR)
     assert session.session == "demo"
-    assert session.skip_sync is True
-    assert session.has_blackrock_data is False
+    assert session.aligns_systems is False   # no blackrock: block
+    assert session.has_data("blackrock") is False
     assert session.sorts_blackrock is False
     assert session.sorts_neuropixels is True
     assert session.neuropixels.n_chan_bin == 385
@@ -227,7 +227,6 @@ monkey: Monkey Athos
 session: "2026-08-13"
 roots:
   neuropixels: "Y:/npx/{monkey}/raw"
-has_blackrock_data: false
 """,
     )
 
@@ -266,8 +265,8 @@ def test_a_stale_data_root_raises_now_that_no_profile_supplies_one(tmp_path):
         """
 session: s
 output_dir: "{data_root}/Monkey Athos"
-skip_blackrock: true
-skip_neuropixels: true
+neuropixels:
+  bin_file: "/a/x.bin"
 """,
     )
 
@@ -278,61 +277,18 @@ skip_neuropixels: true
 
 
 def _flags(tmp_path: Path, body: str):
-    # Both directories stated outright so the flags are the only thing varying.
-    path = _write_session(
-        tmp_path,
-        f"session: s\nblackrock_dir: '{tmp_path / 'br'}'\n"
-        f"neuropixels_dir: '{tmp_path / 'np'}'\n{body}",
-    )
+    """Both directories stated, and both systems declared unless `body` does."""
+    lines = [
+        "session: s",
+        f"blackrock_dir: '{tmp_path / 'br'}'",
+        f"neuropixels_dir: '{tmp_path / 'np'}'",
+    ]
+    if "neuropixels:" not in body:
+        lines.append("neuropixels:\n  bin_file: '/a/x.bin'")
+    if "blackrock:" not in body:
+        lines.append("blackrock:\n  sync_file: '/b/y.ns5'")
+    path = _write_session(tmp_path, "\n".join(lines) + "\n" + body)
     return cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
-
-
-def test_both_systems_are_present_and_sorted_by_default(tmp_path):
-    session = _flags(tmp_path, "")
-    assert session.has_neuropixels_data and session.has_blackrock_data
-    assert session.sorts_neuropixels and session.sorts_blackrock
-
-
-def test_absent_data_is_separate_from_declining_to_sort_it(tmp_path):
-    # The distinction the two axes exist for: a session that recorded
-    # Neuropixels but is only being used for its LFP and sync pulses still has
-    # data -- its inputs must be checked and its extraction must run.
-    session = _flags(tmp_path, "kilosort_on_neuropixels: false\n")
-
-    assert session.has_neuropixels_data is True
-    assert session.sorts_neuropixels is False
-    assert any("neuropixels" in p for p in session.missing_inputs())
-
-
-def test_no_data_means_nothing_is_validated_for_that_system(tmp_path):
-    session = _flags(tmp_path, "has_neuropixels_data: false\n")
-
-    assert session.sorts_neuropixels is False
-    assert not any("neuropixels" in p for p in session.missing_inputs())
-
-
-def test_sorting_cannot_be_asked_for_where_there_is_no_data(tmp_path):
-    # "kilosort_on_x: true" is a request, not an override -- absent data wins.
-    session = _flags(
-        tmp_path,
-        "has_neuropixels_data: false\nkilosort_on_neuropixels: true\n"
-        "has_blackrock_data: false\nkilosort_on_blackrock: true\n",
-    )
-
-    assert session.sorts_neuropixels is False
-    assert session.sorts_blackrock is False
-
-
-def test_legacy_skip_flags_still_mean_the_data_is_absent(tmp_path):
-    # Session copies live on the rig and are gitignored, so the old spelling has
-    # to keep working rather than silently start demanding files that never existed.
-    session = _flags(tmp_path, "skip_neuropixels: true\nskip_blackrock: true\n")
-
-    assert session.has_neuropixels_data is False
-    assert session.has_blackrock_data is False
-    assert not session.missing_inputs() or all(
-        "cache_dir" in p for p in session.missing_inputs()
-    )
 
 
 _TWO_SYSTEMS = """
@@ -399,7 +355,6 @@ def test_cross_system_output_falls_back_when_blackrock_never_recorded(tmp_path):
             """
 monkey: Monkey Demo
 session: "2026-08-13"
-has_blackrock_data: false
 roots:
   neuropixels: "Y:/npx"
 neuropixels:
@@ -423,7 +378,6 @@ def test_a_data_dir_may_be_stated_outright(tmp_path):
             tmp_path,
             """
 session: demo
-has_blackrock_data: false
 neuropixels_dir: "~/ephys/demo_data"
 neuropixels:
   bin_file: "{neuropixels_dir}/x.bin"
@@ -435,28 +389,6 @@ neuropixels:
 
     assert session.neuropixels_dir == Path.home() / "ephys" / "demo_data"
     assert session.paths.sorted_np == Path.home() / "ephys/demo_data/neuropixels/kilosort4"
-
-
-def test_the_sorter_level_is_named_by_the_session(tmp_path):
-    # So a second sorter writes beside the first rather than over it.
-    session = cfg.load_session_config(
-        _write_session(
-            tmp_path,
-            """
-session: s
-sorter: ks5
-has_blackrock_data: false
-neuropixels_dir: "/data/s"
-neuropixels:
-  bin_file: "{neuropixels_dir}/x.bin"
-""",
-        ),
-        "windows_rig",
-        CONFIG_DIR,
-    )
-
-    assert session.sorter == "ks5"
-    assert session.paths.sorted_np == Path("/data/s/neuropixels/ks5")
 
 
 def test_preprocessing_defaults_to_the_shared_block(tmp_path):
@@ -553,13 +485,17 @@ def test_no_probe_named_is_the_default(tmp_path):
 def test_a_named_probe_file_that_is_absent_is_reported(tmp_path):
     # Named but not there is a hard error: the alternative is discovering it after
     # the recording has been copied to the cache.
-    session = _flags(tmp_path, "blackrock:\n  probe_file: '/nope/utah_A.json'\n")
+    session = _flags(
+        tmp_path, "blackrock:\n  sync_file: '/b/y.ns5'\n  probe_file: '/nope/utah_A.json'\n"
+    )
 
     assert any("probe_file" in p for p in session.missing_inputs())
 
 
 def test_a_named_cmp_file_that_is_absent_is_reported(tmp_path):
-    session = _flags(tmp_path, "blackrock:\n  cmp_file: '/nope/array.cmp'\n")
+    session = _flags(
+        tmp_path, "blackrock:\n  sync_file: '/b/y.ns5'\n  cmp_file: '/nope/array.cmp'\n"
+    )
 
     assert any("cmp_file" in p for p in session.missing_inputs())
 
@@ -592,19 +528,6 @@ def test_require_inputs_raises_with_every_problem_at_once():
     with pytest.raises(FileNotFoundError) as excinfo:
         session.require_inputs()
     assert "not runnable" in str(excinfo.value)
-
-
-def test_skip_blackrock_suppresses_blackrock_checks(tmp_path):
-    path = tmp_path / "s.yaml"
-    path.write_text(
-        f"session: s\nskip_blackrock: true\noutput_dir: '{tmp_path / 'out'}'\n"
-        "neuropixels:\n  bin_file: '/nope/missing.bin'\n",
-        encoding="utf-8",
-    )
-    session = cfg.load_session_config(path, "mac", CONFIG_DIR)
-    problems = session.missing_inputs()
-    assert not any("blackrock" in p for p in problems)
-    assert any("bin_file" in p for p in problems)
 
 
 def test_unknown_machine_raises():
@@ -657,7 +580,7 @@ def test_a_duplicate_key_is_rejected_rather_than_silently_dropped(tmp_path):
     path.write_text(
         "session: s\n"
         f"neuropixels_dir: '{tmp_path}'\n"
-        "has_blackrock_data: false\n"
+        ""
         "neuropixels:\n  run_dir: '/a'\n  run_name: r\n"
         "neuropixels:\n  bin_file: '/b/x.bin'\n",
         encoding="utf-8",
@@ -675,7 +598,7 @@ def test_a_duplicate_key_nested_in_a_block_is_also_rejected(tmp_path):
     path.write_text(
         "session: s\n"
         f"neuropixels_dir: '{tmp_path}'\n"
-        "has_blackrock_data: false\n"
+        ""
         "neuropixels:\n  bin_file: '/a/x.bin'\n  bin_file: '/b/y.bin'\n",
         encoding="utf-8",
     )
@@ -714,3 +637,117 @@ def test_an_absolute_probe_file_is_left_alone(tmp_path):
     session = _flags(tmp_path, f"blackrock:\n  probe_file: '{probe}'\n")
 
     assert session.blackrock.probe_file == probe
+
+
+# ---------------------------------------------------------------------------
+# has_data / aligns_systems are derived, not declared
+# ---------------------------------------------------------------------------
+
+
+def _declared(tmp_path, body):
+    path = _write_session(
+        tmp_path,
+        f"session: s\nblackrock_dir: '{tmp_path / 'br'}'\n"
+        f"neuropixels_dir: '{tmp_path / 'np'}'\n{body}",
+    )
+    return cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
+
+
+def test_declaring_a_systems_paths_is_what_says_it_recorded(tmp_path):
+    both = _declared(
+        tmp_path,
+        "neuropixels:\n  bin_file: '/a/x.bin'\nblackrock:\n  sync_file: '/b/y.ns5'\n",
+    )
+    assert both.has_data("neuropixels") and both.has_data("blackrock")
+
+    npx_only = _declared(tmp_path, "neuropixels:\n  bin_file: '/a/x.bin'\n")
+    assert npx_only.has_data("neuropixels")
+    assert not npx_only.has_data("blackrock")
+
+
+def test_a_spikeglx_run_counts_as_declared_only_with_its_name(tmp_path):
+    # run_dir alone cannot locate anything; find_run_files needs the run name.
+    assert not _declared(tmp_path, "neuropixels:\n  run_dir: '/a'\n").has_data("neuropixels")
+    assert _declared(
+        tmp_path, "neuropixels:\n  run_dir: '/a'\n  run_name: r\n"
+    ).has_data("neuropixels")
+
+
+def test_blackrock_counts_as_declared_from_either_file(tmp_path):
+    assert _declared(tmp_path, "blackrock:\n  sync_file: '/b/y.ns5'\n").has_data("blackrock")
+    assert _declared(tmp_path, "blackrock:\n  spike_file: '/b/y.ns6'\n").has_data("blackrock")
+
+
+def test_an_unreachable_share_is_a_loud_error_not_a_silent_skip(tmp_path):
+    # The case the whole design turns on. Files declared on a share that is not
+    # mounted must still count as data, so the run fails saying what is missing
+    # rather than reporting the system as absent and quietly skipping it.
+    session = _declared(
+        tmp_path,
+        "neuropixels:\n  bin_file: '/Volumes/nope/x.bin'\n"
+        "blackrock:\n  sync_file: '/Volumes/nope/y.ns5'\n",
+    )
+
+    assert session.has_data("neuropixels") and session.has_data("blackrock")
+
+    problems = session.missing_inputs()
+    assert any("bin_file does not exist" in p for p in problems)
+    assert any("sync_file does not exist" in p for p in problems)
+
+
+def test_alignment_is_derived_from_having_both_systems(tmp_path):
+    both = _declared(
+        tmp_path,
+        "neuropixels:\n  bin_file: '/a/x.bin'\nblackrock:\n  sync_file: '/b/y.ns5'\n",
+    )
+    assert both.aligns_systems is True
+
+    one = _declared(tmp_path, "neuropixels:\n  bin_file: '/a/x.bin'\n")
+    assert one.aligns_systems is False
+
+
+def test_a_blackrock_only_session_needs_no_sync_file(tmp_path):
+    # With nothing to align to, the 1 Hz train is not needed. This was impossible
+    # to express before: sync_file was demanded whenever Blackrock had data.
+    spike = tmp_path / "HUB.ns6"
+    spike.write_bytes(b"")
+    session = _declared(tmp_path, f"blackrock:\n  spike_file: '{spike}'\n")
+
+    assert session.has_data("blackrock")
+    assert session.aligns_systems is False
+    assert not any("sync_file" in p for p in session.missing_inputs())
+
+
+def test_sorting_still_needs_asking_for_even_when_data_is_declared(tmp_path):
+    session = _declared(
+        tmp_path, "neuropixels:\n  bin_file: '/a/x.bin'\nkilosort_on_neuropixels: false\n"
+    )
+
+    assert session.has_data("neuropixels")
+    assert session.sorts_neuropixels is False
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("has_neuropixels_data", "true"),
+        ("has_blackrock_data", "false"),
+        ("skip_sync", "true"),
+        ("skip_neuropixels", "true"),
+        ("skip_blackrock", "true"),
+        ("sorter", "kilosort4"),
+    ],
+)
+def test_a_removed_key_raises_rather_than_being_ignored(tmp_path, key, value):
+    # Session copies live on the rig and still set these. Ignoring them silently
+    # would change what a run does without a word.
+    path = _write_session(
+        tmp_path,
+        f"session: s\nneuropixels_dir: '{tmp_path}'\n"
+        f"neuropixels:\n  bin_file: '/a/x.bin'\n{key}: {value}\n",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
+
+    assert key in str(excinfo.value)

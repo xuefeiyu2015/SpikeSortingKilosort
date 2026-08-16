@@ -28,26 +28,20 @@ roots:
 # {monkey}, {session}, {cache} and {downloads} are always available, and may be
 # used inside a root.
 
-# Names the directory below neuropixels/ and blackrock/ that results go into, so
-# re-sorting with another version writes beside this run instead of over it.
-sorter: kilosort4
-
-# Two independent questions per system.
+# Whether a system recorded is *derived* from whether its block below declares
+# paths. To say a system did not record, remove its block -- there is no flag, and
+# nothing to keep in step with the paths. Cross-system alignment (steps 8-9)
+# likewise runs when both blocks are present.
 #
-# has_*_data      did this system record at all? False means its files are not
-#                 checked and none of its stages run -- not sync, not LFP.
-# kilosort_on_*   should its spike data be sorted? False with has_*_data true is
-#                 the "extract the LFP and the sync pulses, but do not sort"
-#                 case. Absent data always wins: has_*_data false forces the
-#                 matching kilosort_on_* to false whatever it says here.
-has_neuropixels_data: true
-has_blackrock_data: true
+# Declaring paths means the data is *expected*, not that it is present: a share
+# that is not mounted still fails loudly with "does not exist" rather than being
+# read as "this system never recorded".
+#
+# The one question paths cannot answer is whether to sort. False here with the
+# block still present is the "extract the LFP and the sync pulses, but do not
+# sort" case.
 kilosort_on_neuropixels: true
 kilosort_on_blackrock: true
-
-# Steps 8-9 (cross-system alignment) need both systems recording. Set true for a
-# single-system session.
-skip_sync: false
 
 # Outputs sit beside the recording that produced them:
 #

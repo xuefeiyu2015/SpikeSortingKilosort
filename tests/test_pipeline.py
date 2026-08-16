@@ -21,12 +21,22 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 
 
 def _session(tmp_path, body=""):
+    """A session declaring both systems, unless `body` declares them itself.
+
+    Declaring paths is what says a system recorded, so a fixture that wants both
+    systems present has to name files for both -- there is no flag any more.
+    """
+    lines = [
+        "session: s",
+        f"blackrock_dir: '{tmp_path / 'br'}'",
+        f"neuropixels_dir: '{tmp_path / 'np'}'",
+    ]
+    if "neuropixels:" not in body:
+        lines.append("neuropixels:\n  bin_file: '/a/x.bin'")
+    if "blackrock:" not in body:
+        lines.append("blackrock:\n  sync_file: '/b/y.ns5'")
     path = tmp_path / "s.yaml"
-    path.write_text(
-        f"session: s\nblackrock_dir: '{tmp_path / 'br'}'\n"
-        f"neuropixels_dir: '{tmp_path / 'np'}'\n{body}",
-        encoding="utf-8",
-    )
+    path.write_text("\n".join(lines) + "\n" + body, encoding="utf-8")
     return cfg.load_session_config(path, "mac", CONFIG_DIR)
 
 
@@ -183,7 +193,8 @@ def test_a_utah_cmp_wins_over_a_probe_file(tmp_path):
     # Same rule: the array's own wiring map beats a file built from another one.
     probe = _probe_json(tmp_path / "probes" / "utah_A.json")
     session = _session(
-        tmp_path, f"blackrock:\n  probe_file: '{probe}'\n  cmp_file: '/nope/missing.cmp'\n"
+        tmp_path, f"blackrock:\n  sync_file: '/b/y.ns5'\n  probe_file: '{probe}'\n"
+        f"  cmp_file: '/nope/missing.cmp'\n"
     )
 
     # cmp_file is tried first, so a missing one surfaces rather than being skipped.
@@ -193,7 +204,7 @@ def test_a_utah_cmp_wins_over_a_probe_file(tmp_path):
 
 def test_a_utah_probe_file_is_used_when_no_cmp_is_named(tmp_path):
     probe = _probe_json(tmp_path / "probes" / "utah_A.json")
-    session = _session(tmp_path, f"blackrock:\n  probe_file: '{probe}'\n")
+    session = _session(tmp_path, f"blackrock:\n  sync_file: '/b/y.ns5'\n  probe_file: '{probe}'\n")
 
     assert ss.setup_probe(session, "blackrock")["n_chan"] == 4
 
@@ -206,27 +217,6 @@ def test_a_utah_array_with_no_map_at_all_falls_back_to_the_flagged_placeholder(t
 # ---------------------------------------------------------------------------
 # The config decides whether a verb does anything
 # ---------------------------------------------------------------------------
-
-
-def test_a_system_that_never_recorded_yields_none_everywhere(tmp_path):
-    session = _session(tmp_path, "has_blackrock_data: false\n")
-
-    assert ss.setup_probe(session, "blackrock") is None
-    assert ss.load_spike_continuous(session, "blackrock") is None
-    assert ss.extract_sync(session, "blackrock") is None
-    assert ss.export_results(session, "blackrock") is None
-
-
-def test_declining_to_sort_still_leaves_the_data_loadable(tmp_path):
-    # has_data true + kilosort_on false: pulses and LFP, no sorter. The guard is
-    # on sorting alone, so nothing upstream of it is turned off.
-    session = _session(tmp_path, "kilosort_on_blackrock: false\n")
-
-    assert session.has_blackrock_data is True
-    assert ss.sort_with_kilosort(object(), session, "blackrock") is None
-    assert ss.skip_reason(session, ss.sort_with_kilosort, "blackrock") == (
-        "kilosort_on_blackrock is false"
-    )
 
 
 def test_none_propagates_so_a_sequence_needs_no_branching(tmp_path):
@@ -250,14 +240,6 @@ def test_skip_reason_is_none_when_the_verb_will_actually_run(tmp_path):
 
     assert ss.skip_reason(session, ss.extract_sync, "neuropixels") is None
     assert ss.skip_reason(session, ss.setup_probe, "blackrock") is None
-
-
-def test_skip_sync_turns_off_both_cross_system_verbs(tmp_path):
-    session = _session(tmp_path, "skip_sync: true\n")
-
-    assert ss.time_remapping(session, "neuropixels") is None
-    assert ss.validate_remapping(session) is None
-    assert "skip_sync" in ss.skip_reason(session, ss.time_remapping, "neuropixels")
 
 
 # ---------------------------------------------------------------------------

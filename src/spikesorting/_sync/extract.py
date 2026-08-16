@@ -378,13 +378,14 @@ def _finalize(
 def extract_session_edges(config: SessionConfig, probe: int = 0) -> ExtractionReport:
     """Run both systems' extraction, for whichever systems have data.
 
-    Gated on ``has_*_data`` rather than on sorting: pulses and LFP are read from
+    Gated on whether a system's paths are declared rather than on sorting: pulses
+    and LFP are read from
     the same recordings whether or not those recordings get sorted.
     """
     report = ExtractionReport()
 
-    if not config.has_neuropixels_data:
-        report.note("Neuropixels extraction skipped (has_neuropixels_data is false).")
+    if not config.has_data("neuropixels"):
+        report.note("Neuropixels extraction skipped: no neuropixels paths declared.")
     else:
         npx_report = extract_neuropixels_edges(config, probe)
         report.edge_sets.update(npx_report.edge_sets)
@@ -392,8 +393,8 @@ def extract_session_edges(config: SessionConfig, probe: int = 0) -> ExtractionRe
         report.notes.extend(npx_report.notes)
         report.catgt_commands.extend(npx_report.catgt_commands)
 
-    if not config.has_blackrock_data:
-        report.note("Blackrock extraction skipped (has_blackrock_data is false).")
+    if not config.has_data("blackrock"):
+        report.note("Blackrock extraction skipped: no blackrock paths declared.")
     else:
         br_report = extract_blackrock_edges(config)
         report.edge_sets.update(br_report.edge_sets)

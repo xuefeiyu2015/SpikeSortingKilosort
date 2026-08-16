@@ -41,7 +41,6 @@ def make_session(tmp_path, bin_file, **overrides):
     )
     lines = [
         "session: synthetic",
-        "skip_blackrock: true",
         "output_dir: '{output_root}/synthetic'",
         "neuropixels:",
         f"  bin_file: '{bin_file}'",
@@ -106,7 +105,7 @@ def test_extract_records_the_catgt_command_it_would_have_run(tmp_path):
     )
     session_path = tmp_path / "configs" / "run.yaml"
     session_path.write_text(
-        "session: run\nskip_blackrock: true\noutput_dir: '{output_root}/run'\n"
+        "session: run\noutput_dir: '{output_root}/run'\n"
         f"neuropixels:\n  run_dir: '{run_dir}'\n  run_name: run\n  gate: 0\n  trigger: 0\n",
         encoding="utf-8",
     )

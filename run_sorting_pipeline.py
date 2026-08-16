@@ -9,9 +9,10 @@ whichever systems asked for it. Then it **stops**, because what comes next is
 manual: curation in Phy is not scriptable, and the export stages read the labels
 it writes. Run `run_exporting_pipeline.py` afterwards.
 
-Which systems run is the session's business, not this script's:
+Which systems run is the session's business, not this script's. A system runs
+when its block declares paths; remove the block and nothing for it runs at all.
+The one thing paths cannot say is whether to sort:
 
-    has_<system>_data       false -> nothing for that system runs at all
     kilosort_on_<system>    false -> extract its pulses and LFP, but do not sort
 
 Only the sorting needs a GPU. Nothing here reads an edge file, so the halves can

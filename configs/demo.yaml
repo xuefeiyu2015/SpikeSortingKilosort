@@ -6,6 +6,9 @@
 # settings a bare .bin needs (bin_file, n_chan_bin, sample_rate) where a real
 # SpikeGLX run has run_dir/run_name and reads the rest from its .meta.
 #
+# There is no `blackrock:` block, and that is the whole statement: no Blackrock
+# data, so no Blackrock stage runs and there is nothing to align against.
+#
 # Set it up once with notebooks/setup_demo_data.ipynb, then:
 #   python run_sorting_pipeline.py   --config configs/demo.yaml
 #   python run_exporting_pipeline.py --config configs/demo.yaml
@@ -16,22 +19,7 @@ session: "demo"
 # Roots stop at the share; each system's directory is built as
 # <root>/<monkey>/<session> and exposed as {blackrock_dir} / {neuropixels_dir}.
 roots:
-  blackrock: "/Volumes/server"
   neuropixels: "/Volumes/server"
-
-# Names the directory below neuropixels/ and blackrock/ that results go into.
-sorter: kilosort4
-
-# Two independent questions per system. No NSP-*.ns5 / HUB-*.ns6 here, so nothing
-# Blackrock runs at all.
-has_neuropixels_data: true
-has_blackrock_data: false
-kilosort_on_neuropixels: true
-kilosort_on_blackrock: false
-
-# No second system to align to, so steps 8-9 are skipped. Sync *extraction* still
-# runs: this recording's SY word does carry the 1 Hz square wave.
-skip_sync: true
 
 neuropixels:
   # The one place this differs from a real session. The download is a bare .bin:

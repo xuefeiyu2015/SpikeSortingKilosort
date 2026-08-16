@@ -121,14 +121,15 @@ def sort_recording(
 
     final_dir = Path(results_dir) if results_dir else config.paths.sorted_for(system)
 
+    name = config.sorter  # SORTER_NAME; the directory and the sorter agree by construction
     params = {"device": config.machine.device}
     params.update(config.kilosort_settings)
 
     def body(work_dir: Path) -> Any:
         return ss.run_sorter(
-            "kilosort4",
+            name,
             recording,
-            folder=str(work_dir / "kilosort4"),
+            folder=str(work_dir / name),
             remove_existing_folder=True,
             **params,
         )
@@ -136,9 +137,9 @@ def sort_recording(
     sorting, work_dir = _run_in_cache(
         final_dir,
         config.cache_dir,
-        f"{config.session}_kilosort4_{system}",
+        f"{config.session}_{name}_{system}",
         body,
-        publish_from="kilosort4/sorter_output",
+        publish_from=f"{name}/sorter_output",
     )
 
     probe = recording.get_probe() if hasattr(recording, "get_probe") else None

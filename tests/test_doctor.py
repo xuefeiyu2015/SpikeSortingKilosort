@@ -914,7 +914,7 @@ def test_a_utah_session_with_no_channel_map_is_warned_about(tmp_path):
     sync = tmp_path / "NSP.ns5"
     sync.write_bytes(b"")
     (tmp_path / "s.yaml").write_text(
-        f"session: s\nblackrock_dir: '{tmp_path}'\nhas_neuropixels_data: false\n"
+        f"session: s\nblackrock_dir: '{tmp_path}'\n"
         f"blackrock:\n  sync_file: '{sync}'\n  spike_file: '{spike}'\n",
         encoding="utf-8",
     )
