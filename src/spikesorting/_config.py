@@ -234,8 +234,6 @@ class BlackrockSpec:
     burst_threshold: float = 2.5
     #: Stream to read from the .nsX file (neo/SpikeInterface stream id).
     stream_id: str | None = None
-    #: Channel ids to exclude from sorting (sync / analog inputs sharing the file).
-    exclude_channels: tuple[str, ...] = ()
     #: The array's own .cmp wiring map. Preferred, because it describes *this*
     #: array rather than a map that might have been built from another one.
     cmp_file: Path | None = None
@@ -252,7 +250,6 @@ class BlackrockSpec:
             sync_threshold=float(data.get("sync_threshold", 2.5)),
             burst_threshold=float(data.get("burst_threshold", 2.5)),
             stream_id=data.get("stream_id"),
-            exclude_channels=tuple(str(c) for c in data.get("exclude_channels", ())),
             probe_file=_as_config_path(data.get("probe_file")),
             cmp_file=_as_config_path(data.get("cmp_file")),
         )
@@ -671,6 +668,11 @@ _REMOVED_KEYS = {
         "every batch; set do_CAR / highpass_cutoff under 'kilosort:' instead"
     ),
     "kilosort_settings": "renamed to 'kilosort:', and settable per system",
+    "exclude_channels": (
+        "the probe already drops channels its chanMap does not cover, and this "
+        "ran first, shifting every contact after the excluded one. A broken "
+        "electrode is kilosort.bad_channels -- the same on both systems"
+    ),
 }
 
 

@@ -260,9 +260,7 @@ def load_spike_continuous(
         spec = config.blackrock
         if spec.spike_file is None:
             raise ValueError("blackrock.spike_file is required to load Blackrock data")
-        recording = blackrock.read_recording(
-            spec.spike_file, stream_id=spec.stream_id, exclude_channels=spec.exclude_channels
-        )
+        recording = blackrock.read_recording(spec.spike_file, stream_id=spec.stream_id)
     else:
         info = _neuropixels_stream(config, probe_index)
         recording = si.read_binary(

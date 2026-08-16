@@ -66,10 +66,13 @@ blackrock:
   burst_threshold: 2.5
   # A .nsX may expose several streams; pin one if read_blackrock is ambiguous.
   stream_id: null
-  # Non-neural channels to drop before sorting.
-  exclude_channels: []
-  # Merged over the shared `kilosort:` block at the end of this file. A failed
-  # electrode goes here -- Kilosort removes what you list but cannot find them.
+  # Merged over the shared `kilosort:` block at the end of this file. A dead
+  # electrode goes here: Kilosort removes what you list, but cannot find them.
+  # Entries are recording channel numbers -- rows in the binary, matched against
+  # the probe's chanMap -- not positions on the array.
+  #
+  # Non-neural channels sharing the .ns6 (sync, analog in) need no entry: the
+  # probe drops whatever its chanMap does not cover.
   kilosort:
     bad_channels: []
   # The array's channel map. Which array is in which monkey is a property of the
@@ -104,9 +107,10 @@ neuropixels:
   burst_threshold_v: [1.0, 0.0]
   # Expected burst pulse width in ms; 0 accepts any width.
   burst_pulse_ms: 0
-  # Merged over the shared `kilosort:` block at the end of this file. A dense probe
-  # usually wants Kilosort's defaults, so this is normally empty.
-  kilosort: {}
+  # Merged over the shared `kilosort:` block at the end of this file. Same keys as
+  # the blackrock one -- a dead site is named the same way on either system.
+  kilosort:
+    bad_channels: []
 
 sync_period_s: 1.0
 burst_interval_s: 14.0

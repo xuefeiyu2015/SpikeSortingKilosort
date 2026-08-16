@@ -176,23 +176,19 @@ def read_channel(
     return _read_chunk(reader, stream, start, stop, seg_index, scaled)
 
 
-def read_recording(
-    path: str | Path,
-    stream_id: str | None = None,
-    exclude_channels: tuple[str, ...] = (),
-) -> Any:
+def read_recording(path: str | Path, stream_id: str | None = None) -> Any:
     """SpikeInterface recording for the Utah array spike file (``HUB-*.ns6``).
 
-    Non-neural channels sharing the file (sync, analog inputs) must be dropped
-    before sorting -- pass them as ``exclude_channels``.
+    Every channel in the file, including any sync or analog inputs sharing it.
+    Attaching the probe is what drops those: ``set_probe`` slices the recording to
+    exactly the channels the ``chanMap`` covers. Dropping them here instead would
+    shift every contact after the removed one, silently mis-attributing units.
     """
     from spikeinterface.extractors import read_blackrock  # lazy; heavy import
 
-    recording = read_blackrock(Path(path), stream_id=stream_id) if stream_id else read_blackrock(Path(path))
-    if exclude_channels:
-        keep = [c for c in recording.channel_ids if str(c) not in set(exclude_channels)]
-        recording = recording.select_channels(keep)
-    return recording
+    if stream_id:
+        return read_blackrock(Path(path), stream_id=stream_id)
+    return read_blackrock(Path(path))
 
 
 def list_streams(path: str | Path) -> tuple[list[str], list[str]]:

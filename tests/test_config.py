@@ -744,3 +744,20 @@ def test_a_removed_key_nested_in_a_system_block_is_also_refused(tmp_path):
 
     assert "preprocess" in str(excinfo.value)
     assert "neuropixels" in str(excinfo.value)
+
+
+def test_exclude_channels_is_refused(tmp_path):
+    # Blackrock-only, and applied before the probe -- so it shifted every contact
+    # after the excluded one. The probe already drops what it does not map, and
+    # a broken electrode is kilosort.bad_channels, the same on both systems.
+    path = _write_session(
+        tmp_path,
+        f"session: s\nblackrock_dir: '{tmp_path}'\n"
+        "blackrock:\n  spike_file: '/b/y.ns6'\n  exclude_channels: ['129']\n",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
+
+    assert "exclude_channels" in str(excinfo.value)
+    assert "bad_channels" in str(excinfo.value)

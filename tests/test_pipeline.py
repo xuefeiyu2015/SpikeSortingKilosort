@@ -283,3 +283,32 @@ def test_the_reference_timebase_is_not_remapped_onto_itself(tmp_path):
     assert "reference timebase" in ss.skip_reason(session, ss.time_remapping, "blackrock")
     # ...while the other system has no such guard.
     assert ss.skip_reason(session, ss.time_remapping, "neuropixels") is None
+
+
+def test_the_probe_is_what_drops_non_neural_channels(tmp_path):
+    """A .ns6 carries sync and analog inputs beside the neural channels.
+
+    Nothing has to name them: attaching the probe slices the recording to exactly
+    the channels its chanMap covers. There used to be a blackrock-only
+    `exclude_channels` for this, applied *before* the probe -- which shifted every
+    contact after the excluded one and silently mis-attributed units.
+    """
+    import numpy as np
+    import spikeinterface.full as si
+
+    from spikesorting._probes.common import to_probeinterface
+
+    recording = si.generate_recording(num_channels=8, durations=[1.0])
+    probe = {
+        "chanMap": np.arange(6),
+        "xc": np.tile([0.0, 25.0], 3),
+        "yc": np.repeat(np.arange(3) * 20.0, 2),
+        "kcoords": np.zeros(6),
+        "n_chan": 6,
+    }
+
+    attached = recording.set_probe(to_probeinterface(probe))
+
+    assert recording.get_num_channels() == 8
+    assert attached.get_num_channels() == 6
+    assert [str(c) for c in attached.channel_ids] == ["0", "1", "2", "3", "4", "5"]
