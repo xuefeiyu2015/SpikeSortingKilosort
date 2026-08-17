@@ -95,7 +95,14 @@ def main() -> int:
                     **where,
                 )
 
-            if "sort" in args.steps:
+            if "sort" in args.steps and not getattr(config, f"sorts_{system}"):
+                # Nothing here is wanted: report the one reason and move on. The
+                # steps below are the sort's own -- resolving a map and opening
+                # the recording for a system nobody asked to sort fails on a
+                # session that legitimately has neither.
+                run(ss.sort_with_kilosort, None, config, system, **where)
+
+            elif "sort" in args.steps:
                 probe = run(ss.setup_probe, config, system, probe_index=probe_index, **where)
                 if run.last_failed:
                     continue  # no map, so loading would fail the same way

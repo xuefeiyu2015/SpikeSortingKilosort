@@ -152,14 +152,18 @@ def setup_probe(config: SessionConfig, system: str, probe_index: int = 0) -> dic
     ============================== ===========================================
     1. the run's ``.meta``         1. ``blackrock.cmp_file``
     2. ``neuropixels.probe_file``  2. ``blackrock.probe_file``
-    3. raises: no honest default   3. placeholder grid, flagged and warned
+    3. raises: no honest default   3. raises: no honest default
     ============================== ===========================================
 
-    Kilosort has no probe library to fall back on: it ships no probe files, and
-    its own API (``kilosort.io.load_probe``) also takes a path. There is nothing
-    to guess a Neuropixels layout from, which is why step 3 raises rather than
-    inventing one -- unlike a Utah array, where a square grid is at least a
-    recognisably wrong answer.
+    **Neither system invents a layout.** Kilosort has no probe library to fall
+    back on -- it ships no probe files, and its own API
+    (``kilosort.io.load_probe``) also takes a path -- so there is nothing to guess
+    a Neuropixels map from. A Utah array could be given a square grid in channel
+    order, and used to be: but real arrays are rarely wired that way, so units
+    land on the wrong electrodes, and the grid's channel count silently drops
+    every electrode past it. A deliberate grid is ``make_probe.py utah`` with no
+    ``--cmp``, written to ``configs/probes/`` and named in the session, so the
+    choice is recorded rather than assumed.
 
     ``probe_index`` selects which probe of a SpikeGLX run to build the map for.
     Each probe has its own ``.meta``, and which sites are active is chosen per
@@ -196,7 +200,7 @@ def setup_probe(config: SessionConfig, system: str, probe_index: int = 0) -> dic
             "then set  neuropixels.probe_file: configs/probes/<name>.json"
         )
 
-    from ._probes.utah import probe_from_cmp, utah_grid_probe
+    from ._probes.utah import probe_from_cmp
 
     if spec.cmp_file is not None:
         return probe_from_cmp(spec.cmp_file, independent=True)
@@ -204,11 +208,18 @@ def setup_probe(config: SessionConfig, system: str, probe_index: int = 0) -> dic
         from ._probes.io import load_probe_json
 
         return load_probe_json(spec.probe_file)
-    log.warning(
-        "no blackrock.cmp_file or probe_file: using a PLACEHOLDER grid in channel "
-        "order, so units will be attributed to the wrong electrodes"
+    raise FileNotFoundError(
+        "no channel map for the Utah array: neither blackrock.cmp_file nor "
+        "blackrock.probe_file is set, and there is no honest default. A grid in "
+        "channel order attributes units to the wrong electrodes, and its channel "
+        "count silently drops every electrode past it. Name the array's own map:\n"
+        "    blackrock.cmp_file: <array>.cmp\n"
+        "or build one once and set blackrock.probe_file to it:\n"
+        "    python tools/make_probe.py utah --cmp <array>.cmp "
+        "--out configs/probes/utah_<array>.json --plot\n"
+        "A deliberate placeholder grid is that command without --cmp -- built, "
+        "written down and named, rather than assumed."
     )
-    return utah_grid_probe(96, independent=True)
 
 
 def _probe_from_meta(config: SessionConfig, probe_index: int = 0) -> dict | None:

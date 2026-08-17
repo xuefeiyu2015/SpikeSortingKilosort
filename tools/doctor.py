@@ -1165,10 +1165,10 @@ def check_machine_paths(machine: MachineProfile) -> list[Check]:
 def check_session(config: SessionConfig) -> list[Check]:
     """Session input files, delegated to the existing validator, plus geometry.
 
-    A Utah array with no channel map still sorts -- on a placeholder 10x10 grid
-    in channel order, which is almost certainly not how the array is wired. That
-    is a warning rather than a failure, but it must not be silent: units would be
-    attributed to the wrong electrodes and nothing downstream could tell.
+    A Utah array with no channel map cannot be sorted: there is no honest default
+    to fall back on, so :func:`~spikesorting.pipeline.setup_probe` raises. That is
+    an hour into a run, though, and this is the pre-flight -- so the same gap is
+    reported here as blocking, and the exit code says so before the job starts.
     """
     problems = config.missing_inputs()
     checks = [
@@ -1195,12 +1195,14 @@ def check_session(config: SessionConfig) -> list[Check]:
         checks.append(
             Check(
                 name=f"session:{config.session}:probe",
-                status=WARN,
+                status=MISSING,
                 detail=(
-                    "no blackrock.cmp_file or probe_file: sorting will use a "
-                    "PLACEHOLDER grid in channel order, so units will be "
-                    "attributed to the wrong electrodes"
+                    "no blackrock.cmp_file or probe_file, so the Utah array "
+                    "cannot be sorted: a grid in channel order would attribute "
+                    "units to the wrong electrodes, and its channel count would "
+                    "silently drop every electrode past it"
                 ),
+                disables=("sort_blackrock",),
                 fix=(
                     "set blackrock.cmp_file to the array's .cmp, or build a map "
                     "once: python tools/make_probe.py utah --cmp array.cmp "

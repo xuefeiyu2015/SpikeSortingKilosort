@@ -575,9 +575,11 @@ def test_a_probe_file_that_exists_is_not_a_problem(tmp_path):
     assert not any("probe" in p for p in session.missing_inputs())
 
 
-def test_naming_no_map_at_all_is_not_a_blocking_problem(tmp_path):
-    # It means placeholder geometry, which must warn loudly but still sort --
-    # doctor reports it; missing_inputs is for files that are genuinely absent.
+def test_naming_no_map_at_all_is_not_a_missing_input(tmp_path):
+    # Sorting a Utah array without one does fail -- setup_probe raises and
+    # check_env reports it -- but a map that was never named is an unmade
+    # decision, not an absent file, and this function reports absent files. It is
+    # also not needed at all by a session that extracts without sorting.
     session = _flags(tmp_path, "")
 
     assert not any("probe" in p or "cmp" in p for p in session.missing_inputs())

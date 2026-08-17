@@ -247,9 +247,18 @@ def test_a_utah_probe_file_is_used_when_no_cmp_is_named(tmp_path):
     assert ss.setup_probe(session, "blackrock")["n_chan"] == 4
 
 
-def test_a_utah_array_with_no_map_at_all_falls_back_to_the_flagged_placeholder(tmp_path):
-    # It must still sort -- and must still say the geometry is a guess.
-    assert ss.setup_probe(_session(tmp_path), "blackrock")["_placeholder"] is True
+def test_a_utah_array_with_no_map_at_all_refuses_to_sort(tmp_path):
+    # There is no honest default. A grid in channel order attributes units to the
+    # wrong electrodes, and its channel count silently drops every electrode past
+    # it -- 96 of a 128-channel array, with nothing in the output to say so.
+    # Neuropixels already raises here; this is the same answer for the same
+    # question. A deliberate grid is make_probe.py's job, named in the session.
+    with pytest.raises(FileNotFoundError) as excinfo:
+        ss.setup_probe(_session(tmp_path), "blackrock")
+
+    message = str(excinfo.value)
+    for pointer in ("cmp_file", "probe_file", "make_probe.py"):
+        assert pointer in message, message
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +279,27 @@ def test_blackrock_lfp_is_a_no_op_rather_than_an_error(tmp_path):
 
     assert ss.extract_lfp(session, "blackrock") is None
     assert "Central" in ss.skip_reason(session, ss.extract_lfp, "blackrock")
+
+
+def test_a_system_that_is_not_sorted_needs_no_probe_and_no_recording(tmp_path):
+    # "Extract the pulses, do not sort" is a whole session shape -- the 2-probe
+    # template is one. The driver used to resolve a probe and open the recording
+    # for it anyway, which fails on a session that has neither: no map to build,
+    # and no spike_file to open. What runs is the sort step, and this is what it
+    # asks before running any of it.
+    session = _session(
+        tmp_path,
+        "kilosort_on_blackrock: false\nblackrock:\n  sync_file: '/b/y.ns5'\n",
+    )
+
+    assert session.has_data("blackrock") is True        # it recorded
+    assert session.sorts_blackrock is False             # ...but is not sorted
+    assert "kilosort_on_blackrock is false" in ss.skip_reason(
+        session, ss.sort_with_kilosort, "blackrock"
+    )
+    # ...and the map that setup_probe would have refused to invent is never needed.
+    with pytest.raises(FileNotFoundError):
+        ss.setup_probe(session, "blackrock")
 
 
 def test_skip_reason_is_none_when_the_verb_will_actually_run(tmp_path):

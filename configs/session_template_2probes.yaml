@@ -148,11 +148,14 @@ kilosort: {}
 #   under a probe, and naming a probe that is not in `probes:` raises.
 #
 # Probes
-#   Blackrock: probe_file (a JSON built once by tools/make_probe.py) is tried
-#   first, then cmp_file (the array's own wiring map). With neither, sorting falls
-#   back to a PLACEHOLDER 10x10 grid in channel order and check_env.py warns:
-#   units would land on the wrong electrodes. Which array is in which monkey is a
-#   property of the session, which is why it is named here and not passed as a flag.
+#   Blackrock: cmp_file (the array's own wiring map) is tried first, then
+#   probe_file (a JSON built once by tools/make_probe.py). With neither, sorting
+#   REFUSES to start: a grid in channel order would put units on the wrong
+#   electrodes, and its channel count would silently drop every electrode past it.
+#   Which array is in which monkey is a property of the session, which is why it
+#   is named here and not passed as a flag. If you truly want a grid, build one --
+#   make_probe.py utah with no --cmp -- and name it here, so the choice is written
+#   down rather than assumed.
 #
 #   Neuropixels: the run's .meta wins wherever it has ~snsGeomMap, because it
 #   records which sites were actually active for this recording -- something no

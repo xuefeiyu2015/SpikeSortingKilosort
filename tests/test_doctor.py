@@ -899,12 +899,8 @@ def test_importing_doctor_pulls_in_nothing_heavy():
         assert module not in sys.modules
 
 
-def test_a_utah_session_with_no_channel_map_is_warned_about(tmp_path):
-    # The silent-wrong-geometry hole: the pipeline used to sort Blackrock with a
-    # placeholder grid and say nothing. It must still sort, so this warns rather
-    # than blocks -- but it must not be silent.
+def _blackrock_session(tmp_path, extra: str = ""):
     from spikesorting import _config as cfg
-    import doctor  # from tools/, added to sys.path by conftest
 
     machines = tmp_path / "machines"
     machines.mkdir(parents=True, exist_ok=True)
@@ -914,14 +910,35 @@ def test_a_utah_session_with_no_channel_map_is_warned_about(tmp_path):
     sync = tmp_path / "NSP.ns5"
     sync.write_bytes(b"")
     (tmp_path / "s.yaml").write_text(
-        f"session: s\nblackrock_dir: '{tmp_path}'\n"
+        f"session: s\nblackrock_dir: '{tmp_path}'\n{extra}"
         f"blackrock:\n  sync_file: '{sync}'\n  spike_file: '{spike}'\n",
         encoding="utf-8",
     )
+    return cfg.load_session_config(tmp_path / "s.yaml", "m", tmp_path)
 
-    session = cfg.load_session_config(tmp_path / "s.yaml", "m", tmp_path)
+
+def test_a_utah_session_with_no_channel_map_cannot_sort(tmp_path):
+    # The silent-wrong-geometry hole. setup_probe raises on it, but that is an
+    # hour into a run; check_env is where it should be caught, so it blocks rather
+    # than warns and the exit code says so.
+    import doctor  # from tools/, added to sys.path by conftest
+
+    checks = doctor.check_session(_blackrock_session(tmp_path))
+
+    blocking = [c for c in checks if c.status == doctor.MISSING and "probe" in c.detail.lower()]
+    assert blocking, [(c.status, c.detail) for c in checks]
+    assert "cmp_file" in blocking[0].detail
+    assert "make_probe.py" in (blocking[0].fix or "")
+    assert doctor.exit_code(checks) == 1
+
+
+def test_a_session_that_does_not_sort_needs_no_channel_map(tmp_path):
+    # "Extract the pulses, do not sort" needs no geometry, so demanding a map
+    # would block a session that is complete as it stands.
+    import doctor
+
+    session = _blackrock_session(tmp_path, extra="kilosort_on_blackrock: false\n")
     checks = doctor.check_session(session)
 
-    warned = [c for c in checks if c.status == doctor.WARN and "probe" in c.detail.lower()]
-    assert warned, [(c.status, c.detail) for c in checks]
-    assert "placeholder" in warned[0].detail.lower()
+    assert not [c for c in checks if "probe" in c.detail.lower()]
+    assert doctor.exit_code(checks) == 0
