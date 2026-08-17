@@ -761,3 +761,18 @@ def test_exclude_channels_is_refused(tmp_path):
 
     assert "exclude_channels" in str(excinfo.value)
     assert "bad_channels" in str(excinfo.value)
+
+
+def test_drift_correction_is_off_for_the_utah_array():
+    """Kilosort's drift correction interpolates between neighbouring contacts.
+
+    Its kernel is Gaussian with sig_interp = 20 um, so at the Utah array's 400 um
+    pitch the weight to the nearest neighbour is ~1e-87: there is nothing to
+    interpolate from. A nonzero shift estimate then scales the data toward zero
+    rather than moving it, so the correction can only subtract signal. On a dense
+    probe the same machinery is what makes drift tractable.
+    """
+    session = cfg.load_session_config(CONFIG_DIR / "session_template.yaml", "windows_rig", CONFIG_DIR)
+
+    assert session.kilosort_for("blackrock")["nblocks"] == 0
+    assert session.kilosort_for("neuropixels")["nblocks"] == 1

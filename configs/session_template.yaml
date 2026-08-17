@@ -75,6 +75,14 @@ blackrock:
   # probe drops whatever its chanMap does not cover.
   kilosort:
     bad_channels: []
+    # No drift correction on a 400 um grid. Kilosort corrects drift by
+    # interpolating between neighbouring contacts with a Gaussian kernel of
+    # sig_interp = 20 um; at 400 um the weight to the nearest neighbour is ~1e-87,
+    # so there is nothing to interpolate from. A nonzero shift estimate would then
+    # scale the data toward zero rather than moving it -- the correction can only
+    # subtract signal here. Drift on a chronic array is real; this is not the tool
+    # for it.
+    nblocks: 0
   # The array's channel map. Which array is in which monkey is a property of the
   # session, so it is named here rather than passed as a flag.
   #   probe_file  a JSON built once by make_probe.py and kept in configs/probes/
@@ -111,6 +119,11 @@ neuropixels:
   # the blackrock one -- a dead site is named the same way on either system.
   kilosort:
     bad_channels: []
+    # Drift correction. 1 is rigid: the whole shank is assumed to move together.
+    # Raise it for a long session where the tip and the surface drift differently
+    # (nblocks: 5 gives 5 non-overlapping blocks plus 4 straddling the boundaries).
+    # 0 disables it.
+    nblocks: 1
 
 sync_period_s: 1.0
 burst_interval_s: 14.0
@@ -138,5 +151,8 @@ alignment_tolerance_s: 0.001
 #   skip_kilosort_preprocessing  false   only if you filtered the data yourself
 #
 # Every other Kilosort parameter passes through unchanged.
-kilosort:
-  nblocks: 1
+#
+# Settings that describe *how you want sorting done* belong here; settings that
+# describe *the hardware* -- bad_channels, nblocks -- belong in the per-system
+# blocks above, because the probe and the array need different answers.
+kilosort: {}
