@@ -127,7 +127,7 @@ def sort_recording(
 
     name = config.sorter  # SORTER_NAME; the directory and the sorter agree by construction
     params = {"device": config.machine.device}
-    params.update(config.kilosort_for(system))
+    params.update(config.kilosort_for(system, probe_index))
 
     def body(work_dir: Path) -> Any:
         return ss.run_sorter(
@@ -180,7 +180,7 @@ def _write_run_info(
         "n_spikes": result.n_spikes,
         "fs": result.fs,
         "probe": result.probe,
-        "kilosort": config.kilosort_for(system),
+        "kilosort": config.kilosort_for(system, probe_index),
         "notes": result.notes,
     }
     with open(Path(final_dir) / "run_info.json", "w", encoding="utf-8") as handle:

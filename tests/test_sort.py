@@ -154,6 +154,35 @@ def test_each_probe_is_sorted_into_its_own_directory(tmp_path, monkeypatch):
     assert info["stream"] == "imec1"
 
 
+def test_a_probes_own_bad_channels_reach_the_sorter(tmp_path, monkeypatch):
+    # The whole point of by_probe: a site dies on imec1 and imec0 keeps sorting
+    # with the shared list. Checking run_sorter's arguments is the only place this
+    # is observable, since everything above it is just dict merging.
+    from spikesorting import _config as cfg
+
+    session_path = tmp_path / "s.yaml"
+    session_path.write_text(
+        f"session: s\nneuropixels_dir: '{tmp_path / 'np'}'\n"
+        "neuropixels:\n  run_dir: '/npx'\n  run_name: run\n  probes: [0, 1]\n"
+        "  kilosort:\n    bad_channels: []\n    nblocks: 1\n"
+        "  by_probe:\n    1:\n      kilosort:\n        bad_channels: [17, 203]\n",
+        encoding="utf-8",
+    )
+    config = cfg.load_session_config(
+        session_path, "mac", Path(__file__).resolve().parents[1] / "configs"
+    )
+
+    seen: dict = {}
+    _fake_spikeinterface(monkeypatch, seen)
+
+    sort.sort_recording(config, "neuropixels", _FakeRecording(), probe_index=1)
+    assert seen["params"]["bad_channels"] == [17, 203]
+    assert seen["params"]["nblocks"] == 1          # still the shared answer
+
+    sort.sort_recording(config, "neuropixels", _FakeRecording(), probe_index=0)
+    assert seen["params"]["bad_channels"] == []
+
+
 def test_the_cache_is_deleted_afterwards(tmp_path):
     final = tmp_path / "out"
     cache = tmp_path / "cache"

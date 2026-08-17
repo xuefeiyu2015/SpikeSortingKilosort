@@ -1,10 +1,11 @@
 # Template for a session with TWO Neuropixels probes in one run, plus Blackrock.
 # Copy to configs/<session>.yaml and edit. Copies are gitignored; this is tracked.
 #
-# It is session_template.yaml with one line changed -- `probes: [0, 1]` instead of
-# `[0]`. Everything else is deliberately identical, and a test pins that: the two
-# resolve to the same session apart from the probe list, so a value tuned in one
-# and not the other fails rather than drifting.
+# It is session_template.yaml with two things changed: `probes: [0, 1]` instead of
+# `[0]`, and Blackrock recording the sync channels only -- no spike_file, so
+# kilosort_on_blackrock is false. Everything else is deliberately identical, and a
+# test pins that: the two resolve to the same session apart from those, so a value
+# tuned in one and not the other fails rather than drifting.
 #
 #   python run_sorting_pipeline.py --config configs/Athos_2026_08_13.yaml \
 #          --machine windows_rig
@@ -23,7 +24,10 @@ session: "2026-08-13"
 
 # false = extract that system's LFP and sync pulses, but do not sort it.
 kilosort_on_neuropixels: true
-kilosort_on_blackrock: true
+# ...which is exactly this case: Blackrock carries the sync channels and no
+# spike_file, so there is nothing to sort. Left true, the sort stage would fail
+# with "blackrock.spike_file is required to load Blackrock data".
+kilosort_on_blackrock: false
 
 # Roots stop at the share; each system's directory is <root>/<monkey>/<session>.
 # Changes when the share moves, not per session. See "Paths" below.
@@ -33,7 +37,7 @@ roots:
 
 blackrock:
   # ---------- edit for this session ----------
-  spike_file: "{blackrock_dir}/HUB-Athos_001.ns6"   # Utah array spikes
+  spike_file: null   # no Utah array spikes in this session -- sync only
   sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"    # the two sync channels
   probe_file: "configs/probes/utah_athos_A.json"    # per array, not per session
   kilosort:
@@ -53,9 +57,17 @@ neuropixels:
   run_dir: "{neuropixels_dir}"      # SpikeGLX run: <run_dir>/<run_name>_g<gate>/
   run_name: "Athos_2026_08_13"
   probes: [0, 1]         # both probes of the run -- see "Two probes"
-  kilosort:
+  kilosort:              # applies to every probe listed above
     bad_channels: []     # same key, same meaning as the blackrock one
     nblocks: 1           # rigid drift correction -- see "Drift correction"
+  # One probe's dead sites are not the other's. Uncomment and name the probe --
+  # the same number as in `probes:` -- to override any Kilosort setting for it.
+  # Merged over the block above key by key, so nblocks: 1 still applies, and a
+  # bad_channels here *replaces* the list above rather than adding to it.
+  # by_probe:
+  #   1:
+  #     kilosort:
+  #       bad_channels: [17, 203]
 
   # ---------- defaults: change only if you know what they mean ----------
   gate: 0
@@ -123,11 +135,17 @@ kilosort: {}
 #   List them: `probes: [0, 1]`. Each is sorted on its own and fitted onto
 #   Blackrock time on its own -- they are separate streams with separate clocks --
 #   so there are two of everything under imec0/ and imec1/. configs/
-#   session_template_2probes.yaml is this file with that one line changed.
+#   session_template.yaml is the same file with a single probe.
 #
 #   `--probe 1` on either driver runs one of them; without it, both run. The 14 s
 #   burst comes from the OneBox and is shared, while each probe's 1 Hz train comes
 #   from its own SY word, which is why each needs a fit of its own.
+#
+#   Settings are shared unless a probe says otherwise: `by_probe:` in the block
+#   above overrides any Kilosort setting for one probe, merged over the shared and
+#   per-system blocks key by key. A dead site belongs there; geometry does not --
+#   it already comes from each probe's own .meta. Only `kilosort:` is accepted
+#   under a probe, and naming a probe that is not in `probes:` raises.
 #
 # Probes
 #   Blackrock: probe_file (a JSON built once by tools/make_probe.py) is tried

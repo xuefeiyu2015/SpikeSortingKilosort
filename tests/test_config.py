@@ -115,10 +115,13 @@ def test_the_tracked_configs_state_the_code_defaults_below_their_fences():
         assert fenced, f"{name}: no defaults fence at all"
 
 
-def test_the_two_templates_differ_only_in_the_probe_list():
+def test_the_two_templates_differ_only_where_they_say_they_do():
     # Two near-identical tracked files drift: a threshold gets tuned in the one
     # someone happened to open. Pinning the difference means the drift fails here
     # instead of on the rig, on whichever template was copied that day.
+    #
+    # The 2-probe file states its differences in its own header: two probes, and
+    # a Blackrock that recorded the sync channels only. Everything else must match.
     one, two = (
         cfg.load_session_config(CONFIG_DIR / name, "windows_rig", CONFIG_DIR)
         for name in ("session_template.yaml", "session_template_2probes.yaml")
@@ -128,13 +131,22 @@ def test_the_two_templates_differ_only_in_the_probe_list():
     assert two.neuropixels.probes == (0, 1)
     assert two.probe_indices("neuropixels") == (0, 1)
 
+    # No spike file means nothing to sort, and saying so is the config's job:
+    # left true, the sort stage would fail on the missing path instead.
+    assert two.blackrock.spike_file is None
+    assert two.kilosort_on_blackrock is False
+    assert two.sorts_blackrock is False
+    assert two.has_data("blackrock") and two.aligns_systems  # still aligned against
+
+    stated = {"neuropixels", "blackrock", "kilosort_on_blackrock"}
     differing = [
         f
         for f in one.__dataclass_fields__
-        if f != "neuropixels" and getattr(one, f) != getattr(two, f)
+        if f not in stated and getattr(one, f) != getattr(two, f)
     ]
     assert differing == [], differing
     assert cfg.replace(one.neuropixels, probes=(0, 1)) == two.neuropixels
+    assert cfg.replace(one.blackrock, spike_file=None) == two.blackrock
 
 
 def test_session_paths_no_longer_vary_by_machine():
@@ -872,15 +884,57 @@ def test_a_declared_probe_with_no_binary_is_reported_by_name(tmp_path):
     assert not any("imec0" in p for p in problems), problems
 
 
-def test_per_probe_overrides_are_refused_rather_than_ignored(tmp_path):
-    # Not implemented yet. Dropping the block in silence would sort imec1 with
-    # imec0's settings while the file says otherwise, so the name is reserved.
-    with pytest.raises(ValueError, match="by_probe"):
-        _flags(
-            tmp_path,
-            "neuropixels:\n  run_dir: '/npx'\n  run_name: 'r'\n"
-            "  by_probe:\n    1:\n      kilosort:\n        bad_channels: [17]\n",
+def _two_probes(tmp_path, by_probe: str = ""):
+    return _flags(
+        tmp_path,
+        "kilosort:\n  highpass_cutoff: 300\n"
+        "neuropixels:\n  run_dir: '/npx'\n  run_name: 'r'\n  probes: [0, 1]\n"
+        "  kilosort:\n    bad_channels: []\n    nblocks: 1\n" + by_probe,
+    )
+
+
+def test_a_probe_can_override_the_settings_of_its_own_run(tmp_path):
+    # A site dies on one probe, not on the other. Everything else -- how you want
+    # sorting done -- still comes from the blocks above, key by key.
+    session = _two_probes(
+        tmp_path,
+        "  by_probe:\n    1:\n      kilosort:\n        bad_channels: [17, 203]\n",
+    )
+
+    assert session.kilosort_for("neuropixels", 1)["bad_channels"] == [17, 203]
+    assert session.kilosort_for("neuropixels", 1)["nblocks"] == 1        # per system
+    assert session.kilosort_for("neuropixels", 1)["highpass_cutoff"] == 300  # shared
+    # ...and a probe with no entry of its own is untouched by imec1's.
+    assert session.kilosort_for("neuropixels", 0)["bad_channels"] == []
+
+
+def test_the_probe_layer_is_absent_unless_asked_for(tmp_path):
+    session = _two_probes(tmp_path)
+
+    assert session.kilosort_by_probe == {}
+    for probe in (0, 1):
+        assert session.kilosort_for("neuropixels", probe) == session.kilosort_for("neuropixels")
+
+
+def test_a_by_probe_entry_for_an_undeclared_probe_raises(tmp_path):
+    # Settings written for imec2 of a two-probe run apply to nothing. Ignoring
+    # them would sort imec1 with the shared list while the file says otherwise.
+    with pytest.raises(ValueError, match="probe 2"):
+        _two_probes(
+            tmp_path, "  by_probe:\n    2:\n      kilosort:\n        bad_channels: [17]\n"
         )
+
+
+def test_by_probe_carries_kilosort_settings_and_nothing_else(tmp_path):
+    # probe_file, run_name and the rest are not per probe -- geometry comes from
+    # each probe's own .meta. A key that would silently do nothing is refused.
+    with pytest.raises(ValueError, match="probe_file"):
+        _two_probes(tmp_path, "  by_probe:\n    1:\n      probe_file: 'x.json'\n")
+
+
+def test_blackrock_has_no_probe_dimension_to_override(tmp_path):
+    with pytest.raises(ValueError, match="by_probe"):
+        _flags(tmp_path, "blackrock:\n  sync_file: '/b/y.ns5'\n  by_probe:\n    1: {}\n")
 
 
 def test_no_kilosort_block_means_kilosorts_own_defaults(tmp_path):

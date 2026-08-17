@@ -124,6 +124,12 @@ kilosort: {}
 #   burst comes from the OneBox and is shared, while each probe's 1 Hz train comes
 #   from its own SY word, which is why each needs a fit of its own.
 #
+#   Settings are shared unless a probe says otherwise: `by_probe:` in the block
+#   above overrides any Kilosort setting for one probe, merged over the shared and
+#   per-system blocks key by key. A dead site belongs there; geometry does not --
+#   it already comes from each probe's own .meta. Only `kilosort:` is accepted
+#   under a probe, and naming a probe that is not in `probes:` raises.
+#
 # Probes
 #   Blackrock: probe_file (a JSON built once by tools/make_probe.py) is tried
 #   first, then cmp_file (the array's own wiring map). With neither, sorting falls

@@ -478,6 +478,9 @@ class SessionConfig:
     #: systems genuinely want different answers -- a 400 um Utah array and a dense
     #: probe are not the same problem -- but they share most settings.
     kilosort_by_system: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Per-probe ``kilosort:`` blocks from ``neuropixels.by_probe``, merged last.
+    #: A dead site is a fact about one probe, not about the run.
+    kilosort_by_probe: dict[int, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def paths(self) -> OutputPaths:
@@ -508,13 +511,16 @@ class SessionConfig:
     def cache_dir(self) -> Path | None:
         return self.machine.cache_dir
 
-    def kilosort_for(self, system: str) -> dict[str, Any]:
-        """Kilosort settings for one system: shared block, then its override.
+    def kilosort_for(self, system: str, probe_index: int = 0) -> dict[str, Any]:
+        """Kilosort settings for one stream: shared, then system, then probe.
 
         Merged key by key rather than replaced, so a system can change ``nblocks``
-        without discarding the rest of the shared block. Everything here is passed
-        straight to ``run_sorter`` -- Kilosort's own parameters plus the ones
-        SpikeInterface adds (``do_CAR``, ``bad_channels``, ``invert_sign``,
+        without discarding the rest of the shared block, and a probe can name its
+        own dead sites without restating how you want sorting done. Each layer is
+        one level deep: a per-probe ``bad_channels`` *replaces* the list above it
+        rather than extending it. Everything here is passed straight to
+        ``run_sorter`` -- Kilosort's own parameters plus the ones SpikeInterface
+        adds (``do_CAR``, ``bad_channels``, ``invert_sign``,
         ``skip_kilosort_preprocessing``, ``save_preprocessed_copy``).
 
         Empty means Kilosort's defaults, which already highpass at 300 Hz and
@@ -522,6 +528,8 @@ class SessionConfig:
         """
         merged = dict(self.kilosort)
         merged.update(self.kilosort_by_system.get(system) or {})
+        if system != "blackrock":
+            merged.update(self.kilosort_by_probe.get(probe_index) or {})
         return merged
 
     def has_data(self, system: str) -> bool:
@@ -756,14 +764,16 @@ _REMOVED_KEYS = {
     ),
 }
 
-#: Keys reserved for work not done yet. Refused for the same reason: a session
-#: that writes one is asking for behaviour the code does not have, and reading
-#: past it would sort with settings the file says are different.
-_RESERVED_KEYS = {
-    "by_probe": (
-        "per-probe settings are not implemented yet: give one 'kilosort:' block "
-        "under neuropixels: and it applies to every probe in 'probes'"
-    ),
+#: Keys one system understands and the other does not. Same reason as above: a
+#: block written where nothing reads it would sort with settings the file says
+#: are different.
+_WRONG_SYSTEM_KEYS = {
+    "blackrock": {
+        "by_probe": (
+            "Blackrock records one stream; by_probe is for the probes of a "
+            "SpikeGLX run. Put a dead electrode in blackrock.kilosort.bad_channels"
+        ),
+    },
 }
 
 
@@ -784,11 +794,9 @@ def _reject_removed_keys(data: dict[str, Any], path: Path) -> None:
                 f"{path}: '{prefix}{key}' is no longer a session setting "
                 f"-- {_REMOVED_KEYS[key]}"
             )
-        for key in sorted(set(block) & set(_RESERVED_KEYS)):
-            raise ValueError(
-                f"{path}: '{prefix}{key}' is not a session setting "
-                f"-- {_RESERVED_KEYS[key]}"
-            )
+        wrong = _WRONG_SYSTEM_KEYS.get(prefix.rstrip("."), {})
+        for key in sorted(set(block) & set(wrong)):
+            raise ValueError(f"{path}: '{prefix}{key}' does not apply -- {wrong[key]}")
 
 
 def _reject_probes_without_a_run(data: dict[str, Any], path: Path) -> None:
@@ -805,6 +813,48 @@ def _reject_probes_without_a_run(data: dict[str, Any], path: Path) -> None:
             "bin_file, which names a single binary. Point at a SpikeGLX run "
             "(run_dir + run_name) to sort more than one probe."
         )
+
+
+def _kilosort_by_probe(data: dict[str, Any], path: Path) -> dict[int, dict[str, Any]]:
+    """Parse ``neuropixels.by_probe`` into ``{probe index: kilosort settings}``.
+
+    Only ``kilosort:`` is accepted under a probe. Geometry already comes from that
+    probe's own ``.meta``, and a key nothing reads is worse than no key at all:
+    it would sit in the session file describing a run that never happened.
+    """
+    npx = data.get("neuropixels") or {}
+    raw = npx.get("by_probe")
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"{path}: neuropixels.by_probe must map a probe index to its settings, "
+            f"got {type(raw).__name__}"
+        )
+
+    declared = [int(p) for p in npx.get("probes", (0,))]
+    resolved: dict[int, dict[str, Any]] = {}
+    for key, block in raw.items():
+        if not isinstance(key, int):
+            raise ValueError(
+                f"{path}: neuropixels.by_probe key {key!r} is not a probe index "
+                "-- write '1:', the same number as in 'probes:'"
+            )
+        if key not in declared:
+            raise ValueError(
+                f"{path}: neuropixels.by_probe names probe {key}, which is not in "
+                f"probes: {declared}. Settings there would apply to nothing."
+            )
+        block = block or {}
+        extra = sorted(set(block) - {"kilosort"})
+        if extra:
+            raise ValueError(
+                f"{path}: neuropixels.by_probe.{key} may only carry 'kilosort:', "
+                f"got {', '.join(extra)}. Geometry comes from that probe's own .meta."
+            )
+        if block.get("kilosort"):
+            resolved[key] = dict(block["kilosort"])
+    return resolved
 
 
 def load_machine(name: str, config_dir: Path | None = None) -> MachineProfile:
@@ -928,6 +978,7 @@ def load_session_config(
             for system in ("neuropixels", "blackrock")
             if (data.get(system) or {}).get("kilosort")
         },
+        kilosort_by_probe=_kilosort_by_probe(data, session_path),
     )
 
 
