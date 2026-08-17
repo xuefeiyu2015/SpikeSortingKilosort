@@ -48,6 +48,21 @@ SORTER_NAME = "kilosort4"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def stream_label(system: str, probe: int = 0) -> str:
+    """What one stream is called in paths, cache tags and status lines.
+
+    Blackrock records one stream, so it is just the system. A SpikeGLX run can
+    hold several probes, each with its own clock and its own sync word, so each is
+    named the way SpikeGLX names it: ``imec0``, ``imec1``.
+    """
+    return "blackrock" if system == "blackrock" else f"imec{int(probe)}"
+
+
+def _with_probe(directory: Path, system: str, probe: int) -> Path:
+    """Add the probe level for Neuropixels; leave Blackrock's paths alone."""
+    return directory if system == "blackrock" else directory / stream_label(system, probe)
+
+
 def default_config_dir() -> Path:
     """Directory holding the YAML configs, overridable with ``SPIKESORTING_CONFIG_DIR``."""
     env = os.environ.get("SPIKESORTING_CONFIG_DIR")
@@ -339,6 +354,9 @@ class OutputPaths:
     blackrock_dir: Path | None = None
     neuropixels_dir: Path | None = None
     sorter: str = SORTER_NAME
+    #: Which probes this session recorded, for :meth:`all`. One SpikeGLX run can
+    #: hold several, and each is a stream of its own with its own clock.
+    npx_probes: tuple[int, ...] = (0,)
 
     def dir_for(self, system: str) -> Path | None:
         """That system's directory, or None when it never recorded."""
@@ -361,18 +379,21 @@ class OutputPaths:
                 return directory
         raise ValueError("session has neither a blackrock_dir nor a neuropixels_dir")
 
-    def sync_for(self, system: str) -> Path:
+    def sync_for(self, system: str, probe: int = 0) -> Path:
         """Edge files, beside the recording they were extracted from."""
-        return self._require(system) / "sync"
+        return _with_probe(self._require(system) / "sync", system, probe)
 
     @property
     def lfp(self) -> Path:
         # Neuropixels only: Blackrock LFPs are already saved separately by Central.
         return self._require("neuropixels") / "lfp"
 
-    def sorted_for(self, system: str) -> Path:
+    def lfp_for(self, probe: int = 0) -> Path:
+        return self.lfp / stream_label("neuropixels", probe)
+
+    def sorted_for(self, system: str, probe: int = 0) -> Path:
         """Where one system's sorting lands. The system-agnostic form."""
-        return self._require(system) / system / self.sorter
+        return _with_probe(self._require(system) / system, system, probe) / self.sorter
 
     @property
     def sorted_np(self) -> Path:
@@ -386,15 +407,32 @@ class OutputPaths:
     def aligned(self) -> Path:
         return self.primary / "aligned"
 
+    def aligned_for(self, probe: int = 0) -> Path:
+        """One probe's time map and mapped spike times.
+
+        Per probe rather than per system: each probe has its own clock, so its
+        map, its trimmed edge trains and its validation are its own.
+        """
+        return self.aligned / stream_label("neuropixels", probe)
+
     @property
     def figures(self) -> Path:
         return self.primary / "figures"
+
+    def figures_for(self, system: str, probe: int = 0) -> Path:
+        return _with_probe(self.figures / system, system, probe)
 
     def all(self) -> tuple[Path, ...]:
         """Every directory this session can actually write to."""
         paths: list[Path] = [self.aligned, self.figures]
         if self.neuropixels_dir is not None:
-            paths += [self.sync_for("neuropixels"), self.lfp, self.sorted_np]
+            for probe in self.npx_probes:
+                paths += [
+                    self.sync_for("neuropixels", probe),
+                    self.lfp_for(probe),
+                    self.sorted_for("neuropixels", probe),
+                    self.aligned_for(probe),
+                ]
         if self.blackrock_dir is not None:
             paths += [self.sync_for("blackrock"), self.sorted_br]
         return tuple(dict.fromkeys(paths))
@@ -443,7 +481,23 @@ class SessionConfig:
 
     @property
     def paths(self) -> OutputPaths:
-        return OutputPaths(self.blackrock_dir, self.neuropixels_dir, self.sorter)
+        return OutputPaths(
+            self.blackrock_dir,
+            self.neuropixels_dir,
+            self.sorter,
+            npx_probes=self.probe_indices("neuropixels"),
+        )
+
+    def probe_indices(self, system: str) -> tuple[int, ...]:
+        """Which streams of ``system`` this session recorded.
+
+        Blackrock has one, so the drivers' inner loop runs once for it and does
+        not re-extract the NSP file per Neuropixels probe. A bare ``bin_file``
+        also has one: it names a single binary, with no imec dimension to iterate.
+        """
+        if system == "blackrock" or self.neuropixels.bin_file is not None:
+            return (0,)
+        return tuple(self.neuropixels.probes)
 
     @property
     def output_root(self) -> Path:
@@ -501,6 +555,31 @@ class SessionConfig:
         """Whether step 4 runs."""
         return self.has_data("blackrock") and self.kilosort_on_blackrock
 
+    def _missing_probe_binaries(self) -> list[str]:
+        """Every declared probe whose AP binary is not in the run folder.
+
+        A run holding imec0 and imec1 looks complete from ``run_dir`` alone, so
+        without this a typo'd ``probes:`` entry is only discovered after the first
+        probe has been sorted.
+        """
+        from ._io import spikeglx  # local: keeps the config layer import-light
+
+        npx = self.neuropixels
+        problems: list[str] = []
+        for probe in self.probe_indices("neuropixels"):
+            try:
+                files = spikeglx.find_run_files(
+                    npx.run_dir, npx.run_name, npx.gate, npx.trigger, probe
+                )
+            except FileNotFoundError as error:
+                return [str(error)]
+            if files["ap"] is None:
+                problems.append(
+                    f"neuropixels {stream_label('neuropixels', probe)}: no AP binary "
+                    f"for run {npx.run_name} g{npx.gate} under {npx.run_dir}"
+                )
+        return problems
+
     def missing_inputs(self) -> list[str]:
         """Return human-readable problems with the *input* paths.
 
@@ -520,6 +599,8 @@ class SessionConfig:
             elif npx.run_dir is not None:
                 if not npx.run_dir.exists():
                     problems.append(f"neuropixels.run_dir does not exist: {npx.run_dir}")
+                elif npx.run_name:
+                    problems += self._missing_probe_binaries()
                 if not npx.run_name:
                     problems.append("neuropixels.run_name is required when run_dir is set")
             else:
@@ -675,9 +756,19 @@ _REMOVED_KEYS = {
     ),
 }
 
+#: Keys reserved for work not done yet. Refused for the same reason: a session
+#: that writes one is asking for behaviour the code does not have, and reading
+#: past it would sort with settings the file says are different.
+_RESERVED_KEYS = {
+    "by_probe": (
+        "per-probe settings are not implemented yet: give one 'kilosort:' block "
+        "under neuropixels: and it applies to every probe in 'probes'"
+    ),
+}
+
 
 def _reject_removed_keys(data: dict[str, Any], path: Path) -> None:
-    """Refuse a removed key at the top level or inside a system's block.
+    """Refuse a removed or reserved key, at the top level or in a system's block.
 
     ``preprocess:`` was settable per system, so checking only the top level would
     drop one in silence -- exactly what this exists to prevent.
@@ -693,6 +784,27 @@ def _reject_removed_keys(data: dict[str, Any], path: Path) -> None:
                 f"{path}: '{prefix}{key}' is no longer a session setting "
                 f"-- {_REMOVED_KEYS[key]}"
             )
+        for key in sorted(set(block) & set(_RESERVED_KEYS)):
+            raise ValueError(
+                f"{path}: '{prefix}{key}' is not a session setting "
+                f"-- {_RESERVED_KEYS[key]}"
+            )
+
+
+def _reject_probes_without_a_run(data: dict[str, Any], path: Path) -> None:
+    """A bare ``bin_file`` names one binary, so it cannot hold two probes.
+
+    Reading past this would sort the same file twice and file the two identical
+    results under imec0 and imec1.
+    """
+    npx = data.get("neuropixels") or {}
+    probes = npx.get("probes")
+    if npx.get("bin_file") and probes is not None and len(probes) > 1:
+        raise ValueError(
+            f"{path}: neuropixels.probes lists {len(probes)} probes beside a "
+            "bin_file, which names a single binary. Point at a SpikeGLX run "
+            "(run_dir + run_name) to sort more than one probe."
+        )
 
 
 def load_machine(name: str, config_dir: Path | None = None) -> MachineProfile:
@@ -720,6 +832,7 @@ def load_session_config(
 
     data = _read_yaml(session_path)
     _reject_removed_keys(data, session_path)
+    _reject_probes_without_a_run(data, session_path)
     profile = load_machine(machine, config_dir) if isinstance(machine, str) else machine
 
     session_name = str(data.get("session") or session_path.stem)

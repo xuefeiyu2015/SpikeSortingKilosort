@@ -52,6 +52,56 @@ def square_wave(
     return wave
 
 
+def _imec_meta(n_chan: int, n_sites: int) -> str:
+    """A meta whose ~snsGeomMap has ``n_sites`` entries, so probes differ visibly."""
+    sites = "".join(f"(0:{27 + 5 * i}:{20 * i}:1)" for i in range(n_sites))
+    return (
+        f"nSavedChans={n_chan}\n"
+        "imSampRate=30000\n"
+        "typeThis=imec\n"
+        "fileSizeBytes=0\n"
+        f"snsApLfSy={n_chan - 1},0,1\n"
+        "imAiRangeMax=0.6\n"
+        "imMaxInt=512\n"
+        f"~snsGeomMap=(NP1000,1,0,70){sites}\n"
+    )
+
+
+def spikeglx_run(
+    root: Path,
+    run_name: str = "run",
+    gate: int = 0,
+    trigger: int = 0,
+    probes: tuple[int, ...] = (0,),
+    phases: dict[int, float] | None = None,
+    sites: dict[int, int] | None = None,
+    duration_s: float = 5.0,
+    n_chan: int = 8,
+) -> Path:
+    """A SpikeGLX run folder holding one AP binary + ``.meta`` per probe.
+
+    Each probe gets its own SY-bit-6 phase and its own site count, so a test can
+    tell *which* probe's files were read -- which is the whole question once a run
+    holds more than one.
+    """
+    fs = 30000.0
+    gate_dir = Path(root) / f"{run_name}_g{gate}"
+    for probe in probes:
+        probe_dir = gate_dir / f"{run_name}_g{gate}_imec{probe}"
+        probe_dir.mkdir(parents=True, exist_ok=True)
+
+        data = np.zeros((int(duration_s * fs), n_chan), dtype=np.int16)
+        wave = square_wave(duration_s, fs, period_s=1.0, phase_s=(phases or {}).get(probe, 0.25))
+        data[: wave.size, -1] = (wave.astype(np.uint16) << 6).astype(np.int16)
+
+        bin_path = probe_dir / f"{run_name}_g{gate}_t{trigger}.imec{probe}.ap.bin"
+        bin_path.write_bytes(data.tobytes())
+        bin_path.with_suffix(".meta").write_text(
+            _imec_meta(n_chan, (sites or {}).get(probe, 4)), encoding="utf-8"
+        )
+    return Path(root)
+
+
 def coded_burst_times(
     n_bursts: int,
     interval_s: float = 14.0,

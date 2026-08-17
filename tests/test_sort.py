@@ -86,6 +86,74 @@ def test_the_temp_binary_is_left_behind_in_the_cache(tmp_path):
     assert not (final / "temp.dat").exists()
 
 
+class _FakeRecording:
+    def get_sampling_frequency(self):
+        return 30000.0
+
+
+def _fake_spikeinterface(monkeypatch, seen):
+    """Stand in for spikeinterface.sorters, recording what run_sorter was told.
+
+    Both the package and the submodule are replaced: ``import a.b as x`` resolves
+    ``b`` as an attribute of ``a``, so patching only ``sys.modules["a.b"]`` would
+    still hand back the real one wherever SpikeInterface happens to be installed
+    -- and this test has to behave the same on a laptop that has none of it.
+    """
+    import sys
+    import types
+
+    sorters = types.ModuleType("spikeinterface.sorters")
+
+    def run_sorter(name, recording, folder, remove_existing_folder=True, **params):
+        seen["folder"] = Path(folder)
+        seen["params"] = params
+        results = Path(folder) / "sorter_output"
+        results.mkdir(parents=True)
+        (results / "spike_times.npy").write_bytes(b"spikes")
+        return types.SimpleNamespace(unit_ids=[1, 2, 3])
+
+    sorters.run_sorter = run_sorter
+    package = types.ModuleType("spikeinterface")
+    package.sorters = sorters
+    monkeypatch.setitem(sys.modules, "spikeinterface", package)
+    monkeypatch.setitem(sys.modules, "spikeinterface.sorters", sorters)
+    return sorters
+
+
+def test_each_probe_is_sorted_into_its_own_directory(tmp_path, monkeypatch):
+    # Publishing both probes to <npx>/neuropixels/kilosort4 would leave whichever
+    # sorted last, with nothing to say the other ever ran.
+    from spikesorting import _config as cfg
+
+    session_path = tmp_path / "s.yaml"
+    session_path.write_text(
+        f"session: s\nneuropixels_dir: '{tmp_path / 'np'}'\n"
+        "neuropixels:\n  run_dir: '/npx'\n  run_name: run\n  probes: [0, 1]\n",
+        encoding="utf-8",
+    )
+    config = cfg.load_session_config(
+        session_path, "mac", Path(__file__).resolve().parents[1] / "configs"
+    )
+
+    seen: dict = {}
+    _fake_spikeinterface(monkeypatch, seen)
+
+    result = sort.sort_recording(config, "neuropixels", _FakeRecording(), probe_index=1)
+
+    assert result.results_dir == config.paths.sorted_for("neuropixels", 1)
+    assert result.results_dir.parts[-2:] == ("imec1", "kilosort4")
+    assert (result.results_dir / "spike_times.npy").exists()
+    # The cache is shared by every sort on the machine, so the tag carries the
+    # stream too -- two probes of one session are two different runs.
+    assert "imec1" in str(seen["folder"])
+
+    import json
+
+    info = json.loads((result.results_dir / "run_info.json").read_text())
+    assert info["probe_index"] == 1
+    assert info["stream"] == "imec1"
+
+
 def test_the_cache_is_deleted_afterwards(tmp_path):
     final = tmp_path / "out"
     cache = tmp_path / "cache"

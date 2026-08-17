@@ -94,7 +94,11 @@ def test_the_tracked_configs_state_the_code_defaults_below_their_fences():
     # default; a value chosen for this recording belongs above it.
     stock = {"blackrock": cfg.BlackrockSpec(), "neuropixels": cfg.NeuropixelsSpec()}
 
-    for name, machine in (("session_template.yaml", "windows_rig"), ("demo.yaml", "mac")):
+    for name, machine in (
+        ("session_template.yaml", "windows_rig"),
+        ("session_template_2probes.yaml", "windows_rig"),
+        ("demo.yaml", "mac"),
+    ):
         text = (CONFIG_DIR / name).read_text()
         session = cfg.load_session_config(CONFIG_DIR / name, machine, CONFIG_DIR)
         fenced = 0
@@ -109,6 +113,28 @@ def test_the_tracked_configs_state_the_code_defaults_below_their_fences():
                     f"{name}: {block}.{key} is not a default -- move it above the fence"
                 )
         assert fenced, f"{name}: no defaults fence at all"
+
+
+def test_the_two_templates_differ_only_in_the_probe_list():
+    # Two near-identical tracked files drift: a threshold gets tuned in the one
+    # someone happened to open. Pinning the difference means the drift fails here
+    # instead of on the rig, on whichever template was copied that day.
+    one, two = (
+        cfg.load_session_config(CONFIG_DIR / name, "windows_rig", CONFIG_DIR)
+        for name in ("session_template.yaml", "session_template_2probes.yaml")
+    )
+
+    assert one.neuropixels.probes == (0,)
+    assert two.neuropixels.probes == (0, 1)
+    assert two.probe_indices("neuropixels") == (0, 1)
+
+    differing = [
+        f
+        for f in one.__dataclass_fields__
+        if f != "neuropixels" and getattr(one, f) != getattr(two, f)
+    ]
+    assert differing == [], differing
+    assert cfg.replace(one.neuropixels, probes=(0, 1)) == two.neuropixels
 
 
 def test_session_paths_no_longer_vary_by_machine():
@@ -223,6 +249,44 @@ def test_only_the_reachable_directories_are_created(tmp_path):
     assert not (tmp_path / "np" / "blackrock").exists()
     with pytest.raises(ValueError, match="blackrock_dir"):
         _ = paths.sorted_br
+
+
+def test_every_neuropixels_output_names_its_probe(tmp_path):
+    # Two probes in one run share a directory tree, so every Neuropixels output
+    # carries the probe that produced it. Without this, imec1's sorting, edges and
+    # time map all land on imec0's.
+    paths = cfg.OutputPaths(tmp_path / "br", tmp_path / "np", npx_probes=(0, 1))
+
+    assert paths.sorted_for("neuropixels", 1).parts[-3:] == ("neuropixels", "imec1", "kilosort4")
+    assert paths.sync_for("neuropixels", 1).parts[-2:] == ("sync", "imec1")
+    assert paths.lfp_for(1).parts[-2:] == ("lfp", "imec1")
+    assert paths.aligned_for(1).parts[-2:] == ("aligned", "imec1")
+    assert paths.figures_for("neuropixels", 1).parts[-3:] == ("figures", "neuropixels", "imec1")
+    # ...and imec0 is written the same way, so a tree is never ambiguous about
+    # which probe it came from.
+    assert paths.sorted_for("neuropixels").parts[-2] == "imec0"
+
+
+def test_blackrock_paths_ignore_the_probe_argument(tmp_path):
+    # One stream, no imec dimension. The verbs pass a probe index for both
+    # systems, so the argument has to be harmless here rather than absent.
+    paths = cfg.OutputPaths(tmp_path / "br", tmp_path / "np", npx_probes=(0, 1))
+
+    assert paths.sorted_for("blackrock", 1) == paths.sorted_for("blackrock")
+    assert paths.sync_for("blackrock", 1) == paths.sync_for("blackrock")
+    assert paths.figures_for("blackrock", 1) == paths.figures_for("blackrock")
+    assert paths.sorted_for("blackrock").parts[-2:] == ("blackrock", cfg.SORTER_NAME)
+
+
+def test_mkdirs_creates_one_set_of_directories_per_declared_probe(tmp_path):
+    paths = cfg.OutputPaths(tmp_path / "br", tmp_path / "np", npx_probes=(0, 1))
+    paths.mkdirs()
+
+    for probe in (0, 1):
+        assert paths.sorted_for("neuropixels", probe).exists()
+        assert paths.sync_for("neuropixels", probe).exists()
+        assert paths.aligned_for(probe).exists()
+    assert all(p.exists() for p in paths.all())
 
 
 def _write_session(tmp_path: Path, body: str) -> Path:
@@ -369,7 +433,10 @@ def test_sorted_results_land_beside_each_systems_own_recording(tmp_path):
     session = cfg.load_session_config(_write_session(tmp_path, _TWO_SYSTEMS), "windows_rig", CONFIG_DIR)
 
     assert str(session.paths.sorted_br) == "Z:/server/Monkey Athos/2026-08-13/blackrock/kilosort4"
-    assert str(session.paths.sorted_np) == "Y:/npx/Monkey Athos/2026-08-13/neuropixels/kilosort4"
+    assert (
+        str(session.paths.sorted_np)
+        == "Y:/npx/Monkey Athos/2026-08-13/neuropixels/imec0/kilosort4"
+    )
 
 
 def test_sync_and_lfp_follow_the_system_they_came_from(tmp_path):
@@ -377,9 +444,9 @@ def test_sync_and_lfp_follow_the_system_they_came_from(tmp_path):
     paths = session.paths
 
     assert str(paths.sync_for("blackrock")) == "Z:/server/Monkey Athos/2026-08-13/sync"
-    assert str(paths.sync_for("neuropixels")) == "Y:/npx/Monkey Athos/2026-08-13/sync"
+    assert str(paths.sync_for("neuropixels")) == "Y:/npx/Monkey Athos/2026-08-13/sync/imec0"
     # LFP is a Neuropixels product: Blackrock LFPs are saved separately by Central.
-    assert str(paths.lfp) == "Y:/npx/Monkey Athos/2026-08-13/lfp"
+    assert str(paths.lfp_for(0)) == "Y:/npx/Monkey Athos/2026-08-13/lfp/imec0"
 
 
 def test_cross_system_output_goes_under_the_reference_timebase(tmp_path):
@@ -432,7 +499,7 @@ neuropixels:
     )
 
     assert session.neuropixels_dir == Path.home() / "ephys" / "demo_data"
-    assert session.paths.sorted_np == Path.home() / "ephys/demo_data/neuropixels/kilosort4"
+    assert session.paths.sorted_np == Path.home() / "ephys/demo_data/neuropixels/imec0/kilosort4"
 
 
 def test_each_system_can_name_its_own_probe_file(tmp_path):
@@ -763,6 +830,57 @@ def test_a_system_replaces_a_shared_list_rather_than_extending_it(tmp_path):
 
     assert session.kilosort_for("blackrock")["bad_channels"] == [7]
     assert session.kilosort_for("neuropixels")["bad_channels"] == [191, 192]
+
+
+def test_a_run_can_declare_two_probes(tmp_path):
+    session = _flags(
+        tmp_path,
+        "neuropixels:\n  run_dir: '/npx'\n  run_name: 'r'\n  probes: [0, 1]\n",
+    )
+
+    assert session.probe_indices("neuropixels") == (0, 1)
+    # Blackrock has one stream, so the loop that drives both systems runs once.
+    assert session.probe_indices("blackrock") == (0,)
+    assert session.paths.npx_probes == (0, 1)
+
+
+def test_a_bare_binary_has_no_probe_dimension(tmp_path):
+    # bin_file points at one file. Declaring two probes beside it would sort that
+    # single binary twice, into two directories, and call the results imec0 and
+    # imec1 -- so it raises instead.
+    with pytest.raises(ValueError, match="probes"):
+        _flags(tmp_path, "neuropixels:\n  bin_file: '/a/x.bin'\n  probes: [0, 1]\n")
+
+    session = _flags(tmp_path, "neuropixels:\n  bin_file: '/a/x.bin'\n")
+    assert session.probe_indices("neuropixels") == (0,)
+
+
+def test_a_declared_probe_with_no_binary_is_reported_by_name(tmp_path):
+    # The run folder exists and imec0 is there, so checking run_dir alone would
+    # call this session runnable and only fail hours later, on the second probe.
+    from conftest import spikeglx_run
+
+    spikeglx_run(tmp_path / "npx", probes=(0,))
+    session = _flags(
+        tmp_path,
+        f"neuropixels:\n  run_dir: '{tmp_path / 'npx'}'\n  run_name: 'run'\n  probes: [0, 1]\n",
+    )
+
+    problems = session.missing_inputs()
+
+    assert any("imec1" in p for p in problems), problems
+    assert not any("imec0" in p for p in problems), problems
+
+
+def test_per_probe_overrides_are_refused_rather_than_ignored(tmp_path):
+    # Not implemented yet. Dropping the block in silence would sort imec1 with
+    # imec0's settings while the file says otherwise, so the name is reserved.
+    with pytest.raises(ValueError, match="by_probe"):
+        _flags(
+            tmp_path,
+            "neuropixels:\n  run_dir: '/npx'\n  run_name: 'r'\n"
+            "  by_probe:\n    1:\n      kilosort:\n        bad_channels: [17]\n",
+        )
 
 
 def test_no_kilosort_block_means_kilosorts_own_defaults(tmp_path):

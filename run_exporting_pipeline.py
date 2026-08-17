@@ -31,7 +31,7 @@ from pathlib import Path
 # The shared CLI helpers live in tools/; _cli adds src/ itself.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 
-from _cli import Runner, build_parser, load  # noqa: E402
+from _cli import Runner, build_parser, load, run_probes  # noqa: E402
 
 import spikesorting as ss  # noqa: E402
 
@@ -68,24 +68,45 @@ def main() -> int:
     print()
 
     # The pipeline, in order. Blackrock is the reference timebase, so it is what
-    # the other system is mapped *onto* rather than a system to remap.
+    # the other system is mapped *onto* rather than a system to remap. Each
+    # Neuropixels probe is mapped and validated on its own: two probes are two
+    # clocks, so one fit cannot serve both.
     if "time_remapping" in args.steps:
         for system in ss.SYSTEMS:
-            run(ss.time_remapping, config, system, system=system)
+            for probe_index in run_probes(config, system, args.probe):
+                run(
+                    ss.time_remapping,
+                    config,
+                    system,
+                    probe_index=probe_index,
+                    system=system,
+                    probe=probe_index,
+                )
 
     if "validate_remapping" in args.steps:
-        run(ss.validate_remapping, config, figures)
+        for probe_index in run_probes(config, "neuropixels", args.probe):
+            run(
+                ss.validate_remapping,
+                config,
+                figures,
+                probe_index=probe_index,
+                system="neuropixels",
+                probe=probe_index,
+            )
 
     if "export_results" in args.steps:
         for system in ss.SYSTEMS:
-            run(
-                ss.export_results,
-                config,
-                system,
-                tuple(args.groups),
-                figures,
-                system=system,
-            )
+            for probe_index in run_probes(config, system, args.probe):
+                run(
+                    ss.export_results,
+                    config,
+                    system,
+                    tuple(args.groups),
+                    figures,
+                    probe_index=probe_index,
+                    system=system,
+                    probe=probe_index,
+                )
 
     return run.finish("exporting pipeline")
 

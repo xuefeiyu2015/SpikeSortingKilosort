@@ -201,6 +201,22 @@ def test_a_utah_cmp_wins_over_a_probe_file(tmp_path):
         ss.setup_probe(session, "blackrock")
 
 
+def test_each_probe_gets_the_geometry_from_its_own_meta(tmp_path):
+    # Two probes in one run need not share an imro table: which sites are active
+    # is chosen per probe. Reading imec0's .meta for imec1 would put imec1's units
+    # on imec0's sites, and nothing downstream could tell.
+    from conftest import spikeglx_run
+
+    run_dir = spikeglx_run(tmp_path / "npx", probes=(0, 1), sites={0: 4, 1: 6})
+    session = _session(
+        tmp_path,
+        f"neuropixels:\n  run_dir: '{run_dir}'\n  run_name: run\n  probes: [0, 1]\n",
+    )
+
+    assert ss.setup_probe(session, "neuropixels")["n_chan"] == 4
+    assert ss.setup_probe(session, "neuropixels", probe_index=1)["n_chan"] == 6
+
+
 def test_a_utah_probe_file_is_used_when_no_cmp_is_named(tmp_path):
     probe = _probe_json(tmp_path / "probes" / "utah_A.json")
     session = _session(tmp_path, f"blackrock:\n  sync_file: '/b/y.ns5'\n  probe_file: '{probe}'\n")
@@ -269,8 +285,41 @@ def test_time_remapping_recovers_a_planted_offset_and_drift(tmp_path):
     assert result.method == "map_only"
     assert result.mapping.intercept == pytest.approx(offset, abs=1e-6)
     assert result.mapping.drift_ppm == pytest.approx(-20.0, abs=0.1)
-    assert (session.paths.aligned / "time_map.json").exists()
+    assert (session.paths.aligned_for(0) / "time_map.json").exists()
     assert "ppm" in result.summary()
+
+
+def test_each_probe_is_fitted_onto_blackrock_time_on_its_own(tmp_path):
+    # Two probes in one run are two oscillators. One fit cannot serve both, so
+    # each gets its own map in its own directory -- and planting *different*
+    # drifts is what proves the second probe is not reading the first's edges.
+    from spikesorting._sync import catgt
+
+    session = _session(
+        tmp_path,
+        "neuropixels:\n  run_dir: '/npx'\n  run_name: run\n  probes: [0, 1]\n",
+    )
+    session.paths.sync_for("blackrock").mkdir(parents=True, exist_ok=True)
+
+    br = np.arange(0.0, 600.0, 1.0) + 100.0
+    catgt.write_edge_file(session.paths.sync_for("blackrock") / "blackrock_1hz.txt", br)
+
+    planted = {0: (12.3456, 20e-6), 1: (34.5678, -5e-6)}
+    for probe, (offset, ppm) in planted.items():
+        sync_dir = session.paths.sync_for("neuropixels", probe)
+        sync_dir.mkdir(parents=True, exist_ok=True)
+        catgt.write_edge_file(sync_dir / "npx_1hz.txt", (br - offset) * (1 + ppm))
+
+    for probe, (offset, ppm) in planted.items():
+        result = ss.time_remapping(session, "neuropixels", probe)
+
+        assert result.mapping.intercept == pytest.approx(offset, abs=1e-6)
+        assert result.mapping.drift_ppm == pytest.approx(-ppm * 1e6, abs=0.1)
+        assert (session.paths.aligned_for(probe) / "time_map.json").exists()
+
+    # ...and the two maps are files of their own, not one overwritten twice.
+    maps = sorted(p.parent.name for p in session.paths.aligned.rglob("time_map.json"))
+    assert maps == ["imec0", "imec1"]
 
 
 def test_the_reference_timebase_is_not_remapped_onto_itself(tmp_path):

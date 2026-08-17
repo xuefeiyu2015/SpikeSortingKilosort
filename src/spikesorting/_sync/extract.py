@@ -184,7 +184,7 @@ def _run_catgt_extraction(
         gate=npx.gate,
         trigger=npx.trigger,
         probes=(probe,),
-        dest=config.paths.sync_for("neuropixels") / "catgt",
+        dest=config.paths.sync_for("neuropixels", probe) / "catgt",
     )
     report.catgt_commands.append("runit " + " ".join(args))
 
@@ -196,7 +196,7 @@ def _run_catgt_extraction(
         return {}
 
     catgt.run_catgt(machine.catgt_dir, args)
-    produced = catgt.find_edge_files(config.paths.sync_for("neuropixels") / "catgt")
+    produced = catgt.find_edge_files(config.paths.sync_for("neuropixels", probe) / "catgt")
 
     result: dict[str, np.ndarray] = {}
     for spec in specs:
@@ -223,7 +223,7 @@ def extract_neuropixels_edges(
     and writes the canonical edge files.
     """
     report = ExtractionReport()
-    sync_dir = config.paths.sync_for("neuropixels")
+    sync_dir = config.paths.sync_for("neuropixels", probe)
     sync_dir.mkdir(parents=True, exist_ok=True)
 
     catgt_times = _run_catgt_extraction(config, report, probe)

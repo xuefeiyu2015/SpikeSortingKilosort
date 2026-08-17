@@ -19,6 +19,11 @@ both through SpikeInterface::
     validate_remapping(config)
     export_results(config, "neuropixels")
 
+One SpikeGLX run can hold several probes, and each is a stream of its own with
+its own clock, so the Neuropixels verbs also take ``probe_index`` and every
+output of theirs names the probe (``sync/imec1/``, ``neuropixels/imec1/…``).
+Blackrock records one stream and ignores it.
+
 **Verbs return values, not status wrappers** -- a recording, a report, a path --
 so a notebook cell shows the real object and the next verb takes it directly.
 
@@ -48,6 +53,7 @@ from ._config import (  # noqa: F401  (re-exported: the config verb and its type
     SessionConfig,
     load_machine,
     load_session_config,
+    stream_label,
 )
 from ._sync import align, burst, catgt, extract
 
@@ -71,6 +77,7 @@ __all__ = [
     "MachineProfile",
     "OutputPaths",
     "load_machine",
+    "stream_label",
 ]
 
 SYSTEMS = ("neuropixels", "blackrock")
@@ -126,7 +133,7 @@ def skip_reason(config: SessionConfig, verb: Any, system: str | None = None) -> 
 # ----------------------------------------------------------------------------
 
 
-def setup_probe(config: SessionConfig, system: str) -> dict | None:
+def setup_probe(config: SessionConfig, system: str, probe_index: int = 0) -> dict | None:
     """The channel map for one system, as a Kilosort probe dict.
 
     An explicit step rather than something hidden inside loading, because this is
@@ -152,6 +159,10 @@ def setup_probe(config: SessionConfig, system: str) -> dict | None:
     to guess a Neuropixels layout from, which is why step 3 raises rather than
     inventing one -- unlike a Utah array, where a square grid is at least a
     recognisably wrong answer.
+
+    ``probe_index`` selects which probe of a SpikeGLX run to build the map for.
+    Each probe has its own ``.meta``, and which sites are active is chosen per
+    probe, so the two need not agree.
     """
     _check(system)
     if not config.has_data(system):
@@ -160,13 +171,20 @@ def setup_probe(config: SessionConfig, system: str) -> dict | None:
     spec = getattr(config, system)
 
     if system == "neuropixels":
-        probe = _probe_from_meta(config)
+        probe = _probe_from_meta(config, probe_index)
         if probe is not None:
             return probe
         if spec.probe_file is not None:
             from ._probes.io import load_probe_json
 
             log.info("no usable .meta; using neuropixels.probe_file %s", spec.probe_file)
+            if len(config.probe_indices("neuropixels")) > 1:
+                log.warning(
+                    "this run declares %d probes and none has a usable .meta, so the "
+                    "same map (%s) is applied to every one of them -- correct only if "
+                    "they were configured identically",
+                    len(config.probe_indices("neuropixels")), spec.probe_file,
+                )
             return load_probe_json(spec.probe_file)
         raise FileNotFoundError(
             "no channel map for neuropixels: this run has no .meta to build one "
@@ -244,7 +262,9 @@ def load_spike_continuous(
     Not the LFP and not the sync channels -- those have verbs of their own. The
     probe is attached here, so everything downstream stops caring which system
     produced the samples. Pass ``probe`` to override the configured map for one
-    run, for trying a map before committing it to the session file.
+    run, for trying a map before committing it to the session file;
+    ``probe_index`` selects which probe of a SpikeGLX run to read, and the map
+    comes from that same probe.
     """
     _check(system)
     if not config.has_data(system):
@@ -270,7 +290,7 @@ def load_spike_continuous(
             dtype="int16",
         )
 
-    probe = probe if probe is not None else setup_probe(config, system)
+    probe = probe if probe is not None else setup_probe(config, system, probe_index)
     return recording.set_probe(to_probeinterface(probe))
 
 
@@ -284,6 +304,7 @@ def sort_with_kilosort(
     config: SessionConfig,
     system: str,
     results_dir: Path | None = None,
+    probe_index: int = 0,
 ) -> Any | None:
     """Run Kilosort4 on a loaded recording. Returns a ``SortResult``.
 
@@ -303,7 +324,9 @@ def sort_with_kilosort(
 
     from ._sort import sort_recording
 
-    return sort_recording(config, system, recording, results_dir=results_dir)
+    return sort_recording(
+        config, system, recording, results_dir=results_dir, probe_index=probe_index
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -311,24 +334,27 @@ def sort_with_kilosort(
 # ----------------------------------------------------------------------------
 
 
-def extract_sync(config: SessionConfig, system: str, probe: int = 0) -> Any | None:
-    """Extract one system's sync edges to its own ``sync/``. Returns a report.
+def extract_sync(config: SessionConfig, system: str, probe_index: int = 0) -> Any | None:
+    """Extract one stream's sync edges to its own ``sync/``. Returns a report.
 
     Runs CatGT where the machine has it, always runs the NumPy detector, and
     compares them -- that agreement is what lets the fallback be trusted on a
     machine without CatGT.
+
+    Each Neuropixels probe is its own stream with its own clock, so its edges go
+    to ``sync/imec<n>/``. Blackrock has one stream and ignores ``probe_index``.
     """
     _check(system)
     if not config.has_data(system):
         return None
 
     if system == "neuropixels":
-        return extract.extract_neuropixels_edges(config, probe)
+        return extract.extract_neuropixels_edges(config, probe_index)
     return extract.extract_blackrock_edges(config)
 
 
 def extract_lfp(
-    config: SessionConfig, system: str, decimate: int = 1, probe: int = 0
+    config: SessionConfig, system: str, decimate: int = 1, probe_index: int = 0
 ) -> Path | None:
     """Export one system's LFP. Returns the path written, or ``None``.
 
@@ -350,23 +376,31 @@ def extract_lfp(
     if npx.run_dir is None or not npx.run_name:
         return None
     try:
-        files = spikeglx.find_run_files(npx.run_dir, npx.run_name, npx.gate, npx.trigger, probe)
+        files = spikeglx.find_run_files(
+            npx.run_dir, npx.run_name, npx.gate, npx.trigger, probe_index
+        )
     except FileNotFoundError:
         return None
     if files["lf"] is None:
         return None
 
-    path = spikeglx.export_lfp(files["lf"], config.paths.lfp, decimate=decimate)
+    path = spikeglx.export_lfp(
+        files["lf"], config.paths.lfp_for(probe_index), decimate=decimate
+    )
     log.info("wrote %s%s", path, f" (decimated {decimate}x)" if decimate > 1 else "")
     return path
 
 
-def _load_edges(config: SessionConfig, name: str) -> np.ndarray | None:
-    """One edge file. Each system's edges sit beside its own recording."""
+def _load_edges(config: SessionConfig, name: str, probe_index: int = 0) -> np.ndarray | None:
+    """One edge file. Each stream's edges sit beside the recording they came from.
+
+    ``EDGE_SYSTEM`` says which system owns the name, so ``probe_index`` applies to
+    the Neuropixels files and is ignored for the Blackrock ones.
+    """
     system = extract.EDGE_SYSTEM[name]
     if config.paths.dir_for(system) is None:
         return None
-    path = config.paths.sync_for(system) / f"{name}.txt"
+    path = config.paths.sync_for(system, probe_index) / f"{name}.txt"
     return catgt.read_edge_file(path) if path.exists() else None
 
 
@@ -396,11 +430,16 @@ class TimeMap:
         )
 
 
-def time_remapping(config: SessionConfig, system: str = "neuropixels") -> TimeMap | None:
-    """Map ``system``'s spike times onto Blackrock time. Returns a :class:`TimeMap`.
+def time_remapping(
+    config: SessionConfig, system: str = "neuropixels", probe_index: int = 0
+) -> TimeMap | None:
+    """Map one stream's spike times onto Blackrock time. Returns a :class:`TimeMap`.
 
     Blackrock is the reference timebase, so it is not an argument -- this maps
     onto it, never the reverse.
+
+    One map per probe, in ``aligned/imec<n>/``. Each probe has its own oscillator
+    and its own SY word, so one probe's fit says nothing about another's.
 
     Coarse offset from the 14 s coded bursts first: their onsets alone are
     periodic and ambiguous, so the full pulse trains are matched on the coded
@@ -420,9 +459,9 @@ def time_remapping(config: SessionConfig, system: str = "neuropixels") -> TimeMa
     from ._sync import tprime as tprime_mod
 
     br_1hz = _load_edges(config, extract.BR_1HZ)
-    npx_1hz = _load_edges(config, extract.NPX_1HZ)
+    npx_1hz = _load_edges(config, extract.NPX_1HZ, probe_index)
     br_burst = _load_edges(config, extract.BR_BURST)
-    npx_burst = _load_edges(config, extract.NPX_BURST)
+    npx_burst = _load_edges(config, extract.NPX_BURST, probe_index)
 
     missing = [
         name
@@ -464,7 +503,7 @@ def time_remapping(config: SessionConfig, system: str = "neuropixels") -> TimeMa
         "1 Hz trains trimmed to overlap: Blackrock %d -> %d, SpikeGLX %d -> %d",
         br_1hz.size, br_trim.size, npx_1hz.size, npx_trim.size,
     )
-    aligned_dir = config.paths.aligned
+    aligned_dir = config.paths.aligned_for(probe_index)
     aligned_dir.mkdir(parents=True, exist_ok=True)
     br_trim_path = catgt.write_edge_file(aligned_dir / "blackrock_1hz_trimmed.txt", br_trim)
     npx_trim_path = catgt.write_edge_file(aligned_dir / "npx_1hz_trimmed.txt", npx_trim)
@@ -485,7 +524,7 @@ def time_remapping(config: SessionConfig, system: str = "neuropixels") -> TimeMa
     )
 
     # 4. Convert Kilosort sample indices to seconds, then map them.
-    results_dir = config.paths.sorted_for(system)
+    results_dir = config.paths.sorted_for(system, probe_index)
     spike_times_path = results_dir / "spike_times.npy"
     if not spike_times_path.exists():
         log.info("no sorting at %s; wrote the time map only", results_dir)
@@ -550,8 +589,10 @@ def _save_map(
         json.dump(payload, handle, indent=2)
 
 
-def validate_remapping(config: SessionConfig, figures: bool = True) -> Any | None:
-    """Check the map against the 14 s burst onsets. Returns a ``ValidationReport``.
+def validate_remapping(
+    config: SessionConfig, figures: bool = True, probe_index: int = 0
+) -> Any | None:
+    """Check one probe's map against the 14 s burst onsets. Returns a ``ValidationReport``.
 
     A real check precisely because the bursts were **held out** of the 1 Hz fit.
     Uncorrected clock drift of tens of ppm is 72 ms/hour at 20 ppm and fails the
@@ -566,13 +607,14 @@ def validate_remapping(config: SessionConfig, figures: bool = True) -> Any | Non
     if not config.aligns_systems:
         return None
 
-    map_path = config.paths.aligned / "time_map.json"
+    aligned_dir = config.paths.aligned_for(probe_index)
+    map_path = aligned_dir / "time_map.json"
     if not map_path.exists():
         log.warning("no time map at %s; run time_remapping first", map_path)
         return None
 
     br_burst = _load_edges(config, extract.BR_BURST)
-    npx_burst = _load_edges(config, extract.NPX_BURST)
+    npx_burst = _load_edges(config, extract.NPX_BURST, probe_index)
     if br_burst is None or npx_burst is None or not br_burst.size or not npx_burst.size:
         log.warning(
             "no 14 s burst edges on one or both systems, so the alignment cannot be "
@@ -597,7 +639,7 @@ def validate_remapping(config: SessionConfig, figures: bool = True) -> Any | Non
     )
     log.info("%s", report.summary())
 
-    with open(config.paths.aligned / "validation.json", "w", encoding="utf-8") as handle:
+    with open(aligned_dir / "validation.json", "w", encoding="utf-8") as handle:
         json.dump(
             {
                 "n_checked": report.n_checked,
@@ -614,7 +656,9 @@ def validate_remapping(config: SessionConfig, figures: bool = True) -> Any | Non
         axes = plots.plot_alignment_residuals(
             report.times_s, report.residuals_s, report.tolerance_s
         )
-        path = config.paths.figures / "alignment_residuals.png"
+        path = (
+            config.paths.figures_for("neuropixels", probe_index) / "alignment_residuals.png"
+        )
         plots.save_figure(axes.figure, path)
         log.info("wrote %s", path)
 
@@ -632,6 +676,7 @@ def export_results(
     groups: tuple[str, ...] = ("good", "mua"),
     figures: bool = True,
     max_unit_figures: int = 40,
+    probe_index: int = 0,
 ) -> dict | None:
     """Export metrics, figures and the final bundle for a sorted folder.
 
@@ -649,7 +694,7 @@ def export_results(
     if not config.has_data(system):
         return None
 
-    results_dir = config.paths.sorted_for(system)
+    results_dir = config.paths.sorted_for(system, probe_index)
     if not (results_dir / "spike_times.npy").exists():
         log.info("no sorting results in %s", results_dir)
         return None
@@ -662,7 +707,8 @@ def export_results(
         "curated" if phy.curated else "not curated in Phy", groups,
     )
 
-    aligned_path = config.paths.aligned / f"{system}_spike_seconds_blackrock.npy"
+    aligned_dir = config.paths.aligned_for(probe_index)
+    aligned_path = aligned_dir / f"{system}_spike_seconds_blackrock.npy"
     spike_times_s: dict[int, np.ndarray] | None = None
     timebase = "sorter"
     if aligned_path.exists():
@@ -678,19 +724,24 @@ def export_results(
             timebase = "blackrock"
     log.info("timebase: %s", timebase)
 
-    out_dir = config.paths.aligned if timebase == "blackrock" else results_dir / "export"
+    out_dir = aligned_dir if timebase == "blackrock" else results_dir / "export"
     paths = final.export_units(
         out_dir,
         phy,
         unit_ids=unit_ids,
         spike_times_s=spike_times_s,
         timebase=timebase,
-        provenance={"session": config.session, "system": system, "machine": config.machine.name},
+        provenance={
+            "session": config.session,
+            "system": system,
+            "stream": stream_label(system, probe_index),
+            "machine": config.machine.name,
+        },
     )
     log.info("exported %d units -> %s", unit_ids.size, out_dir)
 
     if figures and unit_ids.size:
-        figure_dir = config.paths.figures / system
+        figure_dir = config.paths.figures_for(system, probe_index)
         duration = phy.duration_s
         for unit_id in unit_ids[:max_unit_figures]:
             unit_id = int(unit_id)

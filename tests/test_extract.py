@@ -120,6 +120,47 @@ def test_extract_records_the_catgt_command_it_would_have_run(tmp_path):
     assert any("no catgt_dir" in note for note in report.notes)
 
 
+def make_run_session(tmp_path, run_dir, probes="[0, 1]"):
+    """A SessionConfig pointing at a SpikeGLX run rather than a bare binary."""
+    machines = tmp_path / "configs" / "machines"
+    machines.mkdir(parents=True, exist_ok=True)
+    (machines / "test.yaml").write_text(
+        f"output_root: '{tmp_path / 'out'}'\ncache_dir: '{tmp_path / 'c'}'\n"
+        "catgt_dir: null\ntprime_dir: null\ndevice: cpu\n",
+        encoding="utf-8",
+    )
+    session_path = tmp_path / "configs" / "run.yaml"
+    session_path.write_text(
+        "session: run\noutput_dir: '{output_root}/run'\n"
+        f"neuropixels:\n  run_dir: '{run_dir}'\n  run_name: run\n  probes: {probes}\n",
+        encoding="utf-8",
+    )
+    session = cfg.load_session_config(session_path, "test", tmp_path / "configs")
+    session.paths.mkdirs()
+    return session
+
+
+def test_each_probe_writes_its_own_edge_files(tmp_path):
+    # Two probes in one run are two clocks. Sharing one sync/ directory would
+    # leave whichever ran last, and the other probe would be aligned with it.
+    from conftest import spikeglx_run
+
+    run_dir = spikeglx_run(tmp_path / "npx", probes=(0, 1), phases={0: 0.25, 1: 0.75})
+    session = make_run_session(tmp_path, run_dir)
+
+    for probe, phase in ((0, 0.25), (1, 0.75)):
+        report = extract.extract_neuropixels_edges(session, probe)
+        written = session.paths.sync_for("neuropixels", probe) / f"{extract.NPX_1HZ}.txt"
+
+        assert report.edge_sets[extract.NPX_1HZ].path == written
+        assert written.exists()
+        times = catgt.read_edge_file(written)
+        assert times[0] == pytest.approx(phase, abs=1e-6)     # this probe's phase
+        assert np.allclose(np.diff(times), 1.0, atol=1e-6)
+
+    assert "imec1" in str(session.paths.sync_for("neuropixels", 1))
+
+
 def test_extract_sync_returns_none_for_a_system_that_never_recorded(tmp_path):
     # Each system is extracted on its own now, so "Blackrock did not record" is a
     # None from that call rather than a note buried in a combined report.

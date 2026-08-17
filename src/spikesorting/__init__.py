@@ -38,6 +38,7 @@ from .pipeline import (  # noqa: F401
     setup_probe,
     skip_reason,
     sort_with_kilosort,
+    stream_label,
     time_remapping,
     validate_remapping,
 )
@@ -60,4 +61,5 @@ __all__ = [
     "MachineProfile",
     "OutputPaths",
     "load_machine",
+    "stream_label",
 ]

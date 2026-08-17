@@ -1,5 +1,10 @@
-# Template for a real recording session. Copy to configs/<session>.yaml and edit.
-# Copies are gitignored; this template is tracked.
+# Template for a session with TWO Neuropixels probes in one run, plus Blackrock.
+# Copy to configs/<session>.yaml and edit. Copies are gitignored; this is tracked.
+#
+# It is session_template.yaml with one line changed -- `probes: [0, 1]` instead of
+# `[0]`. Everything else is deliberately identical, and a test pins that: the two
+# resolve to the same session apart from the probe list, so a value tuned in one
+# and not the other fails rather than drifting.
 #
 #   python run_sorting_pipeline.py --config configs/Athos_2026_08_13.yaml \
 #          --machine windows_rig
@@ -47,7 +52,7 @@ neuropixels:
   # ---------- edit for this session ----------
   run_dir: "{neuropixels_dir}"      # SpikeGLX run: <run_dir>/<run_name>_g<gate>/
   run_name: "Athos_2026_08_13"
-  probes: [0]            # one entry per probe in the run -- see "Two probes"
+  probes: [0, 1]         # both probes of the run -- see "Two probes"
   kilosort:
     bad_channels: []     # same key, same meaning as the blackrock one
     nblocks: 1           # rigid drift correction -- see "Drift correction"

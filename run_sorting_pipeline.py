@@ -31,7 +31,7 @@ from pathlib import Path
 # The shared CLI helpers live in tools/; _cli adds src/ itself.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 
-from _cli import Runner, build_parser, load  # noqa: E402
+from _cli import Runner, build_parser, load, run_probes  # noqa: E402
 
 import spikesorting as ss  # noqa: E402
 
@@ -72,27 +72,60 @@ def main() -> int:
 
     # The pipeline, in order. Each verb returns what the next one takes, and
     # returns None when the session config says not to do that work.
+    #
+    # The inner loop is the probes of a SpikeGLX run: two probes are two streams
+    # with two clocks, sorted and aligned separately. Blackrock yields one, so its
+    # stages run once however many probes the Neuropixels run holds.
     for system in ss.SYSTEMS:
-        if "extract_sync" in args.steps:
-            run(ss.extract_sync, config, system, system=system)
+        for probe_index in run_probes(config, system, args.probe):
+            # probe_index is passed to the verb; system= and probe= only name the
+            # status line the Runner prints.
+            where = dict(system=system, probe=probe_index)
 
-        if "lfp" in args.steps:
-            run(ss.extract_lfp, config, system, args.lfp_decimate, system=system)
+            if "extract_sync" in args.steps:
+                run(ss.extract_sync, config, system, probe_index=probe_index, **where)
 
-        if "sort" in args.steps:
-            probe = run(ss.setup_probe, config, system, system=system)
-            if run.last_failed:
-                continue  # no map, so loading would fail the same way
-            rec = run(ss.load_spike_continuous, config, system, probe, system=system)
-            run(ss.sort_with_kilosort, rec, config, system, system=system)
+            if "lfp" in args.steps:
+                run(
+                    ss.extract_lfp,
+                    config,
+                    system,
+                    args.lfp_decimate,
+                    probe_index=probe_index,
+                    **where,
+                )
+
+            if "sort" in args.steps:
+                probe = run(ss.setup_probe, config, system, probe_index=probe_index, **where)
+                if run.last_failed:
+                    continue  # no map, so loading would fail the same way
+                rec = run(
+                    ss.load_spike_continuous,
+                    config,
+                    system,
+                    probe,
+                    probe_index=probe_index,
+                    **where,
+                )
+                run(
+                    ss.sort_with_kilosort,
+                    rec,
+                    config,
+                    system,
+                    probe_index=probe_index,
+                    **where,
+                )
 
     code = run.finish("sorting pipeline")
     if code == 0:
         print("\nNext, by hand:")
         print("    conda activate phy")
         for system in ss.SYSTEMS:
-            if getattr(config, f"sorts_{system}"):
-                print(f"    phy template-gui {config.paths.sorted_for(system)}/params.py")
+            if not getattr(config, f"sorts_{system}"):
+                continue
+            for probe_index in run_probes(config, system, args.probe):
+                sorted_dir = config.paths.sorted_for(system, probe_index)
+                print(f"    phy template-gui {sorted_dir}/params.py")
         print("then:")
         print(f"    python run_exporting_pipeline.py --config {args.config}")
     return code

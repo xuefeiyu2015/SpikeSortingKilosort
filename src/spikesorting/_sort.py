@@ -19,7 +19,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from ._config import SessionConfig
+from ._config import SessionConfig, stream_label
 
 __all__ = ["SortResult", "sort_recording", "summarize_results"]
 
@@ -103,6 +103,7 @@ def sort_recording(
     system: str,
     recording: Any,
     results_dir: Path | None = None,
+    probe_index: int = 0,
 ) -> SortResult:
     """Sort an already-loaded recording. One path, both systems.
 
@@ -119,7 +120,10 @@ def sort_recording(
     """
     import spikeinterface.sorters as ss
 
-    final_dir = Path(results_dir) if results_dir else config.paths.sorted_for(system)
+    stream = stream_label(system, probe_index)
+    final_dir = (
+        Path(results_dir) if results_dir else config.paths.sorted_for(system, probe_index)
+    )
 
     name = config.sorter  # SORTER_NAME; the directory and the sorter agree by construction
     params = {"device": config.machine.device}
@@ -137,7 +141,7 @@ def sort_recording(
     sorting, work_dir = _run_in_cache(
         final_dir,
         config.cache_dir,
-        f"{config.session}_{name}_{system}",
+        f"{config.session}_{name}_{stream}",
         body,
         publish_from=f"{name}/sorter_output",
     )
@@ -151,12 +155,16 @@ def sort_recording(
         work_dir=work_dir,
         probe={"n_contacts": int(probe.get_contact_count())} if probe is not None else {},
     )
-    _write_run_info(final_dir, config, result, system=system)
+    _write_run_info(final_dir, config, result, system=system, probe_index=probe_index)
     return result
 
 
 def _write_run_info(
-    final_dir: Path, config: SessionConfig, result: SortResult, system: str
+    final_dir: Path,
+    config: SessionConfig,
+    result: SortResult,
+    system: str,
+    probe_index: int = 0,
 ) -> None:
     """Record what produced this sorting, beside the sorting itself."""
     payload = {
@@ -164,6 +172,10 @@ def _write_run_info(
         "machine": config.machine.name,
         "device": config.machine.device,
         "system": system,
+        # Which stream, not just which system: a run can hold several probes, and
+        # `probe` below is the geometry, not the index.
+        "stream": stream_label(system, probe_index),
+        "probe_index": probe_index,
         "n_units": result.n_units,
         "n_spikes": result.n_spikes,
         "fs": result.fs,
