@@ -11,6 +11,7 @@ carries the SMA1 1 Hz square wave used for fine alignment.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -22,7 +23,10 @@ __all__ = [
     "read_meta",
     "meta_path_for",
     "stream_info",
+    "ReadProbe",
+    "probe_read",
     "memmap_stream",
+    "DEFAULT_CHUNK_BYTES",
     "read_channel",
     "iter_channel",
     "read_sy_word",
@@ -173,6 +177,98 @@ def stream_info(
     )
 
 
+@dataclass(frozen=True)
+class ReadProbe:
+    """How fast this file actually reads, measured on a small piece of it.
+
+    Pure once constructed: the arithmetic below is testable without pretending to
+    know a disk speed, and nothing here prints.
+    """
+
+    path: Path
+    #: Size of the whole file.
+    total_bytes: int
+    #: How much of it was read to time the probe.
+    sample_bytes: int
+    #: Time for that read alone -- the throughput measurement.
+    seconds: float
+    #: Time to stat and open, which on a share is latency rather than throughput
+    #: and would otherwise be invisible in the rate.
+    latency_s: float = 0.0
+
+    @property
+    def bytes_per_s(self) -> float:
+        return self.sample_bytes / max(self.seconds, 1e-6)
+
+    def estimated_seconds(self, n_bytes: int | None = None) -> float:
+        """How long reading ``n_bytes`` (default: the whole file) should take."""
+        want = self.total_bytes if n_bytes is None else n_bytes
+        return want / self.bytes_per_s
+
+    def summary(self) -> str:
+        estimate = self.estimated_seconds()
+        span = f"{estimate:.0f} s" if estimate < 120 else f"{estimate / 60:.1f} min"
+        latency = f", open took {self.latency_s:.1f} s" if self.latency_s > 0.5 else ""
+        return (
+            f"{self.total_bytes / 1e9:.2f} GB at "
+            f"{self.bytes_per_s / 1e6:.0f} MB/s -- about {span}{latency}"
+        )
+
+
+def probe_read(
+    path: str | Path, sample_bytes: int = 4 << 20, time_budget_s: float = 2.0
+) -> ReadProbe:
+    """Time a small read of ``path``, to say up front what the whole one costs.
+
+    Reading one channel of an AP binary pulls the entire file, which on a network
+    share can be many minutes with nothing to show for it. This is the cheap check
+    that happens first: ``stat`` fails immediately and by name when the share is
+    not mounted, and the timed sample turns "it is still going" into an estimate
+    made in a second.
+
+    The sample comes from the **end** of the file, which checks reachability of
+    the part a truncated or half-synced copy would be missing, and avoids timing
+    a head that something else has already pulled into the page cache. Even so the
+    estimate is a hint: a warm cache makes it optimistic, and it assumes the rest
+    of the file reads like this piece.
+
+    The sample is read in small blocks and stops at ``time_budget_s``, so the
+    check stays cheap on exactly the share it exists to warn about: a slow one
+    answers in about two seconds rather than taking a minute to measure how slow
+    it is.
+    """
+    path = Path(path)
+    opened = time.perf_counter()
+    total = path.stat().st_size          # unmounted share fails here, not in the loop
+    want = max(1, min(int(sample_bytes), total))
+    handle = open(path, "rb")
+    latency = time.perf_counter() - opened
+
+    block = 1 << 18
+    read = 0
+    start = time.perf_counter()
+    try:
+        handle.seek(max(0, total - want))
+        while read < want:
+            piece = handle.read(min(block, want - read))
+            if not piece:
+                break
+            read += len(piece)
+            if time.perf_counter() - start >= time_budget_s:
+                break
+    finally:
+        handle.close()
+    seconds = time.perf_counter() - start
+
+    return ReadProbe(
+        path=path,
+        total_bytes=total,
+        sample_bytes=read,
+        seconds=seconds,
+        latency_s=latency,
+    )
+
+
 def memmap_stream(info: StreamInfo) -> np.memmap:
     """Read-only ``(n_samples, n_chan)`` int16 view of the binary."""
     return np.memmap(info.path, dtype=np.int16, mode="r", shape=(info.n_samples, info.n_chan))
@@ -186,29 +282,73 @@ def _resolve_channel(info: StreamInfo, channel: int) -> int:
     return index
 
 
+#: Bytes of *file* pulled per read. Sized for the network share, not for the
+#: channel: one row is n_chan samples, so reading any single channel costs the
+#: whole file whatever we do, and the only choice is how it is fetched.
+DEFAULT_CHUNK_BYTES = 64 << 20
+
+
 def read_channel(
     info: StreamInfo, channel: int, start: int = 0, stop: int | None = None
 ) -> np.ndarray:
-    """Raw int16 samples of one channel. ``channel=-1`` is the last (SY) word."""
+    """Raw int16 samples of one channel. ``channel=-1`` is the last (SY) word.
+
+    Reads sequentially rather than slicing a memmap. The bytes transferred are the
+    same -- the channels are interleaved, so one column costs every row -- but a
+    memmap column slice fetches them as scattered page faults, which over SMB is
+    minutes for a file a sequential pass reads in seconds. It also fails
+    differently: a page fault on a dropped share raises SIGBUS and kills the
+    process, where a failed ``read`` is an ``OSError`` a caller can catch.
+    """
     index = _resolve_channel(info, channel)
     stop = info.n_samples if stop is None else min(stop, info.n_samples)
-    data = memmap_stream(info)
-    return np.ascontiguousarray(data[start:stop, index])
+    if stop <= start:
+        return np.empty(0, dtype=np.int16)
+
+    row_bytes = info.n_chan * 2
+    with open(info.path, "rb") as handle:
+        handle.seek(start * row_bytes)
+        raw = handle.read((stop - start) * row_bytes)
+    return _column(raw, info.n_chan, index)
+
+
+def _column(raw: bytes, n_chan: int, index: int) -> np.ndarray:
+    """One channel out of a block of interleaved rows. Pure."""
+    rows = len(raw) // (n_chan * 2)
+    block = np.frombuffer(raw, dtype=np.int16, count=rows * n_chan)
+    return np.ascontiguousarray(block.reshape(rows, n_chan)[:, index])
 
 
 def iter_channel(
-    info: StreamInfo, channel: int, chunk_samples: int = 30_000_000
+    info: StreamInfo, channel: int, chunk_bytes: int = DEFAULT_CHUNK_BYTES
 ) -> Iterator[tuple[int, np.ndarray]]:
-    """Stream one channel in chunks, yielding ``(start_sample, samples)``.
+    """Stream one channel, yielding ``(start_sample, samples)``.
 
-    Keeps memory bounded on hour-long recordings. The default chunk is ~1000 s of
-    a 30 kHz channel (60 MB as int16).
+    ``chunk_bytes`` is measured in bytes *of the file*, which is what governs both
+    the time each step takes and how often the loop comes back up into Python --
+    so a long read reports progress and answers Ctrl-C between chunks. Sized in
+    samples of the channel instead, the default used to be one 23 GB step for a
+    385-channel stream: no progress, and uninterruptible.
     """
-    if chunk_samples <= 0:
-        raise ValueError("chunk_samples must be positive")
-    for start in range(0, info.n_samples, chunk_samples):
-        stop = min(start + chunk_samples, info.n_samples)
-        yield start, read_channel(info, channel, start, stop)
+    if chunk_bytes <= 0:
+        raise ValueError("chunk_bytes must be positive")
+
+    index = _resolve_channel(info, channel)
+    row_bytes = info.n_chan * 2
+    rows = max(1, chunk_bytes // row_bytes)
+
+    # One open for the whole pass, and no seeks: on a share an open costs
+    # latency of its own -- seconds, on a bad one -- and reopening per chunk
+    # pays it once per chunk for nothing.
+    with open(info.path, "rb") as handle:
+        start = 0
+        while start < info.n_samples:
+            raw = handle.read(min(rows, info.n_samples - start) * row_bytes)
+            got = len(raw) // row_bytes
+            if got == 0:
+                break
+            yield start, _column(raw, info.n_chan, index)
+            start += got
 
 
 def read_sy_word(info: StreamInfo, start: int = 0, stop: int | None = None) -> np.ndarray:

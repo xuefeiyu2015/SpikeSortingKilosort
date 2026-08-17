@@ -22,6 +22,7 @@ fallback be trusted on machines without CatGT.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
@@ -31,6 +32,8 @@ import numpy as np
 from .._config import SessionConfig
 from .._io import spikeglx
 from . import catgt, edges
+
+log = logging.getLogger("spikesorting")
 
 __all__ = [
     "EdgeSet",
@@ -112,11 +115,41 @@ class ExtractionReport:
 
 
 def _sy_bit_chunks(
-    info: spikeglx.StreamInfo, bit: int, chunk_samples: int
+    info: spikeglx.StreamInfo, bit: int, chunk_bytes: int
 ) -> Iterator[tuple[int, np.ndarray]]:
-    """Yield ``(start, bit_values)`` for the SY word, chunk by chunk."""
-    for start, block in spikeglx.iter_channel(info, info.sy_index, chunk_samples):
+    """Yield ``(start, bit_values)`` for the SY word, chunk by chunk.
+
+    Logs progress as it goes: the caller is reading the whole binary to get one
+    channel, which on a share is minutes, and a silent loop is indistinguishable
+    from a hang.
+    """
+    total = info.n_samples
+    for start, block in spikeglx.iter_channel(info, info.sy_index, chunk_bytes):
+        if total:
+            log.info("  read %5.1f%% of %s", 100.0 * (start + block.size) / total, info.path.name)
         yield start, edges.digital_bit_signal(block.view(np.uint16), bit)
+
+
+def _announce_read(info: spikeglx.StreamInfo, report: ExtractionReport) -> None:
+    """Say what this read is going to cost, before it starts costing it.
+
+    One channel of an interleaved binary costs the whole file: 385x the bytes you
+    want. Over a share that is minutes, so the size, the amplification and a
+    measured speed go out first -- and an unmounted share fails here, by name,
+    rather than stalling inside the loop.
+    """
+    probe = spikeglx.probe_read(info.path)
+    wanted = info.n_samples * 2
+    log.info(
+        "reading %s to extract 1 of %d channels (%.0fx the bytes wanted): %s",
+        info.path.name, info.n_chan, probe.total_bytes / max(wanted, 1), probe.summary(),
+    )
+    if probe.estimated_seconds() > 60:
+        report.note(
+            f"{info.path.name}: {probe.summary()}. That is the whole file crossing "
+            "the network to read one channel -- run extraction beside the data, or "
+            "stage the binary to the local cache first."
+        )
 
 
 def _resolve_ap_stream(config: SessionConfig, probe: int) -> spikeglx.StreamInfo | None:
@@ -215,7 +248,7 @@ def _run_catgt_extraction(
 def extract_neuropixels_edges(
     config: SessionConfig,
     probe: int = 0,
-    chunk_samples: int = 30_000_000,
+    chunk_bytes: int = spikeglx.DEFAULT_CHUNK_BYTES,
 ) -> ExtractionReport:
     """Extract the SpikeGLX sync trains (pipeline step 2).
 
@@ -235,8 +268,9 @@ def extract_neuropixels_edges(
         report.note(f"Neuropixels 1 Hz extraction skipped: {ap_info.path.name} has no SY word.")
     else:
         npx = config.neuropixels
+        _announce_read(ap_info, report)
         times = edges.stream_pulse_times(
-            _sy_bit_chunks(ap_info, npx.sync_bit, chunk_samples),
+            _sy_bit_chunks(ap_info, npx.sync_bit, chunk_bytes),
             threshold=0.5,
             fs=ap_info.fs,
             duration_ms=npx.sync_pulse_ms,

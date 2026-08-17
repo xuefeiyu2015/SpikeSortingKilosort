@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -111,14 +112,80 @@ def test_sy_word_bit_6_recovers_the_square_wave(tmp_path):
 def test_iter_channel_covers_every_sample(tmp_path):
     info = spikeglx.stream_info(write_stream(tmp_path, n_samples=6000))
     whole = spikeglx.read_channel(info, 0)
-    pieces = [block for _, block in spikeglx.iter_channel(info, 0, chunk_samples=777)]
+    pieces = [block for _, block in spikeglx.iter_channel(info, 0, chunk_bytes=777)]
     assert np.array_equal(np.concatenate(pieces), whole)
 
 
 def test_iter_channel_rejects_zero_chunk(tmp_path):
     info = spikeglx.stream_info(write_stream(tmp_path))
     with pytest.raises(ValueError):
-        list(spikeglx.iter_channel(info, 0, chunk_samples=0))
+        list(spikeglx.iter_channel(info, 0, chunk_bytes=0))
+
+
+def test_reads_stream_the_file_rather_than_paging_a_memmap(tmp_path):
+    # The SY word is interleaved with 384 neural channels, so reading it pulls
+    # every byte of the file whatever we do. Doing that through a memmap column
+    # slice makes it scattered 4 KB page faults, which over SMB is minutes for a
+    # 1 GB file -- and uninterruptible, since one slice is a single C call.
+    info = spikeglx.stream_info(write_stream(tmp_path, n_samples=6000))
+
+    for channel in (0, info.n_chan - 1):
+        expected = np.ascontiguousarray(spikeglx.memmap_stream(info)[:, channel])
+        assert np.array_equal(spikeglx.read_channel(info, channel), expected)
+        # ...and in pieces, at a chunk size that does not divide the file evenly.
+        pieces = [block for _, block in spikeglx.iter_channel(info, channel, chunk_bytes=4321)]
+        assert np.array_equal(np.concatenate(pieces), expected)
+
+
+def test_iter_channel_yields_the_start_sample_of_each_block(tmp_path):
+    info = spikeglx.stream_info(write_stream(tmp_path, n_samples=6000))
+
+    starts, sizes = zip(*[(s, b.size) for s, b in spikeglx.iter_channel(info, 0, chunk_bytes=8192)])
+
+    assert starts[0] == 0
+    assert list(starts[1:]) == list(np.cumsum(sizes)[:-1])
+    assert sum(sizes) == info.n_samples
+
+
+def test_a_probe_reports_the_read_speed_before_the_whole_file_is_touched(tmp_path):
+    # The point: know in a second what an 8-minute read is going to cost, instead
+    # of finding out eight minutes in.
+    path = write_stream(tmp_path, n_samples=6000)
+    probe = spikeglx.probe_read(path, sample_bytes=4096)
+
+    assert probe.sample_bytes == 4096
+    assert probe.total_bytes == path.stat().st_size
+    assert probe.bytes_per_s > 0
+    assert probe.estimated_seconds() > 0
+    assert "MB/s" in probe.summary()
+
+
+def test_the_probe_stops_at_its_time_budget(tmp_path):
+    # The check has to stay cheap on the slow share it exists to warn about: it
+    # reports how slow things are, it does not wait to measure it precisely.
+    path = write_stream(tmp_path, n_samples=6000)
+    probe = spikeglx.probe_read(path, sample_bytes=1 << 30, time_budget_s=0.0)
+
+    assert 0 < probe.sample_bytes <= path.stat().st_size
+    assert probe.bytes_per_s > 0
+
+
+def test_an_unreachable_file_fails_at_the_probe_not_hours_later(tmp_path):
+    # An unmounted share is the case this exists for: stat first, so the failure
+    # is immediate and named rather than a stall inside the read loop.
+    with pytest.raises(OSError):
+        spikeglx.probe_read(tmp_path / "not_mounted" / "run_g0_t0.imec0.ap.bin")
+
+
+def test_the_estimate_scales_the_sample_to_the_whole_file():
+    # Pure arithmetic, so it is checkable without pretending to know a disk speed.
+    probe = spikeglx.ReadProbe(
+        path=Path("x.bin"), total_bytes=1_000_000_000, sample_bytes=1_000_000, seconds=0.5
+    )
+
+    assert probe.bytes_per_s == pytest.approx(2e6)
+    assert probe.estimated_seconds() == pytest.approx(500.0)
+    assert probe.estimated_seconds(2_000_000) == pytest.approx(1.0)
 
 
 def test_raw_to_volts_uses_the_meta_scaling(tmp_path):
