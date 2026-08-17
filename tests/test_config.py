@@ -706,6 +706,21 @@ def test_a_system_can_carry_settings_of_its_own(tmp_path):
     assert session.kilosort_for("neuropixels") == {}
 
 
+def test_a_system_replaces_a_shared_list_rather_than_extending_it(tmp_path):
+    # The merge is one level deep, which session_template.yaml now states: a
+    # per-system bad_channels is the whole list for that system, not an addition
+    # to the shared one. Deep-merging would make [7] read as [7, 191, 192] and
+    # quietly keep sorting channels the session said to drop.
+    session = _flags(
+        tmp_path,
+        "kilosort:\n  bad_channels: [191, 192]\n"
+        "blackrock:\n  sync_file: '/b/y.ns5'\n  kilosort:\n    bad_channels: [7]\n",
+    )
+
+    assert session.kilosort_for("blackrock")["bad_channels"] == [7]
+    assert session.kilosort_for("neuropixels")["bad_channels"] == [191, 192]
+
+
 def test_no_kilosort_block_means_kilosorts_own_defaults(tmp_path):
     session = _flags(tmp_path, "")
 

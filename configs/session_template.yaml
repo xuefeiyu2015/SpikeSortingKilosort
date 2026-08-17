@@ -131,7 +131,9 @@ burst_interval_s: 14.0
 alignment_tolerance_s: 0.001
 
 # Passed straight to Kilosort. A system's own `kilosort:` block above is merged
-# over this one, key by key. Empty means Kilosort's defaults.
+# over this one, key by key -- any Kilosort setting can be given per system, not
+# just the two below. A per-system value *replaces* the shared one, so a list is
+# overridden rather than extended. Empty means Kilosort's defaults.
 #
 # There is no preprocessing outside Kilosort, because Kilosort already does it on
 # every batch: it subtracts the median across channels when do_CAR is set, then
@@ -142,17 +144,17 @@ alignment_tolerance_s: 0.001
 #                                        (the name says average; the code takes a
 #                                        median, which is what a Utah array wants)
 #   highpass_cutoff              300     Hz
-#   nblocks                      1       drift correction blocks; 0 disables
 #   whitening_range              32      channels used for local whitening
 #   artifact_threshold           inf     zero out any batch exceeding this
-#   bad_channels                 null    channels to exclude. Kilosort removes what
-#                                        you list; it does not detect them, so look
-#                                        at the data and name them per array
 #   skip_kilosort_preprocessing  false   only if you filtered the data yourself
+#   nblocks                      1       drift correction blocks; 0 disables
+#                                        -> set per system: 1 for the probe, 0 for
+#                                           the array
+#   bad_channels                 null    channels to exclude. Kilosort removes what
+#                                        you list; it does not detect them
+#                                        -> set per system: a channel number is a
+#                                           row in *that* system's binary
 #
-# Every other Kilosort parameter passes through unchanged.
-#
-# Settings that describe *how you want sorting done* belong here; settings that
-# describe *the hardware* -- bad_channels, nblocks -- belong in the per-system
-# blocks above, because the probe and the array need different answers.
+# Every other Kilosort parameter passes through unchanged. A key this file does
+# not name fails at sort time with the full list of valid ones, so a typo is loud.
 kilosort: {}
