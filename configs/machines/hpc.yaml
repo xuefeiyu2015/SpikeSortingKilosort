@@ -1,0 +1,33 @@
+# HPC / Linux batch node. Runs pipeline steps 1-5 headless.
+#
+# System facts only: scratch disk, installed tools, device. Where recordings
+# live is a property of the recording, so it belongs in the session config --
+# do not re-add data_root / output_root here.
+#
+# catgt_dir and tprime_dir are intentionally null: the sorting path must never
+# depend on them. Sync extraction falls back to the pure-NumPy detectors in
+# spikesorting.sync.edges, which write byte-identical edge files.
+#
+# CatGT does ship a Linux runit.sh -- if it is installed here, set catgt_dir and
+# the wrapper will be used instead of the fallback.
+
+# Node-local scratch, not the shared filesystem.
+cache_dir: "/tmp/kilosort_cache"
+
+catgt_dir: null
+tprime_dir: null
+
+# conda_envs_dir is unset: a batch job here usually runs <prefix>/bin/python
+# directly, and check_env.py recognises the env it is running in without help.
+#
+# Uncomment if the environments are not called kilosort4 / phy, or live somewhere
+# conda does not list. `path` is the directory holding the env, so the prefix is
+# path/name -- useful here, where a module-loaded env often sits outside any
+# registered envs dir:
+# conda_envs:
+#   sorting:
+#     name: kilosort4
+#     path: "/shared/apps/envs"     # -> /shared/apps/envs/kilosort4
+#   curation: phy
+
+device: "cuda"
