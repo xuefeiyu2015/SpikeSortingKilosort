@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import numpy as np
 import pytest
 from conftest import square_wave
 
-from spikesorting._io import spikeglx
+from spikesorting._io import reachable, spikeglx
 from spikesorting._sync import edges
 
 GEOM_MAP = "(NP1000,1,0,70)(0:27:0:1)(0:59:0:1)(0:27:20:1)(0:59:20:0)"
@@ -175,6 +176,63 @@ def test_an_unreachable_file_fails_at_the_probe_not_hours_later(tmp_path):
     # is immediate and named rather than a stall inside the read loop.
     with pytest.raises(OSError):
         spikeglx.probe_read(tmp_path / "not_mounted" / "run_g0_t0.imec0.ap.bin")
+
+
+def test_check_reachable_answers_like_a_direct_probe(tmp_path):
+    path = write_stream(tmp_path, n_samples=6000)
+
+    probe = reachable.check_reachable(path, sample_bytes=4096)
+
+    assert probe.total_bytes == path.stat().st_size
+    assert probe.sample_bytes == 4096
+
+
+def test_check_reachable_gives_up_rather_than_waiting_out_a_stalled_mount(tmp_path, monkeypatch):
+    # The case a bare probe cannot bound: a stat on a hung share blocks in the
+    # kernel, so the check has to abandon it rather than wait for it.
+    monkeypatch.setattr(reachable, "probe_read", lambda *a, **k: time.sleep(30))
+
+    started = time.perf_counter()
+    with pytest.raises(TimeoutError) as excinfo:
+        reachable.check_reachable(tmp_path / "share" / "run.ap.bin", timeout_s=0.2)
+    waited = time.perf_counter() - started
+
+    assert waited < 5.0, "waited for the stall instead of the deadline"
+    assert "run.ap.bin" in str(excinfo.value)
+
+
+def test_the_stall_error_is_an_oserror(tmp_path, monkeypatch):
+    # The notebooks catch OSError around these verbs. If this stops being one,
+    # they go back to showing a traceback instead of "recording not reachable".
+    monkeypatch.setattr(reachable, "probe_read", lambda *a, **k: time.sleep(30))
+
+    with pytest.raises(OSError):
+        reachable.check_reachable(tmp_path / "x.bin", timeout_s=0.1)
+
+
+def test_a_directory_is_probed_by_looking_inside_it(tmp_path):
+    # A SpikeGLX run is named by its directory, and find_run_files globs before
+    # anything has a filename to check -- so the mount has to be answerable from
+    # the directory alone, which cannot be probed by reading bytes from it.
+    write_stream(tmp_path, n_samples=600)
+
+    probe = reachable.check_reachable(tmp_path)
+
+    assert probe.total_bytes == 0          # nothing to read, so nothing to estimate
+    assert "answered" in probe.summary()
+
+
+def test_a_real_failure_is_raised_as_itself_not_as_a_timeout(tmp_path):
+    # An absent file answers immediately; saying "did not respond" would be a lie.
+    with pytest.raises(FileNotFoundError):
+        reachable.check_reachable(tmp_path / "nope.bin", timeout_s=5.0)
+
+
+def test_the_probe_is_still_reachable_through_spikeglx(tmp_path):
+    # It moved to _io/reachable.py; spikeglx re-exports it, and this pins that so
+    # the re-export is not dropped as dead code later.
+    assert spikeglx.probe_read is reachable.probe_read
+    assert spikeglx.ReadProbe is reachable.ReadProbe
 
 
 def test_the_estimate_scales_the_sample_to_the_whole_file():

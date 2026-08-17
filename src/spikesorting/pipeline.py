@@ -55,6 +55,7 @@ from ._config import (  # noqa: F401  (re-exported: the config verb and its type
     load_session_config,
     stream_label,
 )
+from ._io import reachable
 from ._sync import align, burst, catgt, extract
 
 log = logging.getLogger("spikesorting")
@@ -265,12 +266,21 @@ def load_spike_continuous(
     run, for trying a map before committing it to the session file;
     ``probe_index`` selects which probe of a SpikeGLX run to read, and the map
     comes from that same probe.
+
+    Loading reads no samples -- it is a ``stat`` and an ``open``, and the sorter
+    is what streams the file. Those two calls are also what hangs when a share
+    stops answering, so the recording's path is checked first, with a deadline;
+    see :func:`spikesorting._io.reachable.check_reachable`.
     """
     _check(system)
     if not config.has_data(system):
         return None
 
-    import spikeinterface.full as si
+    _check_input_reachable(config, system)
+
+    # core, not full: this needs read_binary and nothing else, and `full` pulls in
+    # the widgets, exporters and sorters behind it.
+    from spikeinterface.core import read_binary
 
     from ._probes.common import to_probeinterface
 
@@ -283,7 +293,7 @@ def load_spike_continuous(
         recording = blackrock.read_recording(spec.spike_file, stream_id=spec.stream_id)
     else:
         info = _neuropixels_stream(config, probe_index)
-        recording = si.read_binary(
+        recording = read_binary(
             file_paths=[str(info.path)],
             sampling_frequency=float(info.fs),
             num_channels=int(info.n_chan),
@@ -292,6 +302,36 @@ def load_spike_continuous(
 
     probe = probe if probe is not None else setup_probe(config, system, probe_index)
     return recording.set_probe(to_probeinterface(probe))
+
+
+def _input_path(config: SessionConfig, system: str) -> Path | None:
+    """The path the session *names* for this system's spike data.
+
+    Named, not resolved: for a SpikeGLX run that is the run directory, because
+    finding the binaries inside it means globbing, and globbing a share that has
+    stopped answering blocks exactly like the read does.
+    """
+    if system == "blackrock":
+        return config.blackrock.spike_file
+    npx = config.neuropixels
+    return npx.bin_file if npx.bin_file is not None else npx.run_dir
+
+
+def _check_input_reachable(config: SessionConfig, system: str) -> None:
+    """Fail fast, and loudly, when the recording's filesystem is not answering."""
+    path = _input_path(config, system)
+    if path is None:
+        return                             # nothing named; the caller reports that
+
+    probe = reachable.check_reachable(path)
+    log.info("%s: %s", path, probe.summary())
+    if probe.total_bytes and probe.estimated_seconds() > 60:
+        log.warning(
+            "%s reads at %.0f MB/s -- sorting streams the whole file, so expect "
+            "about %.0f min of I/O. Sort beside the data, or stage it to the "
+            "machine's cache_dir first.",
+            path.name, probe.bytes_per_s / 1e6, probe.estimated_seconds() / 60,
+        )
 
 
 # ----------------------------------------------------------------------------

@@ -138,7 +138,7 @@ def _announce_read(info: spikeglx.StreamInfo, report: ExtractionReport) -> None:
     measured speed go out first -- and an unmounted share fails here, by name,
     rather than stalling inside the loop.
     """
-    probe = spikeglx.probe_read(info.path)
+    probe = spikeglx.check_reachable(info.path)
     wanted = info.n_samples * 2
     log.info(
         "reading %s to extract 1 of %d channels (%.0fx the bytes wanted): %s",

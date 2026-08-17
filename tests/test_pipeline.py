@@ -217,6 +217,29 @@ def test_each_probe_gets_the_geometry_from_its_own_meta(tmp_path):
     assert ss.setup_probe(session, "neuropixels", probe_index=1)["n_chan"] == 6
 
 
+def test_loading_checks_the_recording_answers_before_importing_a_sorter(tmp_path, monkeypatch):
+    # Loading is three metadata calls and no data, so on a share that has stopped
+    # answering it hangs in stat() with nothing printed. The check goes first --
+    # and before the several-second SpikeInterface import, which is wasted work if
+    # the file is not there.
+    import sys
+
+    from spikesorting._io import reachable
+
+    session = _session(tmp_path, "neuropixels:\n  bin_file: '/mnt/gone/x.bin'\n")
+
+    def stalled(path, *args, **kwargs):
+        raise TimeoutError(f"{path} did not respond within 10 s")
+
+    monkeypatch.setattr(reachable, "check_reachable", stalled)
+    heavy = set(sys.modules)
+
+    with pytest.raises(OSError, match="did not respond"):
+        ss.load_spike_continuous(session, "neuropixels")
+
+    assert "spikeinterface" not in set(sys.modules) - heavy
+
+
 def test_a_utah_probe_file_is_used_when_no_cmp_is_named(tmp_path):
     probe = _probe_json(tmp_path / "probes" / "utah_A.json")
     session = _session(tmp_path, f"blackrock:\n  sync_file: '/b/y.ns5'\n  probe_file: '{probe}'\n")
