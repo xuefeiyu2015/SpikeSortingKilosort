@@ -1,10 +1,11 @@
 # Demo session -- an ordinary session config that happens to point at the
 # official Kilosort4 example recording.
 #
-# Nothing about it is special-cased in the code. It has the same keys as
-# session_template.yaml and differs only in where the data is and in three
-# settings a bare .bin needs (bin_file, n_chan_bin, sample_rate) where a real
-# SpikeGLX run has run_dir/run_name and reads the rest from its .meta.
+# Nothing about it is special-cased in the code. It has the same keys, and the
+# same edit/defaults fences, as session_template.yaml, and differs only in where
+# the data is and in three settings a bare .bin needs (bin_file, n_chan_bin,
+# sample_rate) where a real SpikeGLX run has run_dir/run_name and reads the rest
+# from its .meta.
 #
 # There is no `blackrock:` block, and that is the whole statement: no Blackrock
 # data, so no Blackrock stage runs and there is nothing to align against.
@@ -16,30 +17,31 @@
 monkey: "Monkey neuropixel_demo"
 session: "demo"
 
-# Roots stop at the share; each system's directory is built as
-# <root>/<monkey>/<session> and exposed as {blackrock_dir} / {neuropixels_dir}.
+# Roots stop at the share; each system's directory is <root>/<monkey>/<session>.
 roots:
   neuropixels: "/Volumes/server"
 
 neuropixels:
-  # The one place this differs from a real session. The download is a bare .bin:
-  # no .meta beside it and no SpikeGLX run folder, so there is no run_dir/run_name
-  # and the channel count and rate have to be stated.
+  # ---------- edit for this session ----------
+  # The download is a bare .bin: no .meta beside it and no SpikeGLX run folder,
+  # so there is no run_dir/run_name and the channel count and rate are stated.
   bin_file: "{neuropixels_dir}/ZFM-02370_mini.imec0.ap.short.bin"
-  n_chan_bin: 385          # 384 AP channels + the SY word
+  n_chan_bin: 385        # 384 AP channels + the SY word
   sample_rate: 30000
   # With no .meta there is no geometry to derive, so the map is named here. Built
   # once by notebooks/setup_demo_data.ipynb; a real run leaves this null and lets
   # setup_probe read ~snsGeomMap from the .meta instead.
   probe_file: "configs/probes/np1_default.json"
-  # SY-word bit carrying the SMA1 1 Hz square wave (SpikeGLX default is 6).
-  sync_bit: 6
-  sync_pulse_ms: 500
 
+  # ---------- defaults: change only if you know what they mean ----------
+  sync_bit: 6            # SY-word bit carrying the 1 Hz wave (SpikeGLX default)
+  sync_pulse_ms: 500     # its high duration; a CatGT -xd argument
+
+# The pulse train itself. Nothing reads these without a second system to align
+# to, but they are what a real session states, so the demo states them too.
 sync_period_s: 1.0
 burst_interval_s: 14.0
-# Step 9 passes when burst residuals stay under this (seconds).
-alignment_tolerance_s: 0.001
+alignment_tolerance_s: 0.001      # step 9 passes below this burst residual
 
 # Passed straight to Kilosort. Empty means its defaults, which already highpass at
 # 300 Hz and subtract the median across channels on every batch -- there is no

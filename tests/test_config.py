@@ -7,6 +7,7 @@ is broken rather than merely if the loader is.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -65,6 +66,49 @@ def test_template_leaves_no_unresolved_placeholders():
         assert "{" not in str(path)
         assert str(path).startswith("Z:")
     assert str(session.output_root).endswith(session.session)
+
+
+_FENCE = "---------- defaults"
+
+
+def _keys_below_the_fence(text: str, block: str) -> list[str]:
+    """Keys inside ``block:`` that sit after its defaults fence, in file order."""
+    lines = text.splitlines()
+    fenced, keys = False, []
+    for line in lines[lines.index(f"{block}:") + 1 :]:
+        if line and not line.startswith((" ", "#")):
+            break                                    # the next top-level key
+        if _FENCE in line:
+            fenced = True
+        elif fenced:
+            match = re.match(r"  (\w+):", line)      # two spaces: not a nested key
+            if match:
+                keys.append(match.group(1))
+    return keys
+
+
+def test_the_tracked_configs_state_the_code_defaults_below_their_fences():
+    # The fence claims everything under it can be left alone. That claim rots the
+    # moment someone tunes a threshold in place, and the file would still read as
+    # a stock session. Every key below a fence must therefore equal the dataclass
+    # default; a value chosen for this recording belongs above it.
+    stock = {"blackrock": cfg.BlackrockSpec(), "neuropixels": cfg.NeuropixelsSpec()}
+
+    for name, machine in (("session_template.yaml", "windows_rig"), ("demo.yaml", "mac")):
+        text = (CONFIG_DIR / name).read_text()
+        session = cfg.load_session_config(CONFIG_DIR / name, machine, CONFIG_DIR)
+        fenced = 0
+        for block, default in stock.items():
+            if f"\n{block}:" not in text:
+                continue                             # that system did not record
+            keys = _keys_below_the_fence(text, block)
+            assert keys, f"{name}: {block}: has no defaults fence"
+            fenced += 1
+            for key in keys:
+                assert getattr(getattr(session, block), key) == getattr(default, key), (
+                    f"{name}: {block}.{key} is not a default -- move it above the fence"
+                )
+        assert fenced, f"{name}: no defaults fence at all"
 
 
 def test_session_paths_no_longer_vary_by_machine():
