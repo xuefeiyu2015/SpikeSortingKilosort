@@ -20,7 +20,7 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 def test_demo_config_is_an_ordinary_session():
     # The demo is just a config: a binary path plus a couple of flags. Nothing in
     # the code branches on it being "the demo".
-    session = cfg.load_session_config(CONFIG_DIR / "demo.yaml", "mac", CONFIG_DIR)
+    session = cfg.load_session_config(CONFIG_DIR / "session_demo_1probe.yaml", "mac", CONFIG_DIR)
     assert session.session == "demo"
     assert session.aligns_systems is False   # no blackrock: block
     assert session.has_data("blackrock") is False
@@ -35,7 +35,7 @@ def test_demo_paths_are_derived_the_same_way_a_real_session_is():
     # stating its directory outright -- so it exercises the derivation instead of
     # side-stepping it, and the path it produces is the one the file references
     # as {neuropixels_dir}.
-    session = cfg.load_session_config(CONFIG_DIR / "demo.yaml", "mac", CONFIG_DIR)
+    session = cfg.load_session_config(CONFIG_DIR / "session_demo_1probe.yaml", "mac", CONFIG_DIR)
 
     assert session.neuropixels_dir == session.paths.dir_for("neuropixels")
     assert session.neuropixels_dir.name == session.session
@@ -61,7 +61,7 @@ def test_template_leaves_no_unresolved_placeholders():
     # A stale {data_root} would not raise: _substitute only knows five names and
     # an unknown one is left alone, while a known-but-unset one becomes "" --
     # silently turning "{data_root}/Monkey Athos" into "/Monkey Athos".
-    session = cfg.load_session_config(CONFIG_DIR / "session_template.yaml", "windows_rig", CONFIG_DIR)
+    session = cfg.load_session_config(CONFIG_DIR / "session_template_utah_probe.yaml", "windows_rig", CONFIG_DIR)
     for path in _template_paths(session):
         assert "{" not in str(path)
         assert str(path).startswith("Z:")
@@ -95,9 +95,11 @@ def test_the_tracked_configs_state_the_code_defaults_below_their_fences():
     stock = {"blackrock": cfg.BlackrockSpec(), "neuropixels": cfg.NeuropixelsSpec()}
 
     for name, machine in (
-        ("session_template.yaml", "windows_rig"),
+        ("session_template_utah_probe.yaml", "windows_rig"),
         ("session_template_2probes.yaml", "windows_rig"),
-        ("demo.yaml", "mac"),
+        ("session_template_1probe.yaml", "windows_rig"),
+        ("session_template_utah_only.yaml", "windows_rig"),
+        ("session_demo_1probe.yaml", "mac"),
     ):
         text = (CONFIG_DIR / name).read_text()
         session = cfg.load_session_config(CONFIG_DIR / name, machine, CONFIG_DIR)
@@ -124,15 +126,15 @@ def test_the_two_templates_differ_only_where_they_say_they_do():
     # a Blackrock that recorded the sync channels only. Everything else must match.
     one, two = (
         cfg.load_session_config(CONFIG_DIR / name, "windows_rig", CONFIG_DIR)
-        for name in ("session_template.yaml", "session_template_2probes.yaml")
+        for name in ("session_template_utah_probe.yaml", "session_template_2probes.yaml")
     )
 
     assert one.neuropixels.probes == (0,)
     assert two.neuropixels.probes == (0, 1)
     assert two.probe_indices("neuropixels") == (0, 1)
 
-    # No spike file means nothing to sort, and saying so is the config's job:
-    # left true, the sort stage would fail on the missing path instead.
+    # No spike file means nothing to sort. This file states that outright as
+    # well, though sorts_blackrock derives it from the missing path either way.
     assert two.blackrock.spike_file is None
     assert two.kilosort_on_blackrock is False
     assert two.sorts_blackrock is False
@@ -149,13 +151,85 @@ def test_the_two_templates_differ_only_where_they_say_they_do():
     assert cfg.replace(one.blackrock, spike_file=None) == two.blackrock
 
 
+def test_the_one_probe_template_differs_only_by_the_missing_array():
+    # The third tracked template: Neuropixels records the spikes, Blackrock
+    # records only the pulses they are aligned against. Same pinning as above --
+    # it must be session_template_utah_probe.yaml minus the array, and nothing else.
+    one, none = (
+        cfg.load_session_config(CONFIG_DIR / name, "windows_rig", CONFIG_DIR)
+        for name in ("session_template_utah_probe.yaml", "session_template_1probe.yaml")
+    )
+
+    # Blackrock still recorded, and is still the timebase everything maps onto.
+    assert none.blackrock.sync_file == one.blackrock.sync_file
+    assert none.has_data("blackrock") and none.aligns_systems
+
+    # There is no array, so: nothing to sort, and no channel map to name.
+    assert none.blackrock.spike_file is None
+    assert none.blackrock.probe_file is None and none.blackrock.cmp_file is None
+    assert none.sorts_blackrock is False
+    # ...and the file does not say so: the missing spike_file is what says it, so
+    # adding one later starts sorting with nothing else to remember.
+    assert none.kilosort_on_blackrock is True
+
+    # Neuropixels is untouched, including its Kilosort block.
+    assert none.neuropixels == one.neuropixels
+    assert none.kilosort_by_system["neuropixels"] == one.kilosort_by_system["neuropixels"]
+    assert "blackrock" not in none.kilosort_by_system   # no array, no settings for one
+
+    stated = {"blackrock", "kilosort_by_system"}
+    differing = [
+        f
+        for f in one.__dataclass_fields__
+        if f not in stated and getattr(one, f) != getattr(none, f)
+    ]
+    assert differing == [], differing
+    assert cfg.replace(one.blackrock, spike_file=None, probe_file=None) == none.blackrock
+
+
+def test_the_utah_only_template_differs_only_by_the_missing_probe():
+    # The fourth tracked template: a Utah array and nothing else, so there is no
+    # second clock and nothing to align. Same pinning: session_template_utah_probe.yaml
+    # minus the Neuropixels half, and nothing else.
+    one, utah = (
+        cfg.load_session_config(CONFIG_DIR / name, "windows_rig", CONFIG_DIR)
+        for name in ("session_template_utah_probe.yaml", "session_template_utah_only.yaml")
+    )
+
+    # No neuropixels block at all -- which is how a session says it did not record.
+    assert utah.neuropixels == cfg.NeuropixelsSpec()
+    assert utah.has_data("neuropixels") is False
+    assert utah.neuropixels_dir is None
+    assert utah.aligns_systems is False          # ...so nothing to align against
+
+    # The array is sorted and exported exactly as in the full template.
+    assert utah.has_data("blackrock") and utah.sorts_blackrock
+    assert utah.blackrock.spike_file == one.blackrock.spike_file
+    assert utah.paths.primary == utah.blackrock_dir
+
+    # Its pulse train goes with the probe: nothing to be a pulse train for.
+    assert utah.blackrock.sync_file is None
+    assert cfg.replace(one.blackrock, sync_file=None) == utah.blackrock
+
+    assert utah.kilosort_by_system["blackrock"] == one.kilosort_by_system["blackrock"]
+    assert "neuropixels" not in utah.kilosort_by_system
+
+    stated = {"neuropixels", "neuropixels_dir", "blackrock", "kilosort_by_system"}
+    differing = [
+        f
+        for f in one.__dataclass_fields__
+        if f not in stated and getattr(one, f) != getattr(utah, f)
+    ]
+    assert differing == [], differing
+
+
 def test_session_paths_no_longer_vary_by_machine():
     # The inverse of the old two-layer behaviour, and the point of the split:
     # data paths live in the session file, so one file resolves identically
     # everywhere. The machine profile only decides where temp.dat goes and
     # whether CatGT/TPrime exist.
     loaded = [
-        cfg.load_session_config(CONFIG_DIR / "session_template.yaml", m, CONFIG_DIR)
+        cfg.load_session_config(CONFIG_DIR / "session_template_utah_probe.yaml", m, CONFIG_DIR)
         for m in ("mac", "hpc", "windows_rig")
     ]
     assert len({str(s.blackrock.sync_file) for s in loaded}) == 1
@@ -586,14 +660,14 @@ def test_naming_no_map_at_all_is_not_a_missing_input(tmp_path):
 
 
 def test_missing_inputs_reports_absent_files():
-    session = cfg.load_session_config(CONFIG_DIR / "session_template.yaml", "mac", CONFIG_DIR)
+    session = cfg.load_session_config(CONFIG_DIR / "session_template_utah_probe.yaml", "mac", CONFIG_DIR)
     problems = session.missing_inputs()
     assert problems
     assert any("does not exist" in p or "required" in p for p in problems)
 
 
 def test_require_inputs_raises_with_every_problem_at_once():
-    session = cfg.load_session_config(CONFIG_DIR / "session_template.yaml", "mac", CONFIG_DIR)
+    session = cfg.load_session_config(CONFIG_DIR / "session_template_utah_probe.yaml", "mac", CONFIG_DIR)
     with pytest.raises(FileNotFoundError) as excinfo:
         session.require_inputs()
     assert "not runnable" in str(excinfo.value)
@@ -832,7 +906,7 @@ def test_a_system_can_carry_settings_of_its_own(tmp_path):
 
 
 def test_a_system_replaces_a_shared_list_rather_than_extending_it(tmp_path):
-    # The merge is one level deep, which session_template.yaml now states: a
+    # The merge is one level deep, which session_template_utah_probe.yaml now states: a
     # per-system bad_channels is the whole list for that system, not an addition
     # to the shared one. Deep-merging would make [7] read as [7, 191, 192] and
     # quietly keep sorting channels the session said to drop.
@@ -1005,7 +1079,7 @@ def test_drift_correction_is_off_for_the_utah_array():
     rather than moving it, so the correction can only subtract signal. On a dense
     probe the same machinery is what makes drift tractable.
     """
-    session = cfg.load_session_config(CONFIG_DIR / "session_template.yaml", "windows_rig", CONFIG_DIR)
+    session = cfg.load_session_config(CONFIG_DIR / "session_template_utah_probe.yaml", "windows_rig", CONFIG_DIR)
 
     assert session.kilosort_for("blackrock")["nblocks"] == 0
     assert session.kilosort_for("neuropixels")["nblocks"] == 1

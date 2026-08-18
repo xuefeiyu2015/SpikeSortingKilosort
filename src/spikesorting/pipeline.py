@@ -4,20 +4,23 @@ This is the only file you need to read to understand the workflow. Everything
 below it -- ``_io``, ``_probes``, ``_sync``, ``_export``, ``_plots`` -- is
 machinery these verbs call.
 
-Every per-system verb takes ``system``: ``"neuropixels"`` or ``"blackrock"``. The
-two acquisition systems therefore read identically, which is the point of loading
-both through SpikeInterface::
+Every per-system verb takes ``system``: ``"neuropixels"`` or ``"blackrock"``, so
+the two acquisition systems read identically::
 
     config = load_session_config("configs/athos.yaml", "windows_rig")
 
-    probe  = setup_probe(config, "blackrock")
-    rec    = load_spike_continuous(config, "blackrock", probe)
-    sort_with_kilosort(rec, config, "blackrock")
+    sort_with_kilosort(config, "blackrock")        # pipeline 1, and all of it
 
-    extract_sync(config, "blackrock")
+    extract_sync(config, "blackrock")              # pipeline 2
+    extract_lfp(config, "neuropixels")
     time_remapping(config, "neuropixels")
     validate_remapping(config)
     export_results(config, "neuropixels")
+
+Sorting is Kilosort4's own ``run_kilosort`` on a flat int16 binary. SpikeGLX
+already writes one; a Blackrock ``.ns6`` is read by SpikeInterface and
+transformed into one once, beside the recording. That is SpikeInterface's only
+job here.
 
 One SpikeGLX run can hold several probes, and each is a stream of its own with
 its own clock, so the Neuropixels verbs also take ``probe_index`` and every
@@ -41,6 +44,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -66,13 +70,14 @@ __all__ = [
     "skip_reason",
     "load_session_config",
     "setup_probe",
-    "load_spike_continuous",
     "sort_with_kilosort",
     "extract_sync",
     "extract_lfp",
     "time_remapping",
     "validate_remapping",
     "export_results",
+    "Binary",
+    "SortSummary",
     "TimeMap",
     "SessionConfig",
     "MachineProfile",
@@ -104,8 +109,7 @@ def skip_reason(config: SessionConfig, verb: Any, system: str | None = None) -> 
 
     if system is not None and name in {
         "setup_probe",
-        "load_spike_continuous",
-            "sort_with_kilosort",
+        "sort_with_kilosort",
         "extract_sync",
         "extract_lfp",
         "export_results",
@@ -116,9 +120,16 @@ def skip_reason(config: SessionConfig, verb: Any, system: str | None = None) -> 
     if name == "sort_with_kilosort" and system is not None:
         if not getattr(config, f"kilosort_on_{system}"):
             return f"kilosort_on_{system} is false"
+        if system == "blackrock" and config.blackrock.spike_file is None:
+            # Blackrock recorded, but only the sync channels: a session whose
+            # spikes come from Neuropixels alone. There is no Utah array here.
+            return "no blackrock.spike_file, so there is no spike data to sort"
 
-    if name == "extract_lfp" and system == "blackrock":
-        return "Blackrock LFPs are saved separately by Central"
+    if name == "extract_lfp":
+        if system == "blackrock":
+            return "Blackrock LFPs are saved separately by Central"
+        if not config.export_lfp:
+            return "export_lfp is false"
 
     if name in {"time_remapping", "validate_remapping"} and not config.aligns_systems:
         return "only one system declared, so there is nothing to align against"
@@ -225,22 +236,45 @@ def setup_probe(config: SessionConfig, system: str, probe_index: int = 0) -> dic
 def _probe_from_meta(config: SessionConfig, probe_index: int = 0) -> dict | None:
     """The map from the run's own ``.meta``, or None when there is not one.
 
-    Returns None rather than raising for the two ordinary cases -- a bare binary
-    with no ``.meta`` beside it, and a run predating ``~snsGeomMap`` -- so the
-    caller can fall through to ``probe_file``.
+    Two readers, in order: this repo's ``~snsGeomMap`` parser, which needs only
+    NumPy, then ``probeinterface.read_spikeglx``, which also knows the older
+    layouts (``~snsShankMap``, imro-derived geometry) that predate it. Both read
+    *this run's* meta, which is the rule that matters -- which sites were active
+    is an imro choice made per recording.
+
+    Returns None rather than raising for the ordinary case of a bare binary with
+    no ``.meta`` beside it, or a meta neither reader can use, so the caller can
+    fall through to ``probe_file``.
     """
     from ._probes import neuropixels as np_probes
 
     try:
-        meta = _neuropixels_stream(config, probe_index).meta
+        info = _neuropixels_stream(config, probe_index)
     except FileNotFoundError:
         return None
-    if not meta:
+    if not info.meta:
         return None
+
     try:
-        return np_probes.probe_from_meta(meta)
-    except ValueError:
+        return np_probes.probe_from_meta(info.meta)
+    except ValueError as error:
+        reason = error
+
+    from ._io import spikeglx
+
+    try:
+        probe = np_probes.probe_from_meta_file(spikeglx.meta_path_for(info.path))
+    except Exception as fallback_error:  # missing probeinterface, or a meta it rejects
+        log.info(
+            "no map from %s: %s; probeinterface could not read it either (%s)",
+            spikeglx.meta_path_for(info.path).name, reason, fallback_error,
+        )
         return None
+    log.info(
+        "%s has no ~snsGeomMap; read its geometry with probeinterface instead",
+        spikeglx.meta_path_for(info.path).name,
+    )
+    return probe
 
 
 def _neuropixels_stream(config: SessionConfig, probe: int = 0) -> Any:
@@ -259,60 +293,138 @@ def _neuropixels_stream(config: SessionConfig, probe: int = 0) -> Any:
 
 
 # ----------------------------------------------------------------------------
-# Step 2: the recording
+# Step 2: the binary Kilosort reads
 # ----------------------------------------------------------------------------
 
 
-def load_spike_continuous(
-    config: SessionConfig,
-    system: str,
-    probe: dict | None = None,
-    probe_index: int = 0,
-) -> Any | None:
-    """The spike-band continuous data for one system, as a SpikeInterface recording.
+@dataclass(frozen=True)
+class Binary:
+    """A flat int16 recording file, and the two facts Kilosort needs about it."""
 
-    Not the LFP and not the sync channels -- those have verbs of their own. The
-    probe is attached here, so everything downstream stops caring which system
-    produced the samples. Pass ``probe`` to override the configured map for one
-    run, for trying a map before committing it to the session file;
-    ``probe_index`` selects which probe of a SpikeGLX run to read, and the map
-    comes from that same probe.
+    path: Path
+    n_chan_bin: int
+    fs: float
 
-    Loading reads no samples -- it is a ``stat`` and an ``open``, and the sorter
-    is what streams the file. Those two calls are also what hangs when a share
-    stops answering, so the recording's path is checked first, with a deadline;
-    see :func:`spikesorting._io.reachable.check_reachable`.
+    def summary(self) -> str:
+        return f"{self.path} ({self.n_chan_bin} channels at {self.fs:g} Hz)"
+
+
+def _binary_for(config: SessionConfig, system: str, probe_index: int = 0) -> Binary:
+    """The file ``run_kilosort`` is pointed at, for either system.
+
+    SpikeGLX already writes one: the AP binary is flat, sample-interleaved int16,
+    which is exactly Kilosort's own format, so nothing is converted. A Blackrock
+    ``.ns6`` is not, so it is transformed once -- see :func:`_blackrock_binary`.
     """
-    _check(system)
-    if not config.has_data(system):
-        return None
-
-    _check_input_reachable(config, system)
-
-    # core, not full: this needs read_binary and nothing else, and `full` pulls in
-    # the widgets, exporters and sorters behind it.
-    from spikeinterface.core import read_binary
-
-    from ._probes.common import to_probeinterface
-
     if system == "blackrock":
-        from ._io import blackrock
+        return _blackrock_binary(config)
+    info = _neuropixels_stream(config, probe_index)
+    return Binary(Path(info.path), int(info.n_chan), float(info.fs))
 
-        spec = config.blackrock
-        if spec.spike_file is None:
-            raise ValueError("blackrock.spike_file is required to load Blackrock data")
-        recording = blackrock.read_recording(spec.spike_file, stream_id=spec.stream_id)
-    else:
-        info = _neuropixels_stream(config, probe_index)
-        recording = read_binary(
-            file_paths=[str(info.path)],
-            sampling_frequency=float(info.fs),
-            num_channels=int(info.n_chan),
-            dtype="int16",
+
+def _blackrock_binary(config: SessionConfig) -> Binary:
+    """Transform the Utah array's ``.ns6`` into a Kilosort binary, once.
+
+    SpikeInterface reads the ``.ns6`` and Kilosort's own
+    ``io.spikeinterface_to_binary`` writes it out flat -- this is the whole of
+    SpikeInterface's job in the sorting path. **Every channel is written**,
+    including any sync or analog inputs sharing the file: the probe's ``chanMap``
+    is what selects electrodes, and dropping them here would shift every contact
+    after the removed one.
+
+    The result sits beside the recording rather than in the cache, and is reused
+    when it is already there at the expected size. It has to persist: it is what
+    the sorting's ``params.py`` points at, so Phy can only show raw traces while
+    it exists, and re-transforming an unchanged ``.ns6`` on every re-sort is
+    minutes of I/O for nothing.
+    """
+    spec = config.blackrock
+    if spec.spike_file is None:
+        raise ValueError("blackrock.spike_file is required to sort the Utah array")
+
+    from spikeinterface.extractors import read_blackrock
+
+    # gap_tolerance_ms is not optional in practice: neo raises on any timestamp
+    # jump larger than two sampling periods, and PTP recordings carry occasional
+    # corrupted packet timestamps, so most files will not open without it.
+    kwargs = {"gap_tolerance_ms": spec.gap_tolerance_ms}
+    if spec.stream_id:
+        kwargs["stream_id"] = spec.stream_id
+    recording = read_blackrock(spec.spike_file, **kwargs)
+
+    n_segments = int(recording.get_num_segments())
+    if n_segments > 1 and not spec.allow_segments:
+        raise ValueError(
+            f"{spec.spike_file.name} splits into {n_segments} segments at "
+            f"gap_tolerance_ms={spec.gap_tolerance_ms}: a jump that large is a paused "
+            "recording, not a timestamp glitch. Sorting across a pause is a decision, "
+            "so state it: blackrock.allow_segments: true to concatenate them, or raise "
+            "blackrock.gap_tolerance_ms if the jump really is noise."
         )
 
-    probe = probe if probe is not None else setup_probe(config, system, probe_index)
-    return recording.set_probe(to_probeinterface(probe))
+    n_chan = int(recording.get_num_channels())
+    fs = float(recording.get_sampling_frequency())
+    n_bytes = n_chan * sum(
+        int(recording.get_num_frames(segment_index=s)) for s in range(n_segments)
+    ) * 2  # int16
+
+    # One level above the sorting it feeds, so re-sorting neither wipes it nor
+    # reconverts. Taken from sorted_for rather than dir_for so a session with no
+    # blackrock_dir raises OutputPaths' message naming what to set.
+    directory = config.paths.sorted_for("blackrock").parent
+    directory.mkdir(parents=True, exist_ok=True)
+    name = f"{spec.spike_file.stem}.bin"
+    path = directory / name
+
+    if path.exists() and path.stat().st_size == n_bytes:
+        log.info("reusing %s (%.1f GB) -- delete it to force a re-transform", path, n_bytes / 1e9)
+        return Binary(path, n_chan, fs)
+
+    from kilosort.io import spikeinterface_to_binary
+
+    log.info(
+        "transforming %s -> %s (%.1f GB)", spec.spike_file.name, path, n_bytes / 1e9
+    )
+    written = spikeinterface_to_binary(recording, directory, data_name=name, dtype="int16")
+    # It returns a tuple whose first element is the path; the channel count and
+    # rate come from the recording it was written from, which cannot disagree
+    # with the file and does not depend on the tuple's layout in this release.
+    written = written[0] if isinstance(written, tuple) else written
+    return Binary(Path(written), n_chan, fs)
+
+
+def write_nsp_time_map(config: SessionConfig, out_dir: Path, source: Path) -> Any | None:
+    """Measure ``source``'s sample -> NSP-clock map and write it beside ``out_dir``.
+
+    The axis every other Blackrock product in the lab uses -- ``.nev`` markers,
+    eye traces, online spikes -- and the one Kilosort does not give back. Written
+    as JSON so an export can be traced to the file and the fit it came from.
+    """
+    from ._io import blackrock
+
+    spec = config.blackrock
+    reader = blackrock.open_reader(source, gap_tolerance_ms=spec.gap_tolerance_ms)
+    time_map = blackrock.nsp_time_map(
+        reader, blackrock.nsx_number(source), tolerance_s=config.alignment_tolerance_s
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "nsp_time_map.json"
+    payload = dict(time_map.to_dict(), source=str(source))
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    log.info("NSP clock: %s -> %s", time_map.summary(), path.name)
+    return time_map
+
+
+def read_nsp_time_map(directory: Path) -> Any | None:
+    """The map written by :func:`write_nsp_time_map`, or None if there is none."""
+    from ._io.blackrock import NspTimeMap
+
+    path = Path(directory) / "nsp_time_map.json"
+    if not path.exists():
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        return NspTimeMap.from_dict(json.load(handle))
 
 
 def _input_path(config: SessionConfig, system: str) -> Path | None:
@@ -350,34 +462,278 @@ def _check_input_reachable(config: SessionConfig, system: str) -> None:
 # ----------------------------------------------------------------------------
 
 
+@dataclass
+class SortSummary:
+    """Where a sorting landed and how it went."""
+
+    results_dir: Path
+    n_units: int
+    n_spikes: int
+    fs: float
+    binary: Path
+    settings: dict[str, Any]
+
+    def summary(self) -> str:
+        return (
+            f"{self.n_units} units, {self.n_spikes} spikes at {self.fs:g} Hz "
+            f"-> {self.results_dir}"
+        )
+
+
+#: Arguments this verb decides for itself. A session naming one under ``kilosort:``
+#: would either be ignored or collide with the value passed here, so it is refused
+#: with the key that actually controls it.
+_RESERVED = {
+    "filename": "neuropixels.bin_file / run_dir, or blackrock.spike_file",
+    "data_dir": "neuropixels.run_dir",
+    "file_object": "not used: both systems arrive as a binary",
+    "results_dir": "derived from the session directory",
+    "probe": "the run's .meta, blackrock.cmp_file, or probe_file",
+    "probe_name": "probe_file -- Kilosort ships no probe library",
+    "n_chan_bin": "read from the .meta, or neuropixels.n_chan_bin",
+    "fs": "read from the .meta, or neuropixels.sample_rate",
+    "data_dtype": "both systems are int16",
+    "device": "the machine profile's device:",
+}
+
+
+def _kilosort_arguments(
+    config: SessionConfig, system: str, probe_index: int, binary: Binary
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split the session's ``kilosort:`` block into ``settings`` and keyword args.
+
+    Kilosort takes its parameters in two places -- a ``settings`` dict and
+    ``run_kilosort``'s own arguments (``do_CAR``, ``bad_channels``,
+    ``invert_sign``) -- and which parameter lives where has moved between
+    releases. So the split is read from the installed package rather than
+    hardcoded, and a key in neither is refused here, naming both sets, instead of
+    failing hours later or being silently dropped.
+    """
+    import inspect
+
+    from kilosort import run_kilosort
+    from kilosort.run_kilosort import DEFAULT_SETTINGS
+
+    settings: dict[str, Any] = {"n_chan_bin": binary.n_chan_bin, "fs": binary.fs}
+    kwargs: dict[str, Any] = {}
+    accepted = set(inspect.signature(run_kilosort).parameters)
+
+    for key, value in config.kilosort_for(system, probe_index).items():
+        if key in _RESERVED:
+            raise ValueError(
+                f"kilosort.{key} is set by the pipeline, not by the session file. "
+                f"It comes from: {_RESERVED[key]}"
+            )
+        if key in DEFAULT_SETTINGS:
+            settings[key] = value
+        elif key in accepted:
+            kwargs[key] = value
+        else:
+            raise ValueError(
+                f"Kilosort has no parameter '{key}'.\n"
+                f"  settings: {', '.join(sorted(DEFAULT_SETTINGS))}\n"
+                f"  run_kilosort arguments: "
+                f"{', '.join(sorted(accepted - {'settings', 'probe'}))}"
+            )
+    return settings, kwargs
+
+
 def sort_with_kilosort(
-    recording: Any,
     config: SessionConfig,
     system: str,
-    results_dir: Path | None = None,
     probe_index: int = 0,
+    dry_run: bool = False,
 ) -> Any | None:
-    """Run Kilosort4 on a loaded recording. Returns a ``SortResult``.
+    """Sort one stream with Kilosort4. Returns a :class:`SortSummary`.
 
-    Returns ``None`` without sorting when ``kilosort_on_<system>`` is false --
-    the "extract the pulses and the LFP but do not sort" case -- or when given no
-    recording.
+    The whole of pipeline 1: resolve the channel map, name the binary, hand both
+    to Kilosort's own ``run_kilosort``, and put the results where Phy and the
+    export stages look for them. Nothing is loaded into memory here and no
+    recording object is passed around -- Kilosort streams the file itself.
+
+    Returns ``None`` without sorting when ``kilosort_on_<system>`` is false, the
+    "extract the pulses and the LFP but do not sort" case.
 
     There is no preprocessing step before this. Kilosort does its own on every
     batch: it subtracts the median across channels when ``do_CAR`` is set (the
     default), highpasses at ``highpass_cutoff`` (300 Hz), then whitens and
     drift-corrects. Those are settings, named under ``kilosort:`` in the session
     and resolved by :meth:`SessionConfig.kilosort_for`.
+
+    Sorting runs in the machine's ``cache_dir`` and the results are copied out,
+    because Kilosort writes beside its results and a network share is both slow
+    and rude to everyone else on it. ``dry_run`` reports what would be run --
+    map, binary, settings -- and sorts nothing.
     """
     _check(system)
-    if recording is None or not getattr(config, f"sorts_{system}"):
+    if not getattr(config, f"sorts_{system}"):
         return None
 
-    from ._sort import sort_recording
+    _check_input_reachable(config, system)
 
-    return sort_recording(
-        config, system, recording, results_dir=results_dir, probe_index=probe_index
+    probe = setup_probe(config, system, probe_index)
+    binary = _binary_for(config, system, probe_index)
+    final_dir = config.paths.sorted_for(system, probe_index)
+
+    if dry_run:
+        return _dry_run(config, system, probe_index, probe, binary, final_dir)
+
+    settings, kwargs = _kilosort_arguments(config, system, probe_index, binary)
+
+    import torch
+    from kilosort import run_kilosort
+
+    work_dir = _work_dir(config, system, probe_index) or final_dir
+    work_dir.mkdir(parents=True, exist_ok=True)
+    log.info("sorting %s -> %s", binary.summary(), work_dir)
+
+    try:
+        _ops, spike_times, clusters, *_rest = run_kilosort(
+            settings=settings,
+            probe=probe,
+            filename=binary.path,
+            data_dtype="int16",
+            results_dir=work_dir,
+            device=torch.device(config.machine.device),
+            **kwargs,
+        )
+        if work_dir != final_dir:
+            _publish(work_dir, final_dir)
+            _repoint_params(final_dir, binary.path)
+    finally:
+        if work_dir != final_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    result = SortSummary(
+        results_dir=final_dir,
+        n_units=int(np.unique(clusters).size),
+        n_spikes=int(np.asarray(spike_times).size),
+        fs=binary.fs,
+        binary=binary.path,
+        settings=settings,
     )
+    _write_run_info(config, system, probe_index, result, kwargs)
+
+    # Blackrock only: record what turns these sample indices into NSP-clock
+    # seconds, beside the sorting, while the file that produced them is known.
+    if system == "blackrock":
+        try:
+            write_nsp_time_map(config, final_dir, config.blackrock.spike_file)
+        except Exception as error:  # a bad clock must not discard a finished sort
+            log.warning(
+                "could not measure the NSP clock for %s (%s: %s); spike times will "
+                "export in the sorter's own timebase",
+                config.blackrock.spike_file, type(error).__name__, error,
+            )
+    return result
+
+
+def _work_dir(config: SessionConfig, system: str, probe_index: int) -> Path | None:
+    """Fast local scratch for this stream's sort, or None to sort in place."""
+    if config.cache_dir is None:
+        log.warning(
+            "machine '%s' has no cache_dir, so Kilosort writes straight to the "
+            "session directory -- slow on a share",
+            config.machine.name,
+        )
+        return None
+    return Path(config.cache_dir) / f"{config.session}_{stream_label(system, probe_index)}"
+
+
+def _publish(work_dir: Path, final_dir: Path) -> None:
+    """Copy a finished sorting out of the cache. ``.dat`` stays behind.
+
+    The only ``.dat`` Kilosort writes is the whitened copy of the recording, made
+    on request and the size of the input; the results themselves are the ``.npy``
+    and ``.tsv`` files beside it.
+    """
+    final_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(
+        work_dir, final_dir, dirs_exist_ok=True, ignore=shutil.ignore_patterns("*.dat")
+    )
+
+
+def _repoint_params(final_dir: Path, binary: Path) -> None:
+    """Make ``params.py``'s ``dat_path`` absolute, if it is not already.
+
+    Phy reads the raw traces through that line. Kilosort writes it relative to
+    the directory it sorted in, in some versions -- and that directory was the
+    cache, which is deleted -- so a path that does not resolve from where the
+    results now live is rewritten to the binary's own. A path that does resolve
+    is left exactly as Kilosort wrote it.
+    """
+    params = final_dir / "params.py"
+    if not params.exists():
+        return
+    lines = params.read_text(encoding="utf-8").splitlines(keepends=True)
+    out, changed = [], False
+    for line in lines:
+        if line.startswith("dat_path"):
+            stated = line.partition("=")[2].strip().strip("'\"")
+            if not (final_dir / stated).exists() and not Path(stated).exists():
+                line = f"dat_path = '{binary}'\n"
+                changed = True
+        out.append(line)
+    if changed:
+        params.write_text("".join(out), encoding="utf-8")
+        log.info("params.py: dat_path repointed at %s", binary)
+
+
+def _dry_run(
+    config: SessionConfig,
+    system: str,
+    probe_index: int,
+    probe: dict,
+    binary: Binary,
+    final_dir: Path,
+) -> dict[str, Any]:
+    """What a real run would do, without doing it. Needs no GPU."""
+    from ._probes.common import probe_summary
+
+    report: dict[str, Any] = {
+        "probe": probe_summary(probe),
+        "binary": binary.summary(),
+        "results_dir": final_dir,
+    }
+    try:
+        settings, kwargs = _kilosort_arguments(config, system, probe_index, binary)
+        report["settings"] = settings
+        report["run_kilosort arguments"] = kwargs
+    except ImportError:
+        # No Kilosort here, so which parameter goes where cannot be looked up.
+        # Report the block unsplit rather than nothing: the paths above are the
+        # half a laptop can actually check.
+        report["kilosort (unsplit -- Kilosort is not installed)"] = config.kilosort_for(
+            system, probe_index
+        )
+    return report
+
+
+def _write_run_info(
+    config: SessionConfig,
+    system: str,
+    probe_index: int,
+    result: SortSummary,
+    kwargs: dict[str, Any],
+) -> None:
+    """Record what produced this sorting, beside the sorting itself."""
+    payload = {
+        "session": config.session,
+        "machine": config.machine.name,
+        "device": config.machine.device,
+        "system": system,
+        # Which stream, not just which system: a run can hold several probes.
+        "stream": stream_label(system, probe_index),
+        "probe_index": probe_index,
+        "binary": str(result.binary),
+        "n_units": result.n_units,
+        "n_spikes": result.n_spikes,
+        "fs": result.fs,
+        "settings": result.settings,
+        "run_kilosort_arguments": kwargs,
+    }
+    with open(result.results_dir / "run_info.json", "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, default=str)
 
 
 # ----------------------------------------------------------------------------
@@ -404,22 +760,26 @@ def extract_sync(config: SessionConfig, system: str, probe_index: int = 0) -> An
     return extract.extract_blackrock_edges(config)
 
 
-def extract_lfp(
-    config: SessionConfig, system: str, decimate: int = 1, probe_index: int = 0
-) -> Path | None:
+def extract_lfp(config: SessionConfig, system: str, probe_index: int = 0) -> Path | None:
     """Export one system's LFP. Returns the path written, or ``None``.
 
-    Blackrock always returns ``None``: Central already saves those separately.
+    Runs when the session says ``export_lfp: true``, and with the stride that
+    session names in ``lfp_decimate``. Blackrock always returns ``None``: Central
+    already saves those separately.
 
     Bulk I/O, no compute -- the LF band is ~7 GB/hour at 385 channels and
-    ``decimate=1`` writes an output the size of the input, so run this where the
-    recording lives. Decimation is a plain stride with no anti-alias filter; the
-    LF band is hardware-limited to ~500 Hz at 2500 Hz sampling, so 2 is safe and
-    more aliases.
+    ``lfp_decimate: 1`` writes an output the size of the input, so run this where
+    the recording lives. Decimation is a plain stride with no anti-alias filter;
+    the LF band is hardware-limited to ~500 Hz at 2500 Hz sampling, so 2 is safe
+    and more aliases.
     """
     _check(system)
     if system == "blackrock" or not config.has_data("neuropixels"):
         return None
+    if not config.export_lfp:
+        return None
+
+    decimate = config.lfp_decimate
 
     from ._io import spikeglx
 
@@ -724,12 +1084,13 @@ def validate_remapping(
 def export_results(
     config: SessionConfig,
     system: str = "neuropixels",
-    groups: tuple[str, ...] = ("good", "mua"),
-    figures: bool = True,
-    max_unit_figures: int = 40,
     probe_index: int = 0,
+    max_unit_figures: int = 40,
 ) -> dict | None:
     """Export metrics, figures and the final bundle for a sorted folder.
+
+    Which unit labels to keep and whether to draw figures are the session's
+    ``export_groups`` and ``export_figures``.
 
     Uses aligned spike times when ``time_remapping`` has written them, and
     records which timebase it used. Reads Phy's ``cluster_group.tsv`` where it
@@ -744,6 +1105,9 @@ def export_results(
 
     if not config.has_data(system):
         return None
+
+    groups = tuple(config.export_groups)
+    figures = config.export_figures
 
     results_dir = config.paths.sorted_for(system, probe_index)
     if not (results_dir / "spike_times.npy").exists():
@@ -762,6 +1126,7 @@ def export_results(
     aligned_path = aligned_dir / f"{system}_spike_seconds_blackrock.npy"
     spike_times_s: dict[int, np.ndarray] | None = None
     timebase = "sorter"
+    time_map = None
     if aligned_path.exists():
         aligned = np.load(aligned_path)
         if aligned.size != phy.spike_samples.size:
@@ -773,6 +1138,20 @@ def export_results(
         else:
             spike_times_s = {int(uid): aligned[phy.spike_clusters == uid] for uid in unit_ids}
             timebase = "blackrock"
+    elif system == "blackrock":
+        # No second system to align against, but the Utah array still has a clock
+        # of its own -- and it is not the one Kilosort's sample indices imply.
+        # nsp_time_map.json carries the origin (~1.5e9 s) and the measured rate;
+        # without it these times cannot be compared to the .nev markers or the
+        # eye traces recorded beside them.
+        time_map = read_nsp_time_map(results_dir)
+        if time_map is not None:
+            mapped = time_map.apply(phy.spike_samples)
+            spike_times_s = {
+                int(uid): mapped[phy.spike_clusters == uid] for uid in unit_ids
+            }
+            timebase = "nsp"
+            log.info("NSP clock: %s", time_map.summary())
     log.info("timebase: %s", timebase)
 
     out_dir = aligned_dir if timebase == "blackrock" else results_dir / "export"
@@ -787,6 +1166,7 @@ def export_results(
             "system": system,
             "stream": stream_label(system, probe_index),
             "machine": config.machine.name,
+            **({"nsp_time_map": time_map.to_dict()} if time_map is not None else {}),
         },
     )
     log.info("exported %d units -> %s", unit_ids.size, out_dir)

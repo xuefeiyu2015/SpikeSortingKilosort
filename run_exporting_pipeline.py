@@ -1,14 +1,13 @@
 #!/usr/bin/env python
-"""Pipeline part 2 of 2: everything after manual curation.
+"""Pipeline part 2 of 2: everything that is not sorting.
 
     python run_exporting_pipeline.py --config configs/Athos_2026_08_13.yaml \
            --machine windows_rig
 
-Run this once Phy has written ``cluster_group.tsv``: its labels override
-Kilosort's own ``cluster_KSLabel.tsv``, and every stage here reads the human
-labels when they exist. Running it before curating is not an error -- you get
-Kilosort's labels instead -- but it is rarely what you want.
-
+    extract_sync         the 1 Hz train and the 14 s coded burst, from each
+                         stream, to its own sync/. CatGT where the machine has
+                         it, always the NumPy detector, and the two compared.
+    lfp                  the LF band, when the session says export_lfp: true.
     time_remapping       coarse offset from the 14 s bursts, then a fine fit on
                          the 1 Hz train, onto Blackrock time. Blackrock is the
                          reference timebase; this maps onto it, never the reverse.
@@ -17,9 +16,15 @@ Kilosort's labels instead -- but it is rarely what you want.
                          can gate a batch job.
     export_results       aligned spike times, metrics, waveforms, figures.
 
-**Needs no GPU and no sorter** -- only the edge files and the sorted output. It
-does use CatGT/TPrime where the machine has them, so this is the half that wants
-to run on the rig even when sorting went to a cluster.
+The alignment and export stages read the labels Phy writes, so run this once
+curation is done: ``cluster_group.tsv`` overrides Kilosort's own
+``cluster_KSLabel.tsv``. Running it before curating is not an error -- you get
+Kilosort's labels instead -- but it is rarely what you want. ``--steps
+extract_sync`` is the part that can be run straight after the recording.
+
+**Needs no GPU and no sorter** -- only the recordings' edge channels and the
+sorted output. It does use CatGT/TPrime where the machine has them, so this is
+the half that wants to run on the rig even when sorting went to a cluster.
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ from _cli import Runner, build_parser, load, run_probes  # noqa: E402
 
 import spikesorting as ss  # noqa: E402
 
-STAGES = ["time_remapping", "validate_remapping", "export_results"]
+STAGES = ["extract_sync", "lfp", "time_remapping", "validate_remapping", "export_results"]
 
 
 def main() -> int:
@@ -52,11 +57,26 @@ def main() -> int:
         action="store_true",
         help="continue after a failing stage instead of stopping",
     )
+    # The four below override session keys for one run; the session file is where
+    # each of them lives. See _cli.flag_overrides.
+    parser.add_argument(
+        "--export-lfp",
+        action="store_true",
+        help="export the LF band this run, whatever export_lfp says in the session",
+    )
+    parser.add_argument(
+        "--lfp-decimate",
+        type=int,
+        default=None,
+        help="override the session's lfp_decimate (and export the LF band). The LF "
+        "band is hardware-limited to ~500 Hz at 2500 Hz sampling, so 2 is safe; "
+        "higher aliases (no anti-alias filter)",
+    )
     parser.add_argument(
         "--groups",
         nargs="+",
-        default=["good", "mua"],
-        help="Phy cluster_group labels to export (default: good mua)",
+        default=None,
+        help="override the session's export_groups (Phy cluster_group labels)",
     )
     parser.add_argument("--no-figures", action="store_true", help="skip figure generation")
     args = parser.parse_args()
@@ -64,13 +84,21 @@ def main() -> int:
 
     config = load(args, require_inputs=False)
     run = Runner(config, keep_going=args.keep_going)
-    figures = not args.no_figures
     print()
 
-    # The pipeline, in order. Blackrock is the reference timebase, so it is what
-    # the other system is mapped *onto* rather than a system to remap. Each
-    # Neuropixels probe is mapped and validated on its own: two probes are two
-    # clocks, so one fit cannot serve both.
+    # Extraction first: everything below reads the edge files it writes. Each
+    # Neuropixels probe is its own stream with its own clock, so it is extracted,
+    # mapped and validated on its own; Blackrock yields one stream and is not
+    # re-read per probe.
+    for stage, verb in (("extract_sync", ss.extract_sync), ("lfp", ss.extract_lfp)):
+        if stage not in args.steps:
+            continue
+        for system in ss.SYSTEMS:
+            for probe_index in run_probes(config, system, args.probe):
+                run(verb, config, system, probe_index, system=system, probe=probe_index)
+
+    # Blackrock is the reference timebase, so it is what the other system is
+    # mapped *onto* rather than a system to remap.
     if "time_remapping" in args.steps:
         for system in ss.SYSTEMS:
             for probe_index in run_probes(config, system, args.probe):
@@ -88,7 +116,7 @@ def main() -> int:
             run(
                 ss.validate_remapping,
                 config,
-                figures,
+                config.export_figures,
                 probe_index=probe_index,
                 system="neuropixels",
                 probe=probe_index,
@@ -101,9 +129,7 @@ def main() -> int:
                     ss.export_results,
                     config,
                     system,
-                    tuple(args.groups),
-                    figures,
-                    probe_index=probe_index,
+                    probe_index,
                     system=system,
                     probe=probe_index,
                 )

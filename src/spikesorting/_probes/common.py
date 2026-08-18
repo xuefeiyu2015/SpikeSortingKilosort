@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-__all__ = ["to_probeinterface", "probe_summary"]
+__all__ = ["to_probeinterface", "from_probeinterface", "probe_summary"]
 
 
 def to_probeinterface(probe: dict, contact_radius_um: float = 5.0) -> Any:
@@ -35,6 +35,43 @@ def to_probeinterface(probe: dict, contact_radius_um: float = 5.0) -> Any:
     )
     result.set_device_channel_indices(np.asarray(probe["chanMap"], dtype=int))
     return result
+
+
+def from_probeinterface(probe: Any) -> dict:
+    """Convert a ``probeinterface.Probe`` to a Kilosort probe dict.
+
+    The inverse of :func:`to_probeinterface`, and what lets probeinterface's own
+    readers -- ``read_spikeglx`` on a ``.meta``, ``read_prb``, the probe library
+    -- be used as a source of geometry. ``device_channel_indices`` is the
+    contact-to-binary-row mapping and becomes ``chanMap``; contacts marked ``-1``
+    are not wired to anything and are dropped, since a negative row index is not
+    something Kilosort can read.
+    """
+    positions = np.asarray(probe.contact_positions, dtype=np.float64)
+    indices = probe.device_channel_indices
+    if indices is None:
+        raise ValueError(
+            "probe has no device_channel_indices, so which recording channel each "
+            "contact corresponds to is unknown"
+        )
+    indices = np.asarray(indices, dtype=int)
+    wired = indices >= 0
+
+    shank_ids = getattr(probe, "shank_ids", None)
+    if shank_ids is None or len(shank_ids) != positions.shape[0]:
+        kcoords = np.zeros(positions.shape[0])
+    else:
+        # probeinterface names shanks with strings; Kilosort wants a number per
+        # channel, and only the grouping matters.
+        _, kcoords = np.unique(np.asarray(shank_ids, dtype=str), return_inverse=True)
+
+    return {
+        "chanMap": indices[wired].astype(np.int32),
+        "xc": positions[wired, 0].astype(np.float32),
+        "yc": positions[wired, 1].astype(np.float32),
+        "kcoords": np.asarray(kcoords)[wired].astype(np.float32),
+        "n_chan": int(wired.sum()),
+    }
 
 
 def probe_summary(probe: dict) -> dict[str, Any]:

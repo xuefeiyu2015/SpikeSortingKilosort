@@ -2,7 +2,7 @@
 # official Kilosort4 example recording.
 #
 # Nothing about it is special-cased in the code. It has the same keys, and the
-# same edit/defaults fences, as session_template.yaml, and differs only in where
+# same edit/defaults fences, as session_template_utah_probe.yaml, and differs only in where
 # the data is and in three settings a bare .bin needs (bin_file, n_chan_bin,
 # sample_rate) where a real SpikeGLX run has run_dir/run_name and reads the rest
 # from its .meta.
@@ -11,11 +11,20 @@
 # data, so no Blackrock stage runs and there is nothing to align against.
 #
 # Set it up once with notebooks/setup_demo_data.ipynb, then:
-#   python run_sorting_pipeline.py   --config configs/demo.yaml
-#   python run_exporting_pipeline.py --config configs/demo.yaml
+#   python run_sorting_pipeline.py   --config configs/session_demo_1probe.yaml
+#   python run_exporting_pipeline.py --config configs/session_demo_1probe.yaml
 
 monkey: "Monkey neuropixel_demo"
 session: "demo"
+
+# What to do with it. The demo sorts, and exports what it sorted; there is no LF
+# band beside a bare .bin to export, so that stays off. These keys are the only
+# place those decisions live -- the flags on either driver override them for a
+# single run and change nothing here.
+kilosort_on_neuropixels: true
+export_lfp: false
+export_figures: true
+export_groups: ["good", "mua"]
 
 # Roots stop at the share; each system's directory is <root>/<monkey>/<session>.
 roots:

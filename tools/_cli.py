@@ -23,6 +23,7 @@ from spikesorting import (  # noqa: E402
     skip_reason,
     stream_label,
 )
+from spikesorting._config import with_overrides  # noqa: E402
 
 
 def default_machine() -> str:
@@ -63,9 +64,41 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     return parser
 
 
+def flag_overrides(args: argparse.Namespace) -> dict[str, object]:
+    """Session settings this run replaces, from the flags actually passed.
+
+    Every one of these is a session key first -- ``export_lfp``, ``lfp_decimate``,
+    ``export_groups``, ``export_figures``, ``kilosort_on_<system>`` -- so a
+    setting is never reachable through the command line alone. A flag changes it
+    for one run; the file keeps saying what the session actually wants.
+    """
+    overrides: dict[str, object] = {}
+
+    system = getattr(args, "system", None)
+    if system is not None:
+        for name in ("neuropixels", "blackrock"):
+            overrides[f"kilosort_on_{name}"] = name == system
+    if getattr(args, "export_lfp", False):
+        overrides["export_lfp"] = True
+    if getattr(args, "lfp_decimate", None) is not None:
+        overrides["export_lfp"] = True     # asking for a stride is asking for the export
+        overrides["lfp_decimate"] = int(args.lfp_decimate)
+    if getattr(args, "groups", None) is not None:
+        overrides["export_groups"] = tuple(args.groups)
+    if getattr(args, "no_figures", False):
+        overrides["export_figures"] = False
+
+    return overrides
+
+
 def load(args: argparse.Namespace, require_inputs: bool = True) -> SessionConfig:
-    """Load the session config and create its output folders."""
+    """Load the session config, apply any flag overrides, create its output folders."""
     config = load_session_config(args.config, args.machine)
+
+    overrides = flag_overrides(args)
+    if overrides:
+        config = with_overrides(config, **overrides)
+
     config.paths.mkdirs()
     if require_inputs and not getattr(args, "skip_checks", False):
         config.require_inputs()
@@ -79,6 +112,11 @@ def load(args: argparse.Namespace, require_inputs: bool = True) -> SessionConfig
         )
 
     print(f"session '{config.session}' on machine '{config.machine.name}'")
+    if overrides:
+        print(
+            "  overridden for this run: "
+            + ", ".join(f"{key}={value}" for key, value in sorted(overrides.items()))
+        )
     # Each system writes beside its own recording, so there are up to two trees.
     for system in ("blackrock", "neuropixels"):
         directory = config.paths.dir_for(system)

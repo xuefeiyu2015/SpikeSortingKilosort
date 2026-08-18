@@ -16,9 +16,18 @@
 monkey: "Monkey Athos"
 session: "2026-08-13"
 
+# What to do with what was recorded. Which systems recorded is derived from
+# whether their blocks below declare paths; these say what to do with them, and
+# they are the only place that decision is written down -- see "What runs".
+#
 # false = extract that system's LFP and sync pulses, but do not sort it.
 kilosort_on_neuropixels: true
 kilosort_on_blackrock: true
+
+export_lfp: false      # LF-band copy, ~7 GB/hour at 385 channels -- see "LFP"
+lfp_decimate: 1        # stride for it; 2 is safe, more aliases
+export_figures: true   # per-unit and overview PNGs at export time
+export_groups: ["good", "mua"]   # Phy cluster_group labels to export
 
 # Roots stop at the share; each system's directory is <root>/<monkey>/<session>.
 # Changes when the share moves, not per session. See "Paths" below.
@@ -41,6 +50,8 @@ blackrock:
   sync_threshold: 2.5    # rising-edge thresholds, in volts after neo scaling
   burst_threshold: 2.5
   stream_id: null        # pin one when a .nsX exposes several streams
+  gap_tolerance_ms: 10   # absorb PTP timestamp glitches -- see "The NSP clock"
+  allow_segments: false  # a larger jump is a paused recording: stop, do not guess
   cmp_file: null         # the array's own .cmp, read when probe_file is null
 
 neuropixels:
@@ -91,6 +102,30 @@ kilosort: {}
 #   A placeholder that names nothing raises on load rather than resolving to ""
 #   -- so a typo, or a {data_root} left from the old two-layer config, fails
 #   immediately instead of quietly producing "/Monkey Athos/...".
+#
+# What runs
+#   This file is where every "should it?" is written down, so a run is
+#   `--config <this file>` and nothing else. The pipelines read these keys and
+#   report the one that stopped a stage:
+#
+#     kilosort_on_<system>   false -> keep the recording, do not sort it
+#     export_lfp             false -> no LF-band export (pipeline 2)
+#     export_figures         false -> export the numbers, draw nothing
+#
+#   Each has a flag that overrides it for one run (--export-lfp, --no-figures,
+#   --lfp-decimate, --groups, --system). The flag never replaces the key: a
+#   setting reachable only from a command line is one nobody can read back off
+#   the session six months later.
+#
+# LFP
+#   Off by default because at lfp_decimate: 1 it writes an output the size of the
+#   recording -- about 7 GB per hour at 385 channels -- so it is a deliberate
+#   request, made where the data lives. Blackrock LFPs are already saved
+#   separately by Central, so this is Neuropixels only.
+#
+#   Decimation is a plain stride with no anti-alias filter. The LF band is
+#   hardware-limited to ~500 Hz at 2500 Hz sampling, so 2 (-> 1250 Hz) is safe
+#   and anything above it aliases.
 #
 # Which systems recorded
 #   Derived from whether a block declares paths, not from a flag. To say a system
@@ -145,6 +180,27 @@ kilosort: {}
 #   external file can know. probe_file is the fallback for a run with no usable
 #   .meta; with neither, setup_probe raises rather than guess a layout. Leave it
 #   null for NP 1.0 NHP long.
+#
+# The NSP clock
+#   Blackrock timestamps everything -- .nev markers, eye traces, online spikes --
+#   on the NSP's PTP clock, and the sorted spike times are put on that same axis
+#   so they can be compared with any of it. Two facts make that non-obvious, and
+#   both are measured from the recording's own per-sample timestamps rather than
+#   assumed:
+#
+#     the origin   ~1.5e9 s, not zero
+#     the rate     one measured .ns6 ran at 29999.865 Hz, not 30000 (-4.5 ppm),
+#                  which is 51 ms of error by the end of a three-hour session
+#
+#   The fit and its residual are written to nsp_time_map.json beside the sorting
+#   and beside the sync edges, and export_info.json records `timebase: "nsp"`.
+#
+#   gap_tolerance_ms exists because these files carry occasional corrupted packet
+#   timestamps -- jumps of about a millisecond, sometimes negative, which cancel
+#   within a few dozen samples -- and neo refuses to open the file at all without
+#   a tolerance. Absorbing them loses no time. A jump *larger* than the tolerance
+#   is a paused recording instead, and allow_segments decides whether sorting
+#   across it is acceptable; false stops and prints the gap table.
 #
 # Bad channels
 #   Kilosort removes the channels you list and has no detection of its own, so

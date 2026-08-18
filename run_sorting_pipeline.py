@@ -1,22 +1,23 @@
 #!/usr/bin/env python
-"""Pipeline part 1 of 2: everything up to manual curation.
+"""Pipeline part 1 of 2: sorting, and nothing else.
 
     python run_sorting_pipeline.py --config configs/Athos_2026_08_13.yaml \
            --machine windows_rig
 
-Extracts the sync edges for both systems, optionally exports the LFP, and sorts
-whichever systems asked for it. Then it **stops**, because what comes next is
-manual: curation in Phy is not scriptable, and the export stages read the labels
-it writes. Run `run_exporting_pipeline.py` afterwards.
+One stage per stream: resolve the channel map, then hand it and the recording's
+binary to Kilosort4's own ``run_kilosort``. Nothing here reads a sync pulse or
+writes an LFP -- those belong with the stages that consume them, in
+``run_exporting_pipeline.py``. Then it **stops**, because what comes next is
+manual: curation in Phy is not scriptable.
 
 Which systems run is the session's business, not this script's. A system runs
 when its block declares paths; remove the block and nothing for it runs at all.
 The one thing paths cannot say is whether to sort:
 
-    kilosort_on_<system>    false -> extract its pulses and LFP, but do not sort
+    kilosort_on_<system>    false -> keep the recording, do not sort it
 
-Only the sorting needs a GPU. Nothing here reads an edge file, so the halves can
-also be split across machines -- see --steps.
+This is the half that needs a GPU, and the only half that does -- which is what
+lets it go to a cluster while the rest stays on the rig.
 
 Exits non-zero if any stage fails. Stages that are skipped are reported and do
 not fail the run.
@@ -35,21 +36,14 @@ from _cli import Runner, build_parser, load, run_probes  # noqa: E402
 
 import spikesorting as ss  # noqa: E402
 
-STAGES = ["extract_sync", "sort"]
-
-#: Selectable but not run by default: at decimate=1 the LFP export writes a copy
-#: of the LF band the size of the recording (~7 GB/hour at 385 channels).
-OPT_IN = ["lfp"]
-
 
 def main() -> int:
     parser = build_parser(__doc__)
     parser.add_argument(
-        "--steps",
-        nargs="+",
-        default=STAGES,
-        choices=STAGES + OPT_IN,
-        help="stages to run (default: all but %s)" % ", ".join(OPT_IN),
+        "--system",
+        choices=list(ss.SYSTEMS),
+        default=None,
+        help="sort one system this run, whatever kilosort_on_* says in the session",
     )
     parser.add_argument(
         "--keep-going",
@@ -57,11 +51,9 @@ def main() -> int:
         help="continue after a failing stage instead of stopping",
     )
     parser.add_argument(
-        "--lfp-decimate",
-        type=int,
-        default=1,
-        help="decimation for --steps lfp. The LF band is hardware-limited to ~500 Hz "
-        "at 2500 Hz sampling, so 2 is safe; higher aliases (no anti-alias filter)",
+        "--dry-run",
+        action="store_true",
+        help="report the map, the binary and the settings for each stream; sort nothing",
     )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="       %(message)s")
@@ -70,61 +62,23 @@ def main() -> int:
     run = Runner(config, keep_going=args.keep_going)
     print()
 
-    # The pipeline, in order. Each verb returns what the next one takes, and
-    # returns None when the session config says not to do that work.
-    #
-    # The inner loop is the probes of a SpikeGLX run: two probes are two streams
-    # with two clocks, sorted and aligned separately. Blackrock yields one, so its
-    # stages run once however many probes the Neuropixels run holds.
+    # The whole pipeline. The inner loop is the probes of a SpikeGLX run: two
+    # probes are two streams with two clocks, sorted separately. Blackrock yields
+    # one, so it is sorted once however many probes the Neuropixels run holds.
     for system in ss.SYSTEMS:
         for probe_index in run_probes(config, system, args.probe):
-            # probe_index is passed to the verb; system= and probe= only name the
-            # status line the Runner prints.
-            where = dict(system=system, probe=probe_index)
-
-            if "extract_sync" in args.steps:
-                run(ss.extract_sync, config, system, probe_index=probe_index, **where)
-
-            if "lfp" in args.steps:
-                run(
-                    ss.extract_lfp,
-                    config,
-                    system,
-                    args.lfp_decimate,
-                    probe_index=probe_index,
-                    **where,
-                )
-
-            if "sort" in args.steps and not getattr(config, f"sorts_{system}"):
-                # Nothing here is wanted: report the one reason and move on. The
-                # steps below are the sort's own -- resolving a map and opening
-                # the recording for a system nobody asked to sort fails on a
-                # session that legitimately has neither.
-                run(ss.sort_with_kilosort, None, config, system, **where)
-
-            elif "sort" in args.steps:
-                probe = run(ss.setup_probe, config, system, probe_index=probe_index, **where)
-                if run.last_failed:
-                    continue  # no map, so loading would fail the same way
-                rec = run(
-                    ss.load_spike_continuous,
-                    config,
-                    system,
-                    probe,
-                    probe_index=probe_index,
-                    **where,
-                )
-                run(
-                    ss.sort_with_kilosort,
-                    rec,
-                    config,
-                    system,
-                    probe_index=probe_index,
-                    **where,
-                )
+            run(
+                ss.sort_with_kilosort,
+                config,
+                system,
+                probe_index,
+                dry_run=args.dry_run,
+                system=system,
+                probe=probe_index,
+            )
 
     code = run.finish("sorting pipeline")
-    if code == 0:
+    if code == 0 and not args.dry_run:
         print("\nNext, by hand:")
         print("    conda activate phy")
         for system in ss.SYSTEMS:
