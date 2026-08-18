@@ -38,6 +38,8 @@ export_lfp: false      # LF-band copy, ~7 GB/hour at 385 channels -- see "LFP"
 lfp_decimate: 1        # stride for it; 2 is safe, more aliases
 export_figures: true   # per-unit and overview PNGs at export time
 export_groups: ["good", "mua"]   # Phy cluster_group labels to export
+export_waveforms: false   # cut a snippet per spike from the sorted binary -- see
+waveform_ms: 2.0          # "Waveforms"; one full pass over the recording
 
 # Roots stop at the share; each system's directory is <root>/<monkey>/<session>.
 # Changes when the share moves, not per session. See "Paths" below.
@@ -219,6 +221,30 @@ kilosort: {}
 #   a tolerance. Absorbing them loses no time. A jump *larger* than the tolerance
 #   is a paused recording instead, and allow_segments decides whether sorting
 #   across it is acceptable; false stops and prints the gap table.
+#
+# Waveforms and the .mat products
+#   The LFP export and the waveform export are MATLAB v7.3 .mat files, one struct
+#   each, opened by load() in MATLAB and by h5py or jlab_loader in Python. MATLAB
+#   reverses dimensions, so data comes back as nChan x nSamples -- openNSx's
+#   orientation, which the lab's loaders already assume.
+#
+#   The LFP is extracted with the rest of the extraction -- it needs only the
+#   recording -- so it goes out on the probe's own clock. time_remapping then
+#   stamps t0_blackrock/fs_blackrock into the same file, rewriting a handful of
+#   small fields rather than the gigabytes of samples, so its samples end up on
+#   the same axis as spike times and event markers. `timebase` says which one is
+#   real: "stream" until the map is fitted, "blackrock" after.
+#
+#   export_waveforms decides whether the per-spike snippets are KEPT, not whether
+#   the recording is read: the mean waveform is measured either way, from the
+#   same single pass, so MeanWaveform always has a real amplitude. Keeping the
+#   snippets costs ~120 MB per million spikes. Note that this is the only
+#   waveform with physical units -- mean_template_waveform.npy is Kilosort's
+#   fitted template, in whitened units.
+#
+#   Everything derived from one sorted stream lands in one folder,
+#   <system>/<stream>/kilosort4/export/: figures, the manifest, the LFP and the
+#   three .mat products, so an analysis can be handed the directory whole.
 #
 # Bad channels
 #   Kilosort removes the channels you list and has no detection of its own, so

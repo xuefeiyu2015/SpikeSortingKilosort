@@ -7,7 +7,8 @@ sorting was produced:
 ``units.csv``         one row per unit: channel, counts, rate, ISI, waveform shape
 ``spike_times.npy``   flat spike times in seconds, Blackrock timebase if aligned
 ``spike_clusters.npy`` matching unit id per spike
-``mean_waveforms.npy`` ``(n_units, n_timepoints)`` on each unit's best channel
+``mean_template_waveform.npy`` ``(n_units, n_timepoints)`` on each unit's
+  best channel -- Kilosort's *template*, in whitened units, not a raw average
 ``isi_histograms.npz`` per-unit ISI counts and shared bin edges
 ``export_info.json``   timebase, alignment status, provenance
 ===================== =========================================================
@@ -29,8 +30,8 @@ from . import metrics
 from .curated import PhyResults
 
 __all__ = [
+    "export_sorted_spikes_mat",
     "template_for_unit",
-    "mean_template_waveform",
     "build_unit_table",
     "build_isi_histograms",
     "export_units",
@@ -70,10 +71,24 @@ def mean_template_waveform(
 
     template = results.templates[template_id]  # (n_timepoints, n_channels)
     best_local = int((template**2).sum(axis=0).argmax())
-    channel = (
-        int(results.channel_map[best_local]) if results.channel_map is not None else best_local
-    )
-    return template[:, best_local].astype(np.float64), channel
+    return template[:, best_local].astype(np.float64), best_channel(results, unit_id)
+
+
+def best_channel(results: PhyResults, unit_id: int) -> int | None:
+    """The recording channel a unit is largest on, from its template.
+
+    The peak of the template's per-channel power, mapped through ``channel_map``
+    to a row of the binary. Shared by the waveform export, which cuts snippets on
+    exactly this channel, and by :func:`mean_template_waveform`, so the two can
+    never disagree about which channel a unit belongs to.
+    """
+    if results.templates is None:
+        return None
+    template_id = template_for_unit(results, unit_id)
+    if template_id is None or template_id >= results.templates.shape[0]:
+        return None
+    local = int((results.templates[template_id] ** 2).sum(axis=0).argmax())
+    return int(results.channel_map[local]) if results.channel_map is not None else local
 
 
 def recording_window(
@@ -237,7 +252,7 @@ def export_units(
         "spike_times": out_dir / "spike_times.npy",
         "spike_samples": out_dir / "spike_samples.npy",
         "spike_clusters": out_dir / "spike_clusters.npy",
-        "mean_waveforms": out_dir / "mean_waveforms.npy",
+        "mean_template_waveform": out_dir / "mean_template_waveform.npy",
         "isi_histograms": out_dir / "isi_histograms.npz",
         "info": out_dir / "export_info.json",
     }
@@ -246,7 +261,7 @@ def export_units(
     np.save(paths["spike_times"], times_array[order])
     np.save(paths["spike_samples"], samples_array[order])
     np.save(paths["spike_clusters"], clusters_array[order])
-    np.save(paths["mean_waveforms"], waveform_array)
+    np.save(paths["mean_template_waveform"], waveform_array)
     np.savez(
         paths["isi_histograms"], counts=counts, bin_edges_ms=edges, unit_ids=np.asarray(unit_ids)
     )
@@ -267,3 +282,106 @@ def export_units(
         json.dump(info, handle, indent=2, default=str)
 
     return paths
+
+
+def export_sorted_spikes_mat(
+    out_dir: str | Path,
+    results: PhyResults,
+    unit_ids: np.ndarray,
+    spike_times_s: dict[int, np.ndarray] | None,
+    timebase: str,
+    table: pd.DataFrame,
+    waveforms: dict[str, Any] | None = None,
+    provenance: dict[str, Any] | None = None,
+    filename: str = "sorted_spikes.mat",
+) -> Path:
+    """Write the sorted spikes as the online-spike container's twin.
+
+    Field names are the ones ``jlab_loader`` reads off a ``.nev``
+    (``TimeStamps``/``Channel``/``Unit``/``Waveforms``), so the same analysis
+    code segments this product into trials without a branch. ``Unit`` holds the
+    Kilosort cluster id -- the name is for compatibility, not a claim that a
+    cluster is a Blackrock unit.
+
+    Times are seconds rather than raw ticks: they come from a fitted map, and
+    integer ticks would imply a precision the fit does not have. ``TimeRes`` is
+    carried so the tick view can be recovered.
+    """
+    from .._io.matlab import Chunked, write_mat
+
+    unit_ids = np.asarray(unit_ids)
+    times: list[np.ndarray] = []
+    samples: list[np.ndarray] = []
+    units: list[np.ndarray] = []
+    channels: list[np.ndarray] = []
+    for unit_id in unit_ids:
+        unit_id = int(unit_id)
+        mask = results.spike_clusters == unit_id
+        t = (
+            spike_times_s[unit_id]
+            if spike_times_s is not None and unit_id in spike_times_s
+            else results.times_for(unit_id)
+        )
+        times.append(np.asarray(t, dtype=np.float64))
+        samples.append(np.asarray(results.spike_samples[mask], dtype=np.int64))
+        units.append(np.full(t.size, unit_id, dtype=np.float64))
+        channel = best_channel(results, unit_id)
+        channels.append(np.full(t.size, np.nan if channel is None else channel))
+
+    def flat(parts, dtype=np.float64):
+        return np.concatenate(parts).astype(dtype) if parts else np.empty(0, dtype=dtype)
+
+    time_s = flat(times)
+    order = np.argsort(time_s, kind="stable")     # one train, in time order
+    product: dict[str, Any] = {
+        "TimeStamps": time_s[order],
+        "Channel": flat(channels)[order],
+        "Unit": flat(units)[order],
+        "spike_sample": flat(samples)[order],
+        "TimeRes": float(results.fs),
+    }
+
+    info: dict[str, Any] = {
+        "Channel_Number": np.array(
+            [
+                np.nan if best_channel(results, int(u)) is None else best_channel(results, int(u))
+                for u in unit_ids
+            ],
+            dtype=np.float64,
+        ),
+        "Unit_No": unit_ids.astype(np.float64),
+        "Label": " | ".join(str(results.labels.get(int(u), "unsorted")) for u in unit_ids),
+        "n_spikes": np.array([int((results.spike_clusters == int(u)).sum()) for u in unit_ids],
+                             dtype=np.float64),
+        "samplingrate": float(results.fs),
+        "timebase": timebase,
+    }
+    if "isi_fraction" in table:
+        info["ViolationRate"] = table["isi_fraction"].to_numpy(dtype=np.float64)
+    if provenance:
+        info.update({k: v for k, v in provenance.items() if isinstance(v, (str, float, int))})
+
+    if waveforms is not None:
+        # Measured from the raw samples, so unlike the Kilosort template these
+        # carry an amplitude. The mean is always here; the snippets only when the
+        # session asked to keep them.
+        product["MeanWaveform"] = np.asarray(waveforms["mean"], dtype=np.float32).T
+        product["StdWaveform"] = np.asarray(waveforms["std"], dtype=np.float32).T
+        product["MeanWaveformUnit"] = str(waveforms.get("units", "ADC"))
+        product["window_ms"] = float(waveforms.get("window_ms", float("nan")))
+        info["MeanWaveform_Unit_No"] = np.asarray(waveforms["unit_ids"], dtype=np.float64)
+        snippets = waveforms.get("snippets")
+        if snippets is not None:
+            # Given as (nSamp, nSpikes), which is the HDF5 shape; MATLAB reverses
+            # it and reads nSpikes x nSamp -- the online container's orientation.
+            snippets = np.asarray(snippets)
+            product["Waveforms"] = Chunked(
+                shape=snippets.shape,
+                dtype=np.int16,
+                fill=lambda dataset, s=snippets: dataset.__setitem__(slice(None), s),
+                chunks=None,
+                compression="gzip",
+            )
+
+    product["info"] = info
+    return write_mat(Path(out_dir) / filename, {"sorted_spikes": product})

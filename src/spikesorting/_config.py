@@ -427,26 +427,41 @@ class OutputPaths:
         """
         return self.aligned / stream_label("neuropixels", probe)
 
+    def export_for(self, system: str, probe: int = 0) -> Path:
+        """The copy-paste bundle for one stream: everything derived from it.
+
+        Figures, the manifest, the ``.mat`` products and the plain arrays all
+        land here, so handing the analysis a sorting means handing it one folder.
+        Computable whether or not sorting ran -- a session that only exports the
+        LFP gets a bundle holding just that, which keeps one rule instead of two.
+        """
+        return self.sorted_for(system, probe) / "export"
+
     @property
     def figures(self) -> Path:
         return self.primary / "figures"
 
     def figures_for(self, system: str, probe: int = 0) -> Path:
-        return _with_probe(self.figures / system, system, probe)
+        """Per-unit and overview plots, inside that stream's bundle."""
+        return self.export_for(system, probe) / "figures"
 
     def all(self) -> tuple[Path, ...]:
         """Every directory this session can actually write to."""
-        paths: list[Path] = [self.aligned, self.figures]
+        paths: list[Path] = [self.aligned]
         if self.neuropixels_dir is not None:
             for probe in self.npx_probes:
                 paths += [
                     self.sync_for("neuropixels", probe),
-                    self.lfp_for(probe),
                     self.sorted_for("neuropixels", probe),
+                    self.export_for("neuropixels", probe),
                     self.aligned_for(probe),
                 ]
         if self.blackrock_dir is not None:
-            paths += [self.sync_for("blackrock"), self.sorted_br]
+            paths += [
+                self.sync_for("blackrock"),
+                self.sorted_br,
+                self.export_for("blackrock"),
+            ]
         return tuple(dict.fromkeys(paths))
 
     def mkdirs(self) -> None:
@@ -489,6 +504,12 @@ class SessionConfig:
     export_figures: bool = True
     #: Which Phy ``cluster_group`` labels the export stage keeps.
     export_groups: tuple[str, ...] = ("good", "mua")
+    #: Whether to cut a waveform snippet for every spike from the sorted binary.
+    #: Off by default: it is a full pass over the recording, and Kilosort's own
+    #: output carries no snippets to reuse.
+    export_waveforms: bool = False
+    #: Width of each snippet, in milliseconds, centred on the spike sample.
+    waveform_ms: float = 2.0
     #: Period of the fine-alignment square wave, in seconds. TPrime -syncperiod.
     sync_period_s: float = 1.0
     #: Nominal interval of the coarse coded burst, in seconds.
@@ -1005,6 +1026,8 @@ def load_session_config(
         export_groups=tuple(
             str(group) for group in (data.get("export_groups") or ("good", "mua"))
         ),
+        export_waveforms=bool(data.get("export_waveforms", False)),
+        waveform_ms=float(data.get("waveform_ms", 2.0)),
         sync_period_s=float(data.get("sync_period_s", 1.0)),
         burst_interval_s=float(data.get("burst_interval_s", 14.0)),
         alignment_tolerance_s=float(data.get("alignment_tolerance_s", 1e-3)),

@@ -421,6 +421,243 @@ def test_a_utah_export_lands_on_the_nsp_clock(tmp_path, kilosort_results):
     assert info["nsp_time_map"]["drift_ppm"] == pytest.approx(-4.5, abs=0.2)
 
 
+def test_the_waveform_export_cuts_snippets_from_the_sorted_binary(tmp_path, kilosort_results):
+    # The one export that reads the recording again. Kilosort saves no snippets,
+    # so a waveform with a real amplitude can only come from the raw samples.
+    import shutil
+
+    import h5py
+
+    session = _session(
+        tmp_path,
+        "export_waveforms: true\nwaveform_ms: 2.0\n"
+        "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/HUB.ns6'\n",
+    )
+    sorted_dir = session.paths.sorted_for("blackrock", 0)
+    sorted_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(kilosort_results, sorted_dir, dirs_exist_ok=True)
+
+    # A binary long enough to hold every spike, and the run_info.json that names
+    # it -- written at sort time, so the sample indices cannot disagree with it.
+    n_chan = 8
+    spikes = np.load(sorted_dir / "spike_times.npy")
+    clusters = np.load(sorted_dir / "spike_clusters.npy")
+    peak_channel = {0: 2, 1: 5, 2: 7}                  # the fixture's templates
+    binary = tmp_path / "br" / "HUB.bin"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(0)
+    samples = rng.integers(-20, 20, size=(int(spikes.max()) + 5000, n_chan), dtype=np.int16)
+    # Plant each spike on the channel its own unit peaks on, so a snippet cut
+    # from the wrong channel would show as noise instead of a trough.
+    for s, c in zip(spikes, clusters):
+        samples[int(s), peak_channel[int(c)]] = -400
+    binary.write_bytes(samples.tobytes())
+    (sorted_dir / "run_info.json").write_text(
+        json.dumps({"binary": str(binary), "settings": {"n_chan_bin": n_chan, "fs": 30000.0}}),
+        encoding="utf-8",
+    )
+
+    out = ss.export_waveforms(session, "blackrock", 0)
+
+    assert out["n_spikes"] > 0
+    with h5py.File(out["path"], "r") as handle:
+        wf = handle["waveforms"]
+        width = int(round(2.0 * 30000.0 / 1000.0))     # 60 samples
+        # MATLAB sees nSamples x nSpikes, so on disk it is (nSpikes, nSamples).
+        assert wf["snippet"].shape == (out["n_spikes"], width)
+        assert wf["snippet"].attrs["MATLAB_class"] == b"int16"
+        assert wf["mean"].shape[1] == width
+        # each unit was cut on its own peak channel, not one shared channel
+        assert set(np.unique(wf["channel"][()])) == {2.0, 5.0, 7.0}
+        # ...and every unit's mean has the planted trough at its centre, which
+        # only holds if the snippets came from the right channel and offset.
+        mean = wf["mean"][()]                          # (n_units, width) on disk
+        assert mean.shape[0] == out["n_units"]
+        for row in mean:
+            assert int(np.argmin(row)) == width // 2
+        # This .ns6 header cannot be read, so the gain is unknown: the mean is
+        # still computed, in ADC units, and says so rather than coming back NaN.
+        assert bytes(wf["mean_units"][()].ravel().astype(np.uint8)).decode() == "ADC"
+        assert np.isnan(wf["uv_per_digit"][()]).all()
+
+
+def test_the_mean_is_measured_even_when_the_snippets_are_not_kept(
+    tmp_path, kilosort_results
+):
+    # Reading the recording is the expense, and it is the same single pass either
+    # way -- so export_waveforms decides whether the ~120 MB of snippets is kept,
+    # not whether a real mean waveform exists at all.
+    import shutil
+
+    import h5py
+
+    def run(export_waveforms: bool):
+        root = tmp_path / ("keep" if export_waveforms else "drop")
+        root.mkdir()
+        session = _session(
+            root,
+            f"export_waveforms: {'true' if export_waveforms else 'false'}\n"
+            "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/HUB.ns6'\n",
+        )
+        sorted_dir = session.paths.sorted_for("blackrock", 0)
+        sorted_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(kilosort_results, sorted_dir, dirs_exist_ok=True)
+
+        n_chan = 8
+        spikes = np.load(sorted_dir / "spike_times.npy")
+        clusters = np.load(sorted_dir / "spike_clusters.npy")
+        binary = root / "br" / "HUB.bin"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        samples = np.zeros((int(spikes.max()) + 5000, n_chan), dtype=np.int16)
+        for s, c in zip(spikes, clusters):
+            samples[int(s), {0: 2, 1: 5, 2: 7}[int(c)]] = -400
+        binary.write_bytes(samples.tobytes())
+        (sorted_dir / "run_info.json").write_text(
+            json.dumps(
+                {"binary": str(binary), "settings": {"n_chan_bin": n_chan, "fs": 30000.0}}
+            ),
+            encoding="utf-8",
+        )
+        return ss.export_waveforms(session, "blackrock", 0)
+
+    kept, dropped = run(True), run(False)
+
+    assert kept["snippets_kept"] is True
+    assert dropped["snippets_kept"] is False
+    # ...and the pass ran both times, so both have a real mean.
+    assert kept["n_spikes"] == dropped["n_spikes"] > 0
+    with h5py.File(dropped["path"], "r") as handle:
+        assert "snippet" not in handle["waveforms"]
+        assert handle["waveforms/mean"].shape[0] == dropped["n_units"]
+    with h5py.File(kept["path"], "r") as handle:
+        assert handle["waveforms/snippet"].shape[0] == kept["n_spikes"]
+
+
+def test_an_unreachable_binary_costs_the_waveforms_and_nothing_else(tmp_path, kilosort_results):
+    # A re-export where the recording is not mounted must still produce the rest
+    # of the bundle rather than failing for want of a waveform.
+    import shutil
+
+    session = _session(
+        tmp_path, "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/HUB.ns6'\n"
+    )
+    sorted_dir = session.paths.sorted_for("blackrock", 0)
+    sorted_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(kilosort_results, sorted_dir, dirs_exist_ok=True)
+    (sorted_dir / "run_info.json").write_text(
+        json.dumps({"binary": "/gone/HUB.bin", "settings": {"n_chan_bin": 8, "fs": 30000.0}}),
+        encoding="utf-8",
+    )
+
+    assert ss.export_waveforms(session, "blackrock", 0) is None
+
+
+def test_the_fitted_map_is_stamped_into_an_lfp_written_hours_earlier(tmp_path):
+    # The LF band is extracted with the rest of the extraction, before any map
+    # exists, so it goes out on the probe's own clock. The LF and AP streams of a
+    # probe share that clock, so the fit from the AP sync edges applies to it --
+    # and stamping it in must not re-read gigabytes of samples.
+    import h5py
+
+    from spikesorting._io.spikeglx import export_lfp, meta_path_for
+    from spikesorting._sync.align import LinearMap
+
+    session = _session(tmp_path)
+    n_chan, n_samp = 4, 5000
+    lf = tmp_path / "run_g0_t0.imec0.lf.bin"
+    lf.write_bytes(np.arange(n_samp * n_chan, dtype=np.int16).tobytes())
+    meta_path_for(lf).write_text(
+        f"nSavedChans={n_chan}\nimSampRate=2500\ntypeThis=imec\nfileSizeBytes=0\n"
+        f"snsApLfSy={n_chan - 1},0,1\nimAiRangeMax=0.6\nimMaxInt=512\n",
+        encoding="utf-8",
+    )
+    out = export_lfp(lf, session.paths.export_for("neuropixels", 0), decimate=1)
+
+    with h5py.File(out, "r") as handle:
+        assert bytes(handle["lfp/timebase"][()].ravel().astype(np.uint8)).decode() == "stream"
+        assert np.isnan(handle["lfp/t0_blackrock"][()]).all()
+        data_before = handle["lfp/data"][()]
+    size_before = out.stat().st_size
+
+    mapping = LinearMap(slope=1.0000045, intercept=1_521_182_029.171103,
+                        n_points=10, residuals_s=np.zeros(1))
+    stamped = ss.stamp_lfp_timebase(session, mapping, 0)
+
+    assert stamped == out
+    with h5py.File(out, "r") as handle:
+        lfp = handle["lfp"]
+        assert bytes(lfp["timebase"][()].ravel().astype(np.uint8)).decode() == "blackrock"
+        assert lfp["t0_blackrock"][()].ravel()[0] == pytest.approx(mapping.intercept)
+        assert lfp["fs_blackrock"][()].ravel()[0] == pytest.approx(2500.0 / mapping.slope)
+        # the samples were never rewritten
+        assert np.array_equal(lfp["data"][()], data_before)
+    # Growth is HDF5 object-header overhead for the handful of replaced fields --
+    # a constant, independent of how big `data` is. On a 7 GB export it is the
+    # same few kilobytes, which is the whole point of stamping rather than
+    # rewriting.
+    assert out.stat().st_size - size_before < 32_768
+
+    # ...and sample k now lands where the map says it should.
+    k = 1000
+    with h5py.File(out, "r") as handle:
+        t0b = handle["lfp/t0_blackrock"][()].ravel()[0]
+        fsb = handle["lfp/fs_blackrock"][()].ravel()[0]
+    assert t0b + k / fsb == pytest.approx(mapping.apply(np.array([k / 2500.0]))[0])
+
+
+def test_an_lfp_exported_after_alignment_picks_up_the_map_immediately(tmp_path):
+    # Re-exporting the LFP once the map exists must not need time_remapping run
+    # again: the fit is already on disk, so the new file inherits it.
+    import h5py
+
+    from spikesorting._io.spikeglx import meta_path_for
+
+    run = tmp_path / "np" / "r_g0" / "r_g0_imec0"
+    run.mkdir(parents=True, exist_ok=True)
+    n_chan = 4
+    lf = run / "r_g0_t0.imec0.lf.bin"
+    lf.write_bytes(np.arange(2000 * n_chan, dtype=np.int16).tobytes())
+    meta_path_for(lf).write_text(
+        f"nSavedChans={n_chan}\nimSampRate=2500\ntypeThis=imec\nfileSizeBytes=0\n"
+        f"snsApLfSy={n_chan - 1},0,1\nimAiRangeMax=0.6\nimMaxInt=512\n",
+        encoding="utf-8",
+    )
+
+    session = _session(
+        tmp_path,
+        "export_lfp: true\n"
+        f"neuropixels:\n  run_dir: '{tmp_path / 'np'}'\n  run_name: r\n",
+    )
+    aligned = session.paths.aligned_for(0)
+    aligned.mkdir(parents=True, exist_ok=True)
+    (aligned / "time_map.json").write_text(
+        json.dumps({"slope": 1.0000045, "intercept": 1_521_182_029.171103, "n_points": 99}),
+        encoding="utf-8",
+    )
+
+    path = ss.extract_lfp(session, "neuropixels", 0)
+
+    assert path is not None
+    with h5py.File(path, "r") as handle:
+        timebase = bytes(handle["lfp/timebase"][()].ravel().astype(np.uint8)).decode()
+        assert timebase == "blackrock"
+        assert handle["lfp/t0_blackrock"][()].ravel()[0] == pytest.approx(
+            1_521_182_029.171103
+        )
+        assert handle["lfp/fs_blackrock"][()].ravel()[0] == pytest.approx(
+            2500.0 / 1.0000045
+        )
+
+
+def test_stamping_is_a_no_op_when_no_lfp_was_exported(tmp_path):
+    from spikesorting._sync.align import LinearMap
+
+    session = _session(tmp_path)
+    mapping = LinearMap(slope=1.0, intercept=0.0, n_points=2, residuals_s=np.zeros(1))
+
+    assert ss.stamp_lfp_timebase(session, mapping, 0) is None
+
+
 def test_skip_reason_is_none_when_the_verb_will_actually_run(tmp_path):
     session = _session(tmp_path)
 

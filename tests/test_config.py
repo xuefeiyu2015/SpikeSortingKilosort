@@ -347,7 +347,12 @@ def test_every_neuropixels_output_names_its_probe(tmp_path):
     assert paths.sync_for("neuropixels", 1).parts[-2:] == ("sync", "imec1")
     assert paths.lfp_for(1).parts[-2:] == ("lfp", "imec1")
     assert paths.aligned_for(1).parts[-2:] == ("aligned", "imec1")
-    assert paths.figures_for("neuropixels", 1).parts[-3:] == ("figures", "neuropixels", "imec1")
+    # Figures live inside that stream's own bundle, so the probe is already in
+    # the path above them.
+    assert paths.figures_for("neuropixels", 1).parts[-4:] == (
+        "imec1", "kilosort4", "export", "figures",
+    )
+    assert paths.export_for("neuropixels", 1) == paths.sorted_for("neuropixels", 1) / "export"
     # ...and imec0 is written the same way, so a tree is never ambiguous about
     # which probe it came from.
     assert paths.sorted_for("neuropixels").parts[-2] == "imec0"
