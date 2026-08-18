@@ -19,11 +19,13 @@ the binary also carries the SY word, and that count goes in Kilosort's
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from .._io import spikeglx
 
-__all__ = ["probe_from_geom", "probe_from_meta"]
+__all__ = ["probe_from_geom", "probe_from_meta", "probe_from_meta_file"]
 
 
 def probe_from_geom(geom: np.ndarray, shank_pitch_um: float = 0.0) -> dict:
@@ -78,3 +80,22 @@ def probe_from_meta(meta: dict[str, str]) -> dict:
     header = spikeglx.parse_geom_header(meta)
     pitch = float(header["shank_pitch_um"]) if header else 0.0
     return probe_from_geom(geom, shank_pitch_um=pitch)
+
+
+def probe_from_meta_file(meta_path: str | Path) -> dict:
+    """Build the map by handing the ``.meta`` to probeinterface's SpikeGLX reader.
+
+    The second opinion for a meta :func:`probe_from_meta` cannot read.
+    ``probeinterface.read_spikeglx`` knows the older layouts -- geometry recovered
+    from ``~snsShankMap`` or from the imro table -- where ``~snsGeomMap`` does not
+    exist, and it knows the shank pitch per probe type rather than reading it from
+    the file. It is still the *run's own* geometry, which is the rule that matters.
+
+    Needs ``probeinterface``; the parser above needs nothing but NumPy, which is
+    why it is tried first.
+    """
+    import probeinterface as pi  # lazy: keeps this module NumPy-only until used
+
+    from .common import from_probeinterface
+
+    return from_probeinterface(pi.read_spikeglx(str(meta_path)))

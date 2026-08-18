@@ -337,7 +337,18 @@ def extract_blackrock_edges(
 
     sync_dir = config.paths.sync_for("blackrock")
     sync_dir.mkdir(parents=True, exist_ok=True)
-    reader = blackrock.open_reader(spec.sync_file)
+    reader = blackrock.open_reader(spec.sync_file, gap_tolerance_ms=spec.gap_tolerance_ms)
+
+    # Edge times go out on the NSP clock, the same axis the .nev markers and the
+    # eye traces use -- so the fitted Neuropixels map lands there too, with
+    # nothing downstream needing to know. The map is measured from this file: the
+    # .ns5 and the .ns6 are different crystals and drift differently.
+    time_map = blackrock.nsp_time_map(
+        reader, blackrock.nsx_number(spec.sync_file),
+        tolerance_s=config.alignment_tolerance_s,
+    )
+    _write_nsp_map(sync_dir, time_map, spec.sync_file)
+    report.note(f"Blackrock edge times are on the NSP clock: {time_map.summary()}")
 
     jobs = [
         (BR_1HZ, spec.sync_1hz_channel, spec.sync_threshold, config.sync_period_s * 1000.0 / 2.0),
@@ -348,7 +359,7 @@ def extract_blackrock_edges(
         if stream.n_segments > 1:
             report.note(
                 f"{spec.sync_file.name} has {stream.n_segments} segments (paused recording); "
-                "only segment 0 is extracted, and its times are relative to that segment."
+                "only segment 0 is extracted."
             )
         times = edges.stream_pulse_times(
             blackrock.iter_channel(reader, stream, chunk_samples),
@@ -356,6 +367,9 @@ def extract_blackrock_edges(
             fs=stream.fs,
             duration_ms=duration_ms,
         )
+        # stream_pulse_times counts from the first sample at the nominal rate;
+        # the map supplies the origin and the measured one.
+        times = time_map.apply(np.rint(times * stream.fs).astype(np.int64))
         report.edge_sets[name] = _finalize(
             name,
             times,
@@ -373,6 +387,21 @@ def extract_blackrock_edges(
             )
 
     return report
+
+
+def _write_nsp_map(sync_dir: Path, time_map, source: Path) -> Path:
+    """Record the clock the edge files are on, beside them.
+
+    Without this the convention is implied by the code that happened to write
+    them, and an old edge file (seconds from stream start) is indistinguishable
+    from a new one (NSP seconds) by a factor nobody can see.
+    """
+    import json
+
+    path = Path(sync_dir) / "nsp_time_map.json"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(dict(time_map.to_dict(), source=str(source)), handle, indent=2)
+    return path
 
 
 def _finalize(

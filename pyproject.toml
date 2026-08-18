@@ -30,15 +30,21 @@ dependencies = [
     # spikeinterface at all. Declaring what you import is what keeps those from
     # breaking silently if spikeinterface ever changes its reader stack.
     #
-    # The floors track what the *oldest supported spikeinterface* itself
-    # requires, so the three cannot state a combination pip could not resolve:
-    # spikeinterface 0.101.0 requires neo>=0.13.0 and probeinterface>=0.2.23.
-    # Newer spikeinterface raises them (0.104.x wants neo>=0.14.4,
-    # probeinterface>=0.3.2) and pip resolves that from whichever version is
-    # actually installed -- these floors only bind at the bottom of the range.
-    "neo>=0.13.0",
-    "probeinterface>=0.2.23",
-    "spikeinterface>=0.101",
+    # The floors are set by `gap_tolerance_ms`, which the Blackrock path passes on
+    # every read: neo raises on any timestamp jump over two sampling periods, and
+    # real PTP recordings here carry several, so without the parameter most .nsX
+    # files cannot be opened at all. It arrived in neo 0.14.4 and spikeinterface
+    # 0.104.0 -- both established by scanning the released wheels, not inferred.
+    # An older pair installs cleanly and then fails with "unexpected keyword
+    # argument" once a recording is opened, which is exactly the kind of late,
+    # environment-only break these floors exist to prevent.
+    #
+    # They also cannot state a combination pip could not resolve: spikeinterface
+    # 0.104.x itself requires neo>=0.14.4 and probeinterface>=0.3.2, which is the
+    # same neo floor arrived at independently.
+    "neo>=0.14.4",
+    "probeinterface>=0.3.2",
+    "spikeinterface>=0.104",
 ]
 
 [project.optional-dependencies]

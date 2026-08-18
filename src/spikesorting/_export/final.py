@@ -199,6 +199,7 @@ def export_units(
     counts, edges = build_isi_histograms(results, unit_ids, spike_times_s)
 
     flat_times: list[np.ndarray] = []
+    flat_samples: list[np.ndarray] = []
     flat_clusters: list[np.ndarray] = []
     waveforms: list[np.ndarray] = []
     for unit_id in unit_ids:
@@ -209,11 +210,20 @@ def export_units(
             else results.times_for(unit_id)
         )
         flat_times.append(np.asarray(times, dtype=np.float64))
+        # The sorter's own index, kept beside the seconds: it is what Phy shows,
+        # what a re-run reproduces, and the only way back to the raw binary once
+        # the times have been mapped onto another clock.
+        flat_samples.append(
+            np.asarray(results.spike_samples[results.spike_clusters == unit_id], dtype=np.int64)
+        )
         flat_clusters.append(np.full(times.size, unit_id, dtype=np.int64))
         waveform, _ = mean_template_waveform(results, unit_id)
         waveforms.append(waveform)
 
     times_array = np.concatenate(flat_times) if flat_times else np.empty(0)
+    samples_array = (
+        np.concatenate(flat_samples) if flat_samples else np.empty(0, dtype=np.int64)
+    )
     clusters_array = np.concatenate(flat_clusters) if flat_clusters else np.empty(0, dtype=np.int64)
     order = np.argsort(times_array, kind="stable")
 
@@ -225,6 +235,7 @@ def export_units(
     paths = {
         "units": out_dir / "units.csv",
         "spike_times": out_dir / "spike_times.npy",
+        "spike_samples": out_dir / "spike_samples.npy",
         "spike_clusters": out_dir / "spike_clusters.npy",
         "mean_waveforms": out_dir / "mean_waveforms.npy",
         "isi_histograms": out_dir / "isi_histograms.npz",
@@ -233,6 +244,7 @@ def export_units(
 
     table.to_csv(paths["units"], index=False)
     np.save(paths["spike_times"], times_array[order])
+    np.save(paths["spike_samples"], samples_array[order])
     np.save(paths["spike_clusters"], clusters_array[order])
     np.save(paths["mean_waveforms"], waveform_array)
     np.savez(

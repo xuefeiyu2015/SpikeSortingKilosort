@@ -258,20 +258,23 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
             ),
             PackageSpec(
                 "kilosort",
-                "sort.py:95",
+                "pipeline.py: run_kilosort, io.spikeinterface_to_binary",
                 ("sort_neuropixels", "sort_blackrock"),
                 extra="sorting",
             ),
             PackageSpec(
                 "torch",
-                "sort.py:45",
+                "pipeline.py: the sorter's device",
                 ("sort_neuropixels", "sort_blackrock"),
                 declared=False,
             ),
+            # Sorting is Kilosort's own run_kilosort on a flat binary, and SpikeGLX
+            # already writes one -- so spikeinterface is reached for the Blackrock
+            # .ns6, which is not flat, and nowhere else.
             PackageSpec(
                 "spikeinterface",
-                "_sort.py:130, _io/blackrock.py:189",
-                ("sort_blackrock", "loading either system"),
+                "pipeline.py: read_blackrock",
+                ("sort_blackrock",),
                 docs=SPIKEINTERFACE_DOCS,
             ),
             # Only io/blackrock.py reaches neo. align and validate read the edge
@@ -292,8 +295,8 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
             # handler, instead of as a line here.
             PackageSpec(
                 "probeinterface",
-                "probes/common.py:25, probes/io.py:167",
-                ("probe objects", ".prb export"),
+                "probes/common.py, probes/neuropixels.py: read_spikeglx",
+                ("probe objects", ".prb export", "geometry from an older .meta"),
                 docs=PROBEINTERFACE_DOCS,
             ),
             PackageSpec(

@@ -249,6 +249,16 @@ class BlackrockSpec:
     burst_threshold: float = 2.5
     #: Stream to read from the .nsX file (neo/SpikeInterface stream id).
     stream_id: str | None = None
+    #: Timestamp jumps up to this are absorbed; larger ones split the recording
+    #: into segments. PTP files carry occasional corrupted packet timestamps
+    #: (measured: 0.8-2 ms, some *negative*), and neo refuses to open the file at
+    #: all without a tolerance. Absorbing them loses no time -- they cancel within
+    #: a few dozen samples. See ``_io/blackrock.nsp_time_map``.
+    gap_tolerance_ms: float = 10.0
+    #: Whether to proceed when a gap *above* the tolerance splits the recording.
+    #: False refuses and prints neo's gap table: a jump that large is a paused
+    #: recording, and whether to sort across it is a decision, not a default.
+    allow_segments: bool = False
     #: The array's own .cmp wiring map. Preferred, because it describes *this*
     #: array rather than a map that might have been built from another one.
     cmp_file: Path | None = None
@@ -265,6 +275,8 @@ class BlackrockSpec:
             sync_threshold=float(data.get("sync_threshold", 2.5)),
             burst_threshold=float(data.get("burst_threshold", 2.5)),
             stream_id=data.get("stream_id"),
+            gap_tolerance_ms=float(data.get("gap_tolerance_ms", 10.0)),
+            allow_segments=bool(data.get("allow_segments", False)),
             probe_file=_as_config_path(data.get("probe_file")),
             cmp_file=_as_config_path(data.get("cmp_file")),
         )
@@ -466,6 +478,17 @@ class SessionConfig:
     # wanted for its LFP and sync pulses alone.
     kilosort_on_neuropixels: bool = True
     kilosort_on_blackrock: bool = True
+    #: Whether to export the LF band. Off unless asked for: at ``lfp_decimate: 1``
+    #: it writes a copy the size of the recording (~7 GB/hour at 385 channels).
+    export_lfp: bool = False
+    #: Stride for that export. A plain stride with no anti-alias filter, so 2
+    #: (-> 1250 Hz) is safe against a band hardware-limited to ~500 Hz and
+    #: anything above it aliases.
+    lfp_decimate: int = 1
+    #: Whether the export stage draws per-unit and overview figures.
+    export_figures: bool = True
+    #: Which Phy ``cluster_group`` labels the export stage keeps.
+    export_groups: tuple[str, ...] = ("good", "mua")
     #: Period of the fine-alignment square wave, in seconds. TPrime -syncperiod.
     sync_period_s: float = 1.0
     #: Nominal interval of the coarse coded burst, in seconds.
@@ -560,8 +583,15 @@ class SessionConfig:
 
     @property
     def sorts_blackrock(self) -> bool:
-        """Whether step 4 runs."""
-        return self.has_data("blackrock") and self.kilosort_on_blackrock
+        """Whether step 4 runs.
+
+        Needs ``spike_file`` specifically, not merely *some* Blackrock path.
+        Recording the sync channels on Blackrock while the spikes come from
+        Neuropixels is an ordinary session shape -- there is a ``sync_file`` and
+        no Utah array -- and it has nothing to sort here. ``has_data`` stays true
+        for it, because Blackrock did record and its pulses are still extracted.
+        """
+        return self.blackrock.spike_file is not None and self.kilosort_on_blackrock
 
     def _missing_probe_binaries(self) -> list[str]:
         """Every declared probe whose AP binary is not in the run folder.
@@ -969,6 +999,12 @@ def load_session_config(
         neuropixels=NeuropixelsSpec.from_dict(data.get("neuropixels") or {}),
         kilosort_on_neuropixels=bool(data.get("kilosort_on_neuropixels", True)),
         kilosort_on_blackrock=bool(data.get("kilosort_on_blackrock", True)),
+        export_lfp=bool(data.get("export_lfp", False)),
+        lfp_decimate=int(data.get("lfp_decimate", 1)),
+        export_figures=bool(data.get("export_figures", True)),
+        export_groups=tuple(
+            str(group) for group in (data.get("export_groups") or ("good", "mua"))
+        ),
         sync_period_s=float(data.get("sync_period_s", 1.0)),
         burst_interval_s=float(data.get("burst_interval_s", 14.0)),
         alignment_tolerance_s=float(data.get("alignment_tolerance_s", 1e-3)),

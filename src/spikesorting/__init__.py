@@ -8,14 +8,11 @@ Everything you run is a verb in :mod:`spikesorting.pipeline`, re-exported here::
     import spikesorting as ss
 
     config = ss.load_session_config("configs/athos.yaml", "windows_rig")
-    probe  = ss.setup_probe(config, "blackrock")
-    rec    = ss.load_spike_continuous(config, "blackrock", probe)
-    ss.sort_with_kilosort(rec, config, "blackrock")
+    ss.sort_with_kilosort(config, "blackrock")
 
 Modules prefixed with an underscore are the machinery those verbs call:
-``_config``, ``_io``, ``_probes``, ``_sync``, ``_sort``, ``_export``,
-``_plots``. Read ``pipeline.py`` first; go below it only when you
-need to know how a step works.
+``_config``, ``_io``, ``_probes``, ``_sync``, ``_export``, ``_plots``. Read
+``pipeline.py`` first; go below it only when you need to know how a step works.
 
 Environment checking lives in ``tools/`` (``doctor.py`` + ``check_env.py``): it
 inspects the machine rather than running the pipeline, so it is not part of this
@@ -25,16 +22,17 @@ package.
 from .pipeline import (  # noqa: F401
     REFERENCE_SYSTEM,
     SYSTEMS,
+    Binary,
     MachineProfile,
     OutputPaths,
     SessionConfig,
+    SortSummary,
     TimeMap,
     export_results,
     extract_lfp,
     extract_sync,
     load_machine,
     load_session_config,
-    load_spike_continuous,
     setup_probe,
     skip_reason,
     sort_with_kilosort,
@@ -49,13 +47,14 @@ __all__ = [
     "skip_reason",
     "load_session_config",
     "setup_probe",
-    "load_spike_continuous",
     "sort_with_kilosort",
     "extract_sync",
     "extract_lfp",
     "time_remapping",
     "validate_remapping",
     "export_results",
+    "Binary",
+    "SortSummary",
     "TimeMap",
     "SessionConfig",
     "MachineProfile",
