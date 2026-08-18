@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 
@@ -292,16 +291,28 @@ def test_find_run_files_missing_run_raises(tmp_path):
         spikeglx.find_run_files(tmp_path / "absent", "run")
 
 
-def test_export_lfp_writes_array_and_sidecar(tmp_path):
+def test_export_lfp_writes_a_matlab_struct(tmp_path):
+    # The lab reads these from MATLAB, so the product is a v7.3 .mat struct
+    # rather than a .npy plus a sidecar to reassemble by hand.
+    import h5py
+
     path = write_stream(tmp_path, name="run_g0_t0.imec0.lf.bin", n_chan=4, n_samples=1000)
     out = spikeglx.export_lfp(path, tmp_path / "lfp", decimate=1)
-    data = np.load(out)
-    assert data.shape == (1000, 4)
 
-    sidecar = json.loads(out.with_suffix(".json").read_text())
-    assert sidecar["fs"] == 30000.0
-    assert sidecar["n_chan"] == 4
-    assert sidecar["n_samples"] == 1000
+    assert out.suffix == ".mat"
+    assert not list(out.parent.glob("*.npy"))       # replaced, not written beside
+    with h5py.File(out, "r") as handle:
+        lfp = handle["lfp"]
+        # MATLAB reverses dimensions, so nChan x nSamples on disk is (n, chan).
+        assert lfp["data"].shape == (1000, 4)
+        assert lfp["data"].dtype == np.int16
+        assert lfp["data"].attrs["MATLAB_class"] == b"int16"
+        assert lfp["fs"][()].ravel()[0] == 30000.0
+        assert lfp["n_chan"][()].ravel()[0] == 4
+        assert lfp["n_samples"][()].ravel()[0] == 1000
+        # The gain that would turn these into microvolts is not in the meta this
+        # module reads, and a fabricated 1.0 would scale silently wrong.
+        assert np.isnan(lfp["uv_per_digit"][()]).all()
 
 
 def test_export_lfp_decimation_keeps_the_grid_anchored(tmp_path):
@@ -309,13 +320,15 @@ def test_export_lfp_decimation_keeps_the_grid_anchored(tmp_path):
     info = spikeglx.stream_info(path)
     reference = spikeglx.memmap_stream(info)[::10, :]
 
-    out = spikeglx.export_lfp(path, tmp_path / "lfp10", decimate=10, chunk_samples=333)
-    data = np.load(out)
-    assert data.shape == (100, 2)
-    assert np.array_equal(data, reference)
+    import h5py
 
-    sidecar = json.loads(out.with_suffix(".json").read_text())
-    assert sidecar["fs"] == 3000.0
+    out = spikeglx.export_lfp(path, tmp_path / "lfp10", decimate=10, chunk_samples=333)
+    with h5py.File(out, "r") as handle:
+        data = handle["lfp/data"][()]
+        assert data.shape == (100, 2)
+        assert np.array_equal(data, reference)
+        assert handle["lfp/fs"][()].ravel()[0] == 3000.0
+        assert handle["lfp/decimate"][()].ravel()[0] == 10
 
 
 def test_export_lfp_rejects_bad_decimation(tmp_path):

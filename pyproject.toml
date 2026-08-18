@@ -23,6 +23,11 @@ dependencies = [
     "pandas>=2.0",
     "matplotlib>=3.7",
     "pyyaml>=6.0",
+    # The LFP and waveform products are MATLAB v7.3, which is HDF5. Written
+    # through h5py directly rather than hdf5storage: an hour of LF band is
+    # ~7 GB, so it is streamed into the file, and hdf5storage takes the
+    # finished array as an argument.
+    "h5py>=3.0",
     # spikeinterface already requires neo and probeinterface, so these two look
     # redundant -- they are not. This package imports both *directly*
     # (io/blackrock.py:51, probes/common.py:25, probes/io.py:167), and the stages

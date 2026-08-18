@@ -142,7 +142,7 @@ def test_export_bundle_is_self_consistent(tmp_path, kilosort_results):
     assert info["n_units"] == 2
     assert info["n_spikes"] == times.size
 
-    waveforms = np.load(paths["mean_waveforms"])
+    waveforms = np.load(paths["mean_template_waveform"])
     assert waveforms.shape == (2, 61)
 
     with np.load(paths["isi_histograms"]) as bundle:
@@ -171,3 +171,73 @@ def test_template_for_unit_uses_the_modal_template(kilosort_results):
 
     results = curated.load_phy_results(kilosort_results)
     assert final.template_for_unit(results, 0) == 9
+
+
+def test_the_sorted_spikes_mat_mirrors_the_online_spike_container(tmp_path, kilosort_results):
+    """The field names and orientations jlab_loader reads off a .nev.
+
+    ``loader.py:1399-1423`` builds its online container as TimeStamps (seconds on
+    the NSP clock), Channel, Unit and a ``(nSpikes, nSamp)`` int16 Waveforms. A
+    sorted product that matches segments into trials with the same code, so these
+    are pinned rather than left to drift.
+    """
+    import h5py
+    import numpy as np
+
+    from spikesorting._export.curated import load_phy_results
+    from spikesorting._export.final import build_unit_table, export_sorted_spikes_mat
+
+    phy = load_phy_results(kilosort_results)
+    unit_ids = phy.unit_ids
+    table = build_unit_table(phy, unit_ids)
+    width, n_units = 60, unit_ids.size
+    n_spikes = int(phy.spike_samples.size)
+    waveforms = {
+        "mean": np.zeros((width, n_units), dtype=np.float32),
+        "std": np.zeros((width, n_units), dtype=np.float32),
+        "unit_ids": unit_ids,
+        "units": "microVolts",
+        "window_ms": 2.0,
+        # (nSamp, nSpikes) -- the HDF5 shape, which MATLAB reverses
+        "snippets": np.zeros((width, n_spikes), dtype=np.int16),
+    }
+
+    path = export_sorted_spikes_mat(
+        tmp_path, phy, unit_ids, None, "nsp", table, waveforms=waveforms
+    )
+
+    with h5py.File(path, "r") as handle:
+        s = handle["sorted_spikes"]
+        assert s.attrs["MATLAB_class"] == b"struct"
+        # MATLAB shape is the reverse of the stored one.
+        assert s["TimeStamps"].shape == (n_spikes, 1)      # MATLAB 1 x nSpikes
+        assert s["Channel"].shape == (n_spikes, 1)
+        assert s["Unit"].shape == (n_spikes, 1)
+        assert s["Waveforms"].shape == (width, n_spikes)   # MATLAB nSpikes x nSamp
+        assert s["Waveforms"].dtype == np.int16
+        assert s["MeanWaveform"].shape == (width, n_units)  # MATLAB nUnits x nSamp
+        assert s["TimeRes"][()].ravel()[0] == phy.fs
+        assert s["info"].attrs["MATLAB_class"] == b"struct"
+        assert set(unit_ids.tolist()) == set(np.unique(s["Unit"][()]).astype(int).tolist())
+        # times come out in one train, in order, as the online container is
+        assert np.all(np.diff(s["TimeStamps"][()].ravel()) >= 0)
+
+
+def test_the_sorted_spikes_mat_omits_waveforms_when_none_were_measured(tmp_path, kilosort_results):
+    # An unreachable recording costs the waveform fields and nothing else.
+    import h5py
+
+    from spikesorting._export.curated import load_phy_results
+    from spikesorting._export.final import build_unit_table, export_sorted_spikes_mat
+
+    phy = load_phy_results(kilosort_results)
+    table = build_unit_table(phy, phy.unit_ids)
+
+    path = export_sorted_spikes_mat(
+        tmp_path, phy, phy.unit_ids, None, "sorter", table, waveforms=None
+    )
+
+    with h5py.File(path, "r") as handle:
+        s = handle["sorted_spikes"]
+        assert "TimeStamps" in s and "Unit" in s
+        assert "Waveforms" not in s and "MeanWaveform" not in s

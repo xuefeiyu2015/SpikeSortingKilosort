@@ -10,7 +10,6 @@ carries the SMA1 1 Hz square wave used for fine alignment.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -384,19 +383,40 @@ def export_lfp(
     decimate: int = 1,
     chunk_samples: int = 10_000_000,
 ) -> Path:
-    """Write the LF band to ``out_dir`` as one int16 ``.npy`` plus a JSON sidecar.
+    """Write the LF band to ``out_dir`` as one MATLAB v7.3 ``.mat``.
 
-    Channels are columns, so ``lfp[:, k]`` is channel ``k`` -- per-channel LFP
-    without paying for hundreds of separate files. The sidecar records sampling
-    rate, channel count and the scale factor needed to recover volts.
+    The lab reads these from MATLAB and from ``jlab_loader``, so the product is a
+    struct in their convention rather than a ``.npy`` plus a sidecar to
+    reassemble by hand. **MATLAB sees ``data`` as nChan x nSamples**, which is
+    openNSx's orientation; on disk that is an HDF5 dataset of ``(n_samples,
+    n_chan)``, because MATLAB reverses dimensions -- see :mod:`.matlab`.
+
+    Streamed, never held: an hour of 385-channel LF band is ~7 GB, so the file is
+    filled a chunk at a time and gzipped on the way in.
+
+    Samples stay **int16**, as recorded. Converting to microvolts needs a
+    per-channel gain from ``~imroTbl`` that nothing here parses, so
+    ``uv_per_digit`` is NaN rather than invented: a NaN propagates loudly through
+    any scaling, where a fabricated 1.0 would quietly produce plausible, wrong
+    numbers. ``ai_range_max`` and ``max_int`` are carried so the conversion can be
+    finished downstream.
+
+    This is **extraction**, so it runs beside the other extraction and needs
+    nothing but the recording -- on the rig, straight after the session. The axis
+    it writes is therefore this stream's own, and ``timebase`` says ``stream``.
+    :func:`spikesorting.pipeline.stamp_lfp_timebase` fills in the Blackrock axis
+    later, once ``time_remapping`` has fitted the map, by rewriting a handful of
+    small fields rather than these gigabytes.
 
     Blackrock LFPs are already saved separately by Central, so this is for
     Neuropixels ``.lf.bin`` streams.
     """
+    from .matlab import Chunked, write_mat
+
     info = stream_info(lf_bin)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{info.path.stem}.lfp.npy"
+    out_path = out_dir / f"{info.path.stem}.lfp.mat"
 
     if decimate < 1:
         raise ValueError("decimate must be >= 1")
@@ -404,35 +424,65 @@ def export_lfp(
     n_out = (info.n_samples + decimate - 1) // decimate
     n_chan = info.n_chan
     source = memmap_stream(info)
-    result = np.lib.format.open_memmap(
-        out_path, mode="w+", dtype=np.int16, shape=(n_out, n_chan)
-    )
 
-    written = 0
-    for start in range(0, info.n_samples, chunk_samples):
-        stop = min(start + chunk_samples, info.n_samples)
-        # Keep the decimation grid anchored to sample 0 across chunk boundaries.
-        first = start if start % decimate == 0 else start + (decimate - start % decimate)
-        if first >= stop:
-            continue
-        block = source[first:stop:decimate, :]
-        result[written : written + block.shape[0], :] = block
-        written += block.shape[0]
-    result.flush()
+    def fill(dataset) -> None:
+        written = 0
+        for start in range(0, info.n_samples, chunk_samples):
+            stop = min(start + chunk_samples, info.n_samples)
+            # Keep the decimation grid anchored to sample 0 across chunk boundaries.
+            first = start if start % decimate == 0 else start + (decimate - start % decimate)
+            if first >= stop:
+                continue
+            block = source[first:stop:decimate, :]
+            dataset[written : written + block.shape[0], :] = block
+            written += block.shape[0]
+        if written != n_out:
+            raise RuntimeError(
+                f"wrote {written} samples but the stream implies {n_out}; the "
+                "decimation grid and the file length disagree"
+            )
 
     range_key, max_key = _SCALE_KEYS[info.stream_type]
-    sidecar = {
-        "source": str(info.path),
-        "fs": info.fs / decimate,
-        "decimate": decimate,
-        "n_samples": int(written),
-        "n_chan": n_chan,
-        "sy_index": info.sy_index,
-        "ai_range_max": float(info.meta.get(range_key, "nan")),
-        "max_int": float(info.meta.get(max_key, "nan")),
-        "note": "int16, channels in columns; volts = value * ai_range_max / max_int / gain",
-    }
-    with open(out_path.with_suffix(".json"), "w", encoding="utf-8") as handle:
-        json.dump(sidecar, handle, indent=2)
 
+    fs_out = info.fs / decimate
+    nan = float("nan")
+
+    write_mat(
+        out_path,
+        {
+            "lfp": {
+                "data": Chunked(
+                    shape=(n_out, n_chan),
+                    dtype=np.int16,
+                    fill=fill,
+                    chunks=(min(65536, n_out), n_chan),
+                ),
+                "fs": fs_out,
+                "t0": 0.0,
+                "timebase": "stream",
+                "fs_blackrock": nan,
+                "t0_blackrock": nan,
+                "blackrock_slope": nan,
+                "blackrock_intercept": nan,
+                "decimate": float(decimate),
+                "n_samples": float(n_out),
+                "n_chan": float(n_chan),
+                "channel_ids": np.arange(n_chan, dtype=np.float64),
+                "uv_per_digit": np.full(n_chan, np.nan),
+                "ai_range_max": float(info.meta.get(range_key, "nan")),
+                "max_int": float(info.meta.get(max_key, "nan")),
+                "sy_index": float(info.sy_index if info.sy_index is not None else -1),
+                "source": str(info.path),
+                "note": (
+                    "data is int16, nChan x nSamples in MATLAB; channel_ids are "
+                    "0-based rows of the source binary. Sample k is at "
+                    "t0 + k/fs on this stream's own clock, and at "
+                    "t0_blackrock + k/fs_blackrock on Blackrock's when timebase "
+                    "is 'blackrock' (NaN when no time map had been fitted yet). "
+                    "volts = value * ai_range_max / max_int / gain, and the "
+                    "per-channel gain lives in the meta's ~imroTbl"
+                ),
+            }
+        },
+    )
     return out_path

@@ -76,6 +76,8 @@ __all__ = [
     "time_remapping",
     "validate_remapping",
     "export_results",
+    "export_waveforms",
+    "stamp_lfp_timebase",
     "Binary",
     "SortSummary",
     "TimeMap",
@@ -113,6 +115,7 @@ def skip_reason(config: SessionConfig, verb: Any, system: str | None = None) -> 
         "extract_sync",
         "extract_lfp",
         "export_results",
+        "export_waveforms",
     }:
         if not config.has_data(system):
             return f"no {system} paths declared in the session"
@@ -709,6 +712,79 @@ def _dry_run(
     return report
 
 
+def _waveform_fields(measured: dict | None) -> dict | None:
+    """The waveform arrays in the shape the .mat writer wants, or None."""
+    if measured is None:
+        return None
+    result = measured["result"]
+    return {
+        "mean": result.mean,
+        "std": result.std,
+        "unit_ids": result.unit_ids,
+        "units": measured.get("mean_units", "ADC"),
+        "window_ms": measured.get("window_ms", float("nan")),
+        # Not transposed: Chunked takes the HDF5 shape, and MATLAB reverses it.
+        # (width, n_spikes) on disk is what MATLAB reads as nSpikes x nSamp,
+        # which is the orientation the online .nev container uses.
+        "snippets": result.snippets if measured.get("snippets_kept") else None,
+    }
+
+
+def _write_summary(
+    config: SessionConfig,
+    system: str,
+    probe_index: int,
+    out_dir: Path,
+    timebase: str,
+    unit_ids: np.ndarray,
+    measured: dict | None,
+) -> Path:
+    """The manifest that makes the bundle self-describing.
+
+    What ran, on what, and where everything it used came from -- so a folder
+    copied to another machine still says which recording produced it and which
+    time map its spike times are on.
+    """
+    results_dir = config.paths.sorted_for(system, probe_index)
+    run_info_path = results_dir / "run_info.json"
+    run_info = {}
+    if run_info_path.exists():
+        with open(run_info_path, "r", encoding="utf-8") as handle:
+            run_info = json.load(handle)
+
+    aligned_dir = config.paths.aligned_for(probe_index)
+    payload = {
+        "session": config.session,
+        "system": system,
+        "stream": stream_label(system, probe_index),
+        "sorter": config.sorter,
+        "timebase": timebase,
+        "n_units_exported": int(np.asarray(unit_ids).size),
+        "waveforms": (
+            {
+                "n_spikes": measured["n_spikes"],
+                "n_dropped": measured["n_dropped"],
+                "snippets_kept": measured["snippets_kept"],
+                "units": measured.get("mean_units"),
+            }
+            if measured
+            else "not measured: the sorted binary was not reachable"
+        ),
+        "sorting": run_info,
+        "inputs": {
+            "sorted_dir": str(results_dir),
+            "aligned_dir": str(aligned_dir) if aligned_dir.exists() else None,
+            "time_map": str(aligned_dir / "time_map.json")
+            if (aligned_dir / "time_map.json").exists()
+            else None,
+        },
+    }
+    path = out_dir / "sorting_summary_info.json"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, default=str)
+    return path
+
+
 def _write_run_info(
     config: SessionConfig,
     system: str,
@@ -795,11 +871,84 @@ def extract_lfp(config: SessionConfig, system: str, probe_index: int = 0) -> Pat
     if files["lf"] is None:
         return None
 
+    # Into the stream's own bundle, beside the sorting it will be analysed with.
+    # sorted_for is computable whether or not sorting ran, so a session that only
+    # exports the LFP still has one predictable home for it.
     path = spikeglx.export_lfp(
-        files["lf"], config.paths.lfp_for(probe_index), decimate=decimate
+        files["lf"], config.paths.export_for("neuropixels", probe_index), decimate=decimate
     )
     log.info("wrote %s%s", path, f" (decimated {decimate}x)" if decimate > 1 else "")
+
+    # If a map was already fitted -- a re-export after alignment -- put it on the
+    # Blackrock clock now rather than making the caller run time_remapping again.
+    # Otherwise time_remapping stamps it when it runs.
+    mapping = _fitted_map(config, probe_index)
+    if mapping is not None:
+        stamp_lfp_timebase(config, mapping, probe_index)
     return path
+
+
+def _fitted_map(config: SessionConfig, probe_index: int) -> align.LinearMap | None:
+    """This probe's fitted time map, if ``time_remapping`` has already run."""
+    map_path = config.paths.aligned_for(probe_index) / "time_map.json"
+    if not map_path.exists():
+        return None
+    with open(map_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return align.LinearMap(
+        slope=float(payload["slope"]),
+        intercept=float(payload["intercept"]),
+        n_points=int(payload.get("n_points", 0)),
+        residuals_s=np.empty(0),
+    )
+
+
+def stamp_lfp_timebase(
+    config: SessionConfig, mapping: align.LinearMap, probe_index: int = 0
+) -> Path | None:
+    """Put the fitted map into an LFP export that was written before it existed.
+
+    The LF band is extracted with the rest of the extraction, hours before there
+    is a time map -- so it goes out on the probe's own clock. The LF and AP
+    streams of a probe share that clock, so the fit from the AP stream's sync
+    edges applies to it unchanged, and this fills in the Blackrock axis
+    afterwards.
+
+    Only the small fields are rewritten. The samples are gigabytes and are never
+    re-read: see :func:`spikesorting._io.matlab.update_mat`.
+
+    Returns the file it stamped, or ``None`` when this probe has no LFP export.
+    """
+    from ._io.matlab import update_mat
+
+    lfp_dir = config.paths.export_for("neuropixels", probe_index)
+    exports = sorted(lfp_dir.glob("*.lfp.mat")) if lfp_dir.exists() else []
+    if not exports:
+        return None
+
+    import h5py
+
+    stamped = None
+    for path in exports:
+        with h5py.File(path, "r") as handle:
+            fs = float(np.asarray(handle["lfp/fs"][()]).ravel()[0])
+        # t_blackrock(k) = slope * (k / fs) + intercept, another uniform axis:
+        # rate fs / slope, origin at the intercept.
+        update_mat(
+            path,
+            {
+                "lfp": {
+                    "timebase": "blackrock",
+                    "fs_blackrock": fs / mapping.slope,
+                    "t0_blackrock": mapping.intercept,
+                    "blackrock_slope": mapping.slope,
+                    "blackrock_intercept": mapping.intercept,
+                }
+            },
+        )
+        log.info("stamped the Blackrock timebase into %s", path.name)
+        stamped = path
+    return stamped
 
 
 def _load_edges(config: SessionConfig, name: str, probe_index: int = 0) -> np.ndarray | None:
@@ -940,6 +1089,7 @@ def time_remapping(
     if not spike_times_path.exists():
         log.info("no sorting at %s; wrote the time map only", results_dir)
         _save_map(aligned_dir, mapping, offset, config)
+        stamp_lfp_timebase(config, mapping, probe_index)
         return TimeMap(mapping, offset, "map_only", burst_match=match)
 
     from ._export.curated import parse_params_py
@@ -979,6 +1129,7 @@ def time_remapping(
         method = "linear_fit"
 
     _save_map(aligned_dir, mapping, offset, config)
+    stamp_lfp_timebase(config, mapping, probe_index)
     return TimeMap(mapping, offset, method, aligned_path=out_path, burst_match=match)
 
 
@@ -1077,6 +1228,197 @@ def validate_remapping(
 
 
 # ----------------------------------------------------------------------------
+# Step 6a: waveforms from the raw samples
+# ----------------------------------------------------------------------------
+
+
+def _binary_blocks(path: Path, n_chan: int, overlap: int, block_samples: int = 2_000_000):
+    """Walk a flat int16 recording in order, yielding ``(start, samples)``.
+
+    Consecutive blocks overlap by ``overlap`` samples so a spike whose window
+    straddles a boundary is still wholly inside one of them. Row ranges of a
+    memmap are contiguous reads; it is *column* slices that turn into scattered
+    page faults, which is the distinction :mod:`._io.spikeglx` was rewritten
+    around.
+    """
+    data = np.memmap(path, dtype=np.int16, mode="r").reshape(-1, n_chan)
+    for start in range(0, data.shape[0], block_samples):
+        yield start, data[start : start + block_samples + overlap]
+
+
+def _uv_per_digit(config: SessionConfig, system: str, n_chan: int) -> tuple[np.ndarray, str]:
+    """Per-channel microvolts per ADC unit, and a note on where it came from.
+
+    Blackrock records the gain per channel and neo reports it, so those snippets
+    come out in real microvolts. SpikeGLX keeps the neural gain in ``~imroTbl``,
+    which nothing here parses, so those come back NaN rather than 1.0 -- a NaN
+    propagates loudly through any scaling, where a fabricated unit gain would
+    quietly produce plausible, wrong amplitudes.
+    """
+    if system == "blackrock" and config.blackrock.spike_file is not None:
+        from ._io import blackrock
+
+        try:
+            reader = blackrock.open_reader(
+                config.blackrock.spike_file,
+                gap_tolerance_ms=config.blackrock.gap_tolerance_ms,
+            )
+            channels = reader.header["signal_channels"]
+            gains = np.asarray(channels["gain"], dtype=np.float64)
+            units = {str(u) for u in channels["units"]}
+        except Exception as error:
+            # The snippets come from the transformed binary, which is present;
+            # only the scale is lost. Falling over here would throw away a
+            # finished pass over the recording for a header we cannot read.
+            log.warning(
+                "could not read the gain from %s (%s: %s); snippets stay in ADC units",
+                config.blackrock.spike_file, type(error).__name__, error,
+            )
+        else:
+            if gains.size >= n_chan:
+                return (
+                    gains[:n_chan],
+                    f"gain per channel from the .ns6 header, units {sorted(units)}",
+                )
+    return (
+        np.full(n_chan, np.nan),
+        "gain unknown -- SpikeGLX keeps it in ~imroTbl, which is not parsed here, "
+        "and a Blackrock header that will not open says nothing either; snippets "
+        "stay raw int16 and the mean is in those units",
+    )
+
+
+def export_waveforms(
+    config: SessionConfig, system: str = "blackrock", probe_index: int = 0
+) -> dict | None:
+    """Measure every spike's waveform from the binary the sorter read.
+
+    Kilosort saves templates, not snippets: ``templates.npy`` is the shape it
+    *fitted*, in whitened units, so nothing else in the export has a real
+    amplitude. These are measured from the raw samples, and their per-unit mean
+    does.
+
+    **The mean is always computed; only the snippets are optional.** Reading the
+    recording is the expense and it is the same single pass either way, so
+    ``export_waveforms`` decides whether the ~120 MB per million snippets is
+    *kept*, not whether the pass happens. ``waveform_ms`` sets the window.
+
+    Returns ``None`` when there is no sorting to read, or when the binary the
+    sorting was made from is not reachable -- the rest of the export is still
+    worth having, so that is a warning rather than a failure.
+    """
+    _check(system)
+    if not config.has_data(system):
+        return None
+
+    from ._export.curated import load_phy_results, select_units
+    from ._export.final import best_channel
+    from ._export.waveforms import accumulate, plan_snippets
+    from ._io.matlab import write_mat
+
+    results_dir = config.paths.sorted_for(system, probe_index)
+    info_path = results_dir / "run_info.json"
+    if not (results_dir / "spike_times.npy").exists() or not info_path.exists():
+        log.info("no sorting with a run_info.json in %s", results_dir)
+        return None
+
+    with open(info_path, "r", encoding="utf-8") as handle:
+        run_info = json.load(handle)
+    binary = Path(run_info["binary"])
+    n_chan = int(run_info["settings"]["n_chan_bin"])
+    fs = float(run_info["settings"]["fs"])
+    if not binary.exists():
+        log.warning(
+            "the binary this sorting read is gone (%s), so there is nothing to "
+            "measure a waveform from; the rest of the export is unaffected",
+            binary,
+        )
+        return None
+
+    phy = load_phy_results(results_dir)
+    unit_ids = select_units(phy, tuple(config.export_groups))
+    channel_for_unit = {
+        int(u): best_channel(phy, int(u))
+        for u in unit_ids
+        if best_channel(phy, int(u)) is not None
+    }
+    if not channel_for_unit:
+        log.warning("no unit has a template to pick a channel from; nothing to cut")
+        return None
+
+    width = max(2, int(round(config.waveform_ms * fs / 1000.0)))
+    before = width // 2
+    after = width - before
+    n_samples = binary.stat().st_size // (2 * n_chan)
+
+    plan = plan_snippets(
+        phy.spike_samples, phy.spike_clusters, channel_for_unit, n_samples, before, after
+    )
+    scale, scale_note = _uv_per_digit(config, system, n_chan)
+    # An unknown gain must not destroy the mean: the shape and the relative
+    # amplitude are still worth having, and on SpikeGLX the gain is never known
+    # here. uv_per_digit stays NaN so nobody mistakes ADC units for microvolts,
+    # and mean_units says which one the mean is in.
+    known = not np.isnan(scale).all()
+    mean_units = "uV" if known else "ADC"
+    log.info(
+        "cutting %d snippets of %d samples from %s (%s; mean in %s)",
+        plan.n_spikes, width, binary.name, scale_note, mean_units,
+    )
+    result = accumulate(
+        plan,
+        _binary_blocks(binary, n_chan, width),
+        uv_per_digit=scale if known else 1.0,
+    )
+    for note in result.notes:
+        log.warning("%s", note)
+
+    out_dir = results_dir / "export"
+    out_path = out_dir / f"{config.session}_waveforms.mat"
+    write_mat(
+        out_path,
+        {
+            "waveforms": {
+                **({"snippet": result.snippets} if config.export_waveforms else {}),
+                "unit_id": plan.unit_id.astype(np.float64),
+                "channel": plan.channel.astype(np.float64),
+                "spike_sample": plan.sample.astype(np.float64),
+                "mean": result.mean,
+                "std": result.std,
+                "mean_unit_id": result.unit_ids.astype(np.float64),
+                "n_spikes": result.n_per_unit.astype(np.float64),
+                "uv_per_digit": scale,
+                "mean_units": mean_units,
+                "fs": fs,
+                "window_ms": float(config.waveform_ms),
+                "samples_before": float(before),
+                "n_dropped": float(plan.n_dropped),
+                "source": str(binary),
+                "kept_snippets": float(bool(config.export_waveforms)),
+                "note": (
+                    "snippet is int16, nSamples x nSpikes in MATLAB, and is "
+                    "present only when export_waveforms is true; mean and std "
+                    f"are nSamples x nUnits in {mean_units}, measured from the raw "
+                    "samples rather than from Kilosort's templates. "
+                    f"{scale_note}"
+                ),
+            }
+        },
+    )
+    log.info("wrote %s", out_path)
+    return {
+        "path": out_path,
+        "n_spikes": plan.n_spikes,
+        "n_units": int(result.unit_ids.size),
+        "n_dropped": plan.n_dropped,
+        "snippets_kept": bool(config.export_waveforms),
+        "mean_units": mean_units,
+        "window_ms": float(config.waveform_ms),
+        "result": result,
+    }
+
+
+# ----------------------------------------------------------------------------
 # Step 6: export
 # ----------------------------------------------------------------------------
 
@@ -1154,7 +1496,9 @@ def export_results(
             log.info("NSP clock: %s", time_map.summary())
     log.info("timebase: %s", timebase)
 
-    out_dir = aligned_dir if timebase == "blackrock" else results_dir / "export"
+    # One bundle per stream, so an analysis gets a folder rather than a tour of
+    # three trees. aligned/ stays where it is: the time map is cross-system.
+    out_dir = config.paths.export_for(system, probe_index)
     paths = final.export_units(
         out_dir,
         phy,
@@ -1170,6 +1514,28 @@ def export_results(
         },
     )
     log.info("exported %d units -> %s", unit_ids.size, out_dir)
+
+    # The same spikes in the format the lab's online-spike code already reads,
+    # plus the measured waveform when the recording was reachable.
+    measured = export_waveforms(config, system, probe_index)
+    table = final.build_unit_table(phy, unit_ids, spike_times_s)
+    mat_path = final.export_sorted_spikes_mat(
+        out_dir,
+        phy,
+        unit_ids=unit_ids,
+        spike_times_s=spike_times_s,
+        timebase=timebase,
+        table=table,
+        waveforms=_waveform_fields(measured),
+        provenance={
+            "session": config.session,
+            "system": system,
+            "stream": stream_label(system, probe_index),
+        },
+        filename=f"{config.session}_sorted_spikes.mat",
+    )
+    log.info("wrote %s", mat_path.name)
+    _write_summary(config, system, probe_index, out_dir, timebase, unit_ids, measured)
 
     if figures and unit_ids.size:
         figure_dir = config.paths.figures_for(system, probe_index)

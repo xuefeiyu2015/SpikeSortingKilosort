@@ -8,6 +8,9 @@
                          stream, to its own sync/. CatGT where the machine has
                          it, always the NumPy detector, and the two compared.
     lfp                  the LF band, when the session says export_lfp: true.
+                         Extraction only -- it goes out on the probe's own clock,
+                         and time_remapping stamps the Blackrock axis into it
+                         afterwards without re-reading the samples.
     time_remapping       coarse offset from the 14 s bursts, then a fine fit on
                          the 1 Hz train, onto Blackrock time. Blackrock is the
                          reference timebase; this maps onto it, never the reverse.
@@ -40,7 +43,16 @@ from _cli import Runner, build_parser, load, run_probes  # noqa: E402
 
 import spikesorting as ss  # noqa: E402
 
-STAGES = ["extract_sync", "lfp", "time_remapping", "validate_remapping", "export_results"]
+STAGES = [
+    # Extraction first: everything below reads what it writes.
+    "extract_sync",
+    "lfp",
+    "time_remapping",
+    "validate_remapping",
+    "export_results",
+    # Last, because it is the one stage here that re-reads the recording.
+    "waveforms",
+]
 
 
 def main() -> int:
@@ -78,9 +90,24 @@ def main() -> int:
         default=None,
         help="override the session's export_groups (Phy cluster_group labels)",
     )
+    parser.add_argument(
+        "--export-waveforms",
+        action="store_true",
+        help="cut a snippet per spike this run, whatever export_waveforms says",
+    )
     parser.add_argument("--no-figures", action="store_true", help="skip figure generation")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="       %(message)s")
+
+    # An LFP on the probe's own clock cannot be compared with anything else that
+    # was recorded, so asking for it asks for the map that fixes that. Harmless
+    # when it cannot run: with one system declared, or with no edge files yet,
+    # time_remapping reports why and the LFP stays on stream time.
+    steps = list(args.steps)
+    if "lfp" in steps and "time_remapping" not in steps:
+        steps.append("time_remapping")
+        print("note: --steps lfp also runs time_remapping, which puts the LFP on "
+              "Blackrock time; without it the export is on the probe's own clock")
 
     config = load(args, require_inputs=False)
     run = Runner(config, keep_going=args.keep_going)
@@ -91,7 +118,7 @@ def main() -> int:
     # mapped and validated on its own; Blackrock yields one stream and is not
     # re-read per probe.
     for stage, verb in (("extract_sync", ss.extract_sync), ("lfp", ss.extract_lfp)):
-        if stage not in args.steps:
+        if stage not in steps:
             continue
         for system in ss.SYSTEMS:
             for probe_index in run_probes(config, system, args.probe):
@@ -99,7 +126,7 @@ def main() -> int:
 
     # Blackrock is the reference timebase, so it is what the other system is
     # mapped *onto* rather than a system to remap.
-    if "time_remapping" in args.steps:
+    if "time_remapping" in steps:
         for system in ss.SYSTEMS:
             for probe_index in run_probes(config, system, args.probe):
                 run(
@@ -111,7 +138,7 @@ def main() -> int:
                     probe=probe_index,
                 )
 
-    if "validate_remapping" in args.steps:
+    if "validate_remapping" in steps:
         for probe_index in run_probes(config, "neuropixels", args.probe):
             run(
                 ss.validate_remapping,
@@ -122,11 +149,24 @@ def main() -> int:
                 probe=probe_index,
             )
 
-    if "export_results" in args.steps:
+    if "export_results" in steps:
         for system in ss.SYSTEMS:
             for probe_index in run_probes(config, system, args.probe):
                 run(
                     ss.export_results,
+                    config,
+                    system,
+                    probe_index,
+                    system=system,
+                    probe=probe_index,
+                )
+
+    # Last: the only stage here that re-reads the recording itself.
+    if "waveforms" in steps:
+        for system in ss.SYSTEMS:
+            for probe_index in run_probes(config, system, args.probe):
+                run(
+                    ss.export_waveforms,
                     config,
                     system,
                     probe_index,
