@@ -7,7 +7,14 @@
 # test pins that: the two resolve to the same session apart from those, so a value
 # tuned in one and not the other fails rather than drifting.
 #
-#   python run_sorting_pipeline.py --config configs/Athos_2026_08_13.yaml \
+#   python run_sorting_pipeline.py --config configs/session_template_2probes.yaml \
+#          --machine windows_rig
+#   # curate in Phy, 
+#   conda activate phy
+#   cd {rootpath}/{monkey}/{session}/{system}/kilosort4/ (directory where params.py stored)
+#   phy template-gui params.py
+# then:
+#   python run_exporting_pipeline.py --config configs/session_template_2probes.yaml \
 #          --machine windows_rig
 #
 # A new session means editing five values: monkey, session, the two Blackrock

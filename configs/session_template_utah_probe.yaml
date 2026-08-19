@@ -1,9 +1,15 @@
 # Template for a real recording session. Copy to configs/<session>.yaml and edit.
 # Copies are gitignored; this template is tracked.
 #
-#   python run_sorting_pipeline.py --config configs/Athos_2026_08_13.yaml \
+#   python run_sorting_pipeline.py --config configs/session_template_utah_probe.yaml \
 #          --machine windows_rig
-#
+# curation in phy
+#   conda activate phy
+#   cd {rootpath}/{monkey}/{session}/{system}/kilosort4/ (directory where params.py stored)
+#   phy template-gui params.py
+# after curation
+#  python run_exporting_pipeline.py --config configs/session_template_utah_only.yaml \
+#          --machine windows_rig
 # A new session means editing five values: monkey, session, the two Blackrock
 # filenames, and the SpikeGLX run name. Each block puts what changes first and
 # fences off what does not. Below a fence are the defaults -- change one only if
