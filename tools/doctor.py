@@ -1218,6 +1218,114 @@ def check_session(config: SessionConfig) -> list[Check]:
     return checks
 
 
+def compute_band_fraction(
+    path: Path, n_chan: int, fs: float, cutoff: float, seconds: float = 4.0
+) -> float:
+    """Fraction of a recording's power that sits *below* ``cutoff``. Pure.
+
+    Reads one contiguous stretch from the middle of the binary -- where a
+    recording is likeliest to be running normally -- and returns the mean
+    across channels. Row ranges of a memmap are contiguous, so this is one small
+    sequential read even on a share.
+    """
+    import numpy as np
+    from scipy.signal import welch
+
+    data = np.memmap(path, dtype=np.int16, mode="r").reshape(-1, n_chan)
+    want = int(seconds * fs)
+    if data.shape[0] < want:
+        want = data.shape[0]
+    start = max((data.shape[0] - want) // 2, 0)
+    chunk = np.asarray(data[start : start + want], dtype=np.float64)
+    chunk -= chunk.mean(axis=0)
+
+    freqs, power = welch(chunk, fs=fs, nperseg=min(4096, chunk.shape[0]), axis=0)
+    below = power[freqs < cutoff].sum(axis=0)
+    return float(np.mean(below / power.sum(axis=0)))
+
+
+#: Below this fraction of sub-cutoff power, a stream is already the spike band.
+_BAND_ALREADY_FILTERED = 0.25
+
+
+def check_recorded_band(config: SessionConfig) -> list[Check]:
+    """Does each system's recording actually hold the band its config assumes?
+
+    ``waveforms.highpass_hz`` defaults to 300 Hz on Blackrock and to nothing on
+    Neuropixels, because ``.ns6`` is the broadband group and an AP binary arrives
+    high-passed from the probe. **Neither is guaranteed**: NP 1.0's AP filter is
+    a programmable imro bit, NP 2.0 has no AP/LF split at all, and a Blackrock
+    sampling group's band is set in Central. So measure it rather than assume it.
+
+    A run recorded with the AP filter off looks exactly like a normal one until
+    its mean waveforms come out sitting on the LFP, which is the failure this
+    turns into a line of output before the job instead.
+    """
+    checks: list[Check] = []
+    for system in ("blackrock", "neuropixels"):
+        if not config.has_data(system):
+            continue
+        for probe in config.probe_indices(system):
+            binary = config.paths.sorted_for(system, probe) / "run_info.json"
+            if not binary.exists():
+                continue
+            try:
+                info = json.loads(binary.read_text(encoding="utf-8"))
+                source = Path(info["binary"])
+                n_chan = int(info["settings"]["n_chan_bin"])
+                fs = float(info["settings"]["fs"])
+            except Exception as error:
+                checks.append(Check(
+                    f"recorded band ({system})", WARN,
+                    f"could not read {binary}: {type(error).__name__}",
+                    section="Session",
+                ))
+                continue
+            if not source.exists():
+                continue
+
+            wanted = config.waveforms_for(system).highpass_hz
+            cutoff = float(wanted or 300.0)
+            try:
+                fraction = compute_band_fraction(source, n_chan, fs, cutoff)
+            except Exception as error:
+                checks.append(Check(
+                    f"recorded band ({system})", WARN,
+                    f"could not measure {source.name}: {type(error).__name__}: {error}",
+                    section="Session",
+                ))
+                continue
+
+            broadband = fraction >= _BAND_ALREADY_FILTERED
+            detail = (
+                f"{source.name}: {fraction:.0%} of power below {cutoff:g} Hz "
+                f"-- {'broadband' if broadband else 'already the spike band'}"
+            )
+            if broadband and wanted is None:
+                checks.append(Check(
+                    f"recorded band ({system})", WARN, detail, section="Session",
+                    fix=(
+                        f"set {system}.waveforms.highpass_hz: {cutoff:g} -- this "
+                        "stream still carries the LFP, so its mean waveform will "
+                        "sit on it"
+                    ),
+                ))
+            elif not broadband and wanted is not None:
+                checks.append(Check(
+                    f"recorded band ({system})", WARN, detail, section="Session",
+                    fix=(
+                        f"set {system}.waveforms.highpass_hz: null -- this stream "
+                        "is already high-passed, so filtering it again cascades a "
+                        "second rolloff onto the first"
+                    ),
+                ))
+            else:
+                checks.append(
+                    Check(f"recorded band ({system})", OK, detail, section="Session")
+                )
+    return checks
+
+
 def run_all(
     machine: MachineProfile,
     config: SessionConfig | None = None,
@@ -1247,6 +1355,7 @@ def run_all(
     checks.extend(check_machine_paths(machine))
     if config is not None:
         checks.extend(check_session(config))
+        checks.extend(check_recorded_band(config))
     return checks
 
 

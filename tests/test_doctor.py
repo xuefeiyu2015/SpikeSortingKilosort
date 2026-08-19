@@ -942,3 +942,102 @@ def test_a_session_that_does_not_sort_needs_no_channel_map(tmp_path):
 
     assert not [c for c in checks if "probe" in c.detail.lower()]
     assert doctor.exit_code(checks) == 0
+
+
+# ---------------------------------------------------------------------------
+# Recorded band: the measurement the waveform defaults rest on
+# ---------------------------------------------------------------------------
+
+
+def _write_band_binary(path, fs, n_chan, kind: str):
+    """A broadband recording, or one already high-passed like an AP band."""
+    import numpy as np
+
+    n = int(4 * fs)
+    t = np.arange(n) / fs
+    rng = np.random.default_rng(0)
+    spikes = rng.normal(0, 60, size=(n, n_chan))
+    if kind == "broadband":
+        lfp = 900.0 * np.sin(2 * np.pi * 7.0 * t)[:, None]
+        signal = spikes + lfp
+    else:
+        signal = spikes
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(np.asarray(signal, dtype=np.int16).tobytes())
+
+
+def test_the_band_a_recording_holds_is_measured_not_assumed(tmp_path):
+    # 300 Hz on Blackrock and nothing on Neuropixels are defaults about *settings*
+    # -- NP 1.0's AP filter is an imro bit, a Blackrock group's band is set in
+    # Central -- so they have to be checkable against the actual file.
+    import doctor
+
+    fs, n_chan = 30000.0, 4
+    broad, spike_band = tmp_path / "broad.bin", tmp_path / "ap.bin"
+    _write_band_binary(broad, fs, n_chan, "broadband")
+    _write_band_binary(spike_band, fs, n_chan, "highpassed")
+
+    below_broad = doctor.compute_band_fraction(broad, n_chan, fs, 300.0)
+    below_ap = doctor.compute_band_fraction(spike_band, n_chan, fs, 300.0)
+
+    assert below_broad > doctor._BAND_ALREADY_FILTERED > below_ap
+
+
+def test_a_broadband_stream_with_no_highpass_configured_is_reported(tmp_path):
+    # The failure this exists to catch: a run that looks normal until its mean
+    # waveforms come out sitting on the LFP.
+    import json
+
+    import doctor
+
+    fs, n_chan = 30000.0, 4
+    from spikesorting import _config as cfg
+
+    (tmp_path / "machines").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "machines" / "m.yaml").write_text(
+        f"cache_dir: '{tmp_path / 'c'}'\n", encoding="utf-8"
+    )
+    (tmp_path / "off.yaml").write_text(
+        f"session: s\nblackrock_dir: '{tmp_path}'\n"
+        f"blackrock:\n  spike_file: '{tmp_path / 'HUB.ns6'}'\n"
+        "  waveforms:\n    highpass_hz: null\n",
+        encoding="utf-8",
+    )
+    session = cfg.load_session_config(tmp_path / "off.yaml", "m", tmp_path)
+    sorted_dir = session.paths.sorted_for("blackrock", 0)
+    sorted_dir.mkdir(parents=True, exist_ok=True)
+    binary = tmp_path / "raw" / "HUB.bin"
+    _write_band_binary(binary, fs, n_chan, "broadband")
+    (sorted_dir / "run_info.json").write_text(
+        json.dumps({"binary": str(binary), "settings": {"n_chan_bin": n_chan, "fs": fs}}),
+        encoding="utf-8",
+    )
+
+    checks = doctor.check_recorded_band(session)
+
+    assert [c.status for c in checks] == [doctor.WARN]
+    assert "broadband" in checks[0].detail
+    assert "highpass_hz: 300" in (checks[0].fix or "")
+    # Advisory, not blocking: the export still produces a usable mean.
+    assert doctor.exit_code(checks) == 0
+
+
+def test_a_spike_band_stream_that_matches_its_config_is_fine(tmp_path):
+    import json
+
+    import doctor
+
+    fs, n_chan = 30000.0, 4
+    session = _blackrock_session(tmp_path)      # blackrock defaults to 300 Hz
+    sorted_dir = session.paths.sorted_for("blackrock", 0)
+    sorted_dir.mkdir(parents=True, exist_ok=True)
+    binary = tmp_path / "raw" / "HUB.bin"
+    _write_band_binary(binary, fs, n_chan, "broadband")
+    (sorted_dir / "run_info.json").write_text(
+        json.dumps({"binary": str(binary), "settings": {"n_chan_bin": n_chan, "fs": fs}}),
+        encoding="utf-8",
+    )
+
+    checks = doctor.check_recorded_band(session)
+
+    assert [c.status for c in checks] == [doctor.OK]

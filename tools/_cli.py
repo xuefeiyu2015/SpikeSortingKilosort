@@ -68,7 +68,7 @@ def flag_overrides(args: argparse.Namespace) -> dict[str, object]:
     """Session settings this run replaces, from the flags actually passed.
 
     Every one of these is a session key first -- ``export_lfp``, ``lfp_decimate``,
-    ``export_groups``, ``export_figures``, ``export_waveforms``,
+    ``export_groups``, ``export_figures``, ``waveforms.export_snippets``,
     ``kilosort_on_<system>`` -- so a
     setting is never reachable through the command line alone. A flag changes it
     for one run; the file keeps saying what the session actually wants.
@@ -87,7 +87,9 @@ def flag_overrides(args: argparse.Namespace) -> dict[str, object]:
     if getattr(args, "groups", None) is not None:
         overrides["export_groups"] = tuple(args.groups)
     if getattr(args, "export_waveforms", False):
-        overrides["export_waveforms"] = True
+        # Nested: the waveform settings are per system, and a flag applies to
+        # this run rather than to one system's band. with_overrides fans it out.
+        overrides["waveforms"] = {"export_snippets": True}
     if getattr(args, "no_figures", False):
         overrides["export_figures"] = False
 

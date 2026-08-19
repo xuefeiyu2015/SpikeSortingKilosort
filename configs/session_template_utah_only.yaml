@@ -46,8 +46,6 @@ kilosort_on_blackrock: true
 
 export_figures: true   # per-unit and overview PNGs at export time
 export_groups: ["good", "mua"]   # Phy cluster_group labels to export
-export_waveforms: false   # cut a snippet per spike from the sorted binary -- see
-waveform_ms: 2.0          # "Waveforms"; one full pass over the recording
 #
 # No export_lfp either: that stage is Neuropixels-only. Blackrock LFPs are
 # already saved separately by Central.
@@ -75,6 +73,13 @@ blackrock:
   gap_tolerance_ms: 10   # absorb PTP timestamp glitches -- see "The NSP clock"
   allow_segments: false  # a larger jump is a paused recording: stop, do not guess
   cmp_file: null         # the array's own .cmp, read when probe_file is null
+  waveforms:             # the mean-waveform export -- see "Waveforms"
+    window_ms: 2.0       # snippet width, centred on the spike sample
+    max_spikes: 2000     # per unit, spread over the session; null = every spike
+    highpass_hz: 300     # .ns6 is broadband, so measure the band Kilosort sorted
+    highpass_order: 3    # zero-phase Butterworth
+    filter_pad_ms: 10.0  # read either side and discard, so no filter transient
+    export_snippets: false   # keep per-spike snippets: ~120 MB per million
 
 # Kilosort settings shared by both systems; the blackrock block above is merged
 # over this one. Empty means Kilosort's defaults. See "Kilosort settings".
@@ -182,12 +187,33 @@ kilosort: {}
 #   the same axis as spike times and event markers. `timebase` says which one is
 #   real: "stream" until the map is fitted, "blackrock" after.
 #
-#   export_waveforms decides whether the per-spike snippets are KEPT, not whether
-#   the recording is read: the mean waveform is measured either way, from the
-#   same single pass, so MeanWaveform always has a real amplitude. Keeping the
-#   snippets costs ~120 MB per million spikes. Note that this is the only
-#   waveform with physical units -- mean_template_waveform.npy is Kilosort's
-#   fitted template, in whitened units.
+#   waveforms.export_snippets decides whether the per-spike snippets are KEPT,
+#   not whether the recording is read: the mean waveform is measured either way,
+#   so MeanWaveform always has a real amplitude. Keeping the snippets costs
+#   ~120 MB per million spikes. Note that this is the only waveform with physical
+#   units -- mean_template_waveform.npy is Kilosort's fitted template, in
+#   whitened units.
+#
+#   waveforms.highpass_hz is per system because it describes the BAND THAT WAS
+#   RECORDED, and that is a setting rather than a property. Kilosort sorts what
+#   its own 300 Hz pass produces and Phy displays a 150 Hz-filtered trace, so a
+#   mean cut from a broadband recording is neither of them -- every snippet rides
+#   on the LFP, and averaging does not remove it. Blackrock .ns6 is the broadband
+#   30 kHz group (Central's high-pass is applied on the way to the .nev, not to
+#   the .ns6), so it filters. A Neuropixels AP binary arrives already high-passed
+#   on the probe, so it does not: filtering again would cascade a second rolloff.
+#   Neither is guaranteed -- NP 1.0's AP filter is a programmable imro bit, NP 2.0
+#   has no AP/LF split at all, and a Blackrock sampling group's band is set in
+#   Central -- so check the recording rather than trusting the default.
+#
+#   waveforms.max_spikes caps how many spikes each unit contributes, chosen
+#   uniformly over the RECORDING rather than over the spike list: every k-th
+#   spike would hand you a subset dominated by whichever task the unit fired
+#   hardest in. The mean's error falls as 1/sqrt(n), so a couple of thousand
+#   spikes is already past the point where more changes the answer, while the
+#   reading is what costs. null measures every spike. Each measured spike is
+#   exported with its spike_time_s and the timebase it is on, so a snippet can be
+#   placed against the .nev markers and attributed to a task.
 #
 #   Everything derived from one sorted stream lands in one folder,
 #   <system>/<stream>/kilosort4/export/: figures, the manifest, the LFP and the
