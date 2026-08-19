@@ -93,7 +93,7 @@ def main() -> int:
     parser.add_argument(
         "--export-waveforms",
         action="store_true",
-        help="cut a snippet per spike this run, whatever export_waveforms says",
+        help="keep a snippet per spike this run, whatever the session says",
     )
     parser.add_argument("--no-figures", action="store_true", help="skip figure generation")
     args = parser.parse_args()

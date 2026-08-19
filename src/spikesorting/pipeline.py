@@ -763,9 +763,12 @@ def _write_summary(
         "waveforms": (
             {
                 "n_spikes": measured["n_spikes"],
+                "n_available": measured.get("n_available"),
                 "n_dropped": measured["n_dropped"],
                 "snippets_kept": measured["snippets_kept"],
                 "units": measured.get("mean_units"),
+                "highpass_hz": measured.get("highpass_hz"),
+                "timebase": measured.get("timebase"),
             }
             if measured
             else "not measured: the sorted binary was not reachable"
@@ -1232,16 +1235,74 @@ def validate_remapping(
 # ----------------------------------------------------------------------------
 
 
-def _binary_blocks(path: Path, n_chan: int, overlap: int, block_samples: int = 2_000_000):
+def _resolve_spike_seconds(
+    config: SessionConfig, system: str, probe_index: int, phy
+) -> tuple[np.ndarray | None, str, object | None]:
+    """``(seconds_per_spike, timebase, nsp_time_map)`` for one sorted stream.
+
+    Flat and parallel to ``spike_times.npy``, so a caller can split it per unit
+    or index it down to a subset of spikes.
+
+    **One place, because two files in the same folder must agree.**
+    ``sorted_spikes.mat`` and ``waveforms.mat`` both carry spike times, and a
+    reader has every right to assume they are on the same axis. Deriving that
+    axis twice is how they would quietly stop being.
+
+    Order: the cross-system alignment if it ran; otherwise, for Blackrock, the
+    NSP clock measured from the file's own timestamps -- which is not the axis
+    Kilosort's sample indices imply, and is the one the .nev markers and eye
+    traces are already on. Neither present leaves times in the sorter's timebase.
+    """
+    results_dir = config.paths.sorted_for(system, probe_index)
+    aligned_path = (
+        config.paths.aligned_for(probe_index) / f"{system}_spike_seconds_blackrock.npy"
+    )
+    if aligned_path.exists():
+        aligned = np.load(aligned_path)
+        if aligned.size == phy.spike_samples.size:
+            return aligned, "blackrock", None
+        log.warning(
+            "aligned times (%d) do not match spike count (%d); exporting in the "
+            "sorter timebase instead",
+            aligned.size, phy.spike_samples.size,
+        )
+    elif system == "blackrock":
+        time_map = read_nsp_time_map(results_dir)
+        if time_map is not None:
+            log.info("NSP clock: %s", time_map.summary())
+            return time_map.apply(phy.spike_samples), "nsp", time_map
+    return None, "sorter", None
+
+
+def _binary_blocks(
+    path: Path,
+    n_chan: int,
+    overlap: int,
+    block_samples: int = 2_000_000,
+    regions: list[tuple[int, int]] | None = None,
+):
     """Walk a flat int16 recording in order, yielding ``(start, samples)``.
 
-    Consecutive blocks overlap by ``overlap`` samples so a spike whose window
-    straddles a boundary is still wholly inside one of them. Row ranges of a
-    memmap are contiguous reads; it is *column* slices that turn into scattered
-    page faults, which is the distinction :mod:`._io.spikeglx` was rewritten
-    around.
+    Without ``regions``, consecutive blocks overlap by ``overlap`` samples so a
+    spike whose window straddles a boundary is still wholly inside one of them.
+
+    With ``regions`` -- the merged ranges from ``_export.waveforms.snippet_regions``
+    -- only those are yielded, still in increasing offset order. That is the
+    difference between reading the whole file and reading the parts that hold a
+    spike being measured: filtering forces a block to be *materialised*, so
+    walking the file in 2M-sample steps would turn today's sparse read into a
+    full one. Sequential order is kept either way, because it is what a share
+    rewards.
+
+    Row ranges of a memmap are contiguous reads; it is *column* slices that turn
+    into scattered page faults, which is the distinction :mod:`._io.spikeglx` was
+    rewritten around.
     """
     data = np.memmap(path, dtype=np.int16, mode="r").reshape(-1, n_chan)
+    if regions is not None:
+        for start, stop in regions:
+            yield start, data[start:stop]
+        return
     for start in range(0, data.shape[0], block_samples):
         yield start, data[start : start + block_samples + overlap]
 
@@ -1300,8 +1361,16 @@ def export_waveforms(
 
     **The mean is always computed; only the snippets are optional.** Reading the
     recording is the expense and it is the same single pass either way, so
-    ``export_waveforms`` decides whether the ~120 MB per million snippets is
-    *kept*, not whether the pass happens. ``waveform_ms`` sets the window.
+    ``waveforms.export_snippets`` decides whether the ~120 MB per million
+    snippets is *kept*, not whether the recording is read.
+
+    **How much of the recording is read is bounded by the spikes, not the file.**
+    ``waveforms.max_spikes`` caps the spikes per unit -- chosen uniformly over the
+    session, so the subset spans it rather than clustering where the unit was
+    busiest -- and only the ranges holding those spikes are read. Everything else
+    about the cut lives in the same per-system ``waveforms:`` block: the window,
+    the high-pass, and the pad that keeps the filter's transient out of the kept
+    samples.
 
     Returns ``None`` when there is no sorting to read, or when the binary the
     sorting was made from is not reachable -- the rest of the export is still
@@ -1313,7 +1382,7 @@ def export_waveforms(
 
     from ._export.curated import load_phy_results, select_units
     from ._export.final import best_channel
-    from ._export.waveforms import accumulate, plan_snippets
+    from ._export.waveforms import accumulate, plan_snippets, snippet_regions
     from ._io.matlab import write_mat
 
     results_dir = config.paths.sorted_for(system, probe_index)
@@ -1346,14 +1415,26 @@ def export_waveforms(
         log.warning("no unit has a template to pick a channel from; nothing to cut")
         return None
 
-    width = max(2, int(round(config.waveform_ms * fs / 1000.0)))
+    wf = config.waveforms_for(system)
+    width = max(2, int(round(wf.window_ms * fs / 1000.0)))
     before = width // 2
     after = width - before
     n_samples = binary.stat().st_size // (2 * n_chan)
+    # Read either side of each snippet and throw it away, so the samples that are
+    # kept carry no filter transient. Nothing to pad when nothing is filtered.
+    pad = int(round(wf.filter_pad_ms * fs / 1000.0)) if wf.highpass_hz else 0
 
     plan = plan_snippets(
-        phy.spike_samples, phy.spike_clusters, channel_for_unit, n_samples, before, after
+        phy.spike_samples,
+        phy.spike_clusters,
+        channel_for_unit,
+        n_samples,
+        before,
+        after,
+        max_per_unit=wf.max_spikes,
+        margin=pad,
     )
+    regions = snippet_regions(plan, pad)
     scale, scale_note = _uv_per_digit(config, system, n_chan)
     # An unknown gain must not destroy the mean: the shape and the relative
     # amplitude are still worth having, and on SpikeGLX the gain is never known
@@ -1361,17 +1442,37 @@ def export_waveforms(
     # and mean_units says which one the mean is in.
     known = not np.isnan(scale).all()
     mean_units = "uV" if known else "ADC"
+    band = (
+        f"high-passed at {wf.highpass_hz:g} Hz" if wf.highpass_hz else "unfiltered"
+    )
     log.info(
-        "cutting %d snippets of %d samples from %s (%s; mean in %s)",
-        plan.n_spikes, width, binary.name, scale_note, mean_units,
+        "cutting %d of %d spikes (%d samples each) from %s in %d range(s); "
+        "%s, %s, mean in %s",
+        plan.n_spikes, plan.n_available, width, binary.name, len(regions),
+        band, scale_note, mean_units,
     )
     result = accumulate(
         plan,
-        _binary_blocks(binary, n_chan, width),
+        _binary_blocks(binary, n_chan, width, regions=regions),
         uv_per_digit=scale if known else 1.0,
+        highpass_hz=wf.highpass_hz,
+        fs=fs,
+        highpass_order=wf.highpass_order,
+        pad=pad,
     )
     for note in result.notes:
         log.warning("%s", note)
+
+    # Which spikes these were, on the axis the .nev markers and eye traces are
+    # already on -- so a snippet can be attributed to the task it happened in.
+    # Same resolver export_results uses, so the two .mat files in this folder
+    # cannot end up on different clocks.
+    seconds, timebase, _ = _resolve_spike_seconds(config, system, probe_index, phy)
+    spike_time_s = (
+        seconds[plan.spike_index].astype(np.float64)
+        if seconds is not None
+        else plan.sample.astype(np.float64) / fs
+    )
 
     out_dir = results_dir / "export"
     out_path = out_dir / f"{config.session}_waveforms.mat"
@@ -1379,10 +1480,13 @@ def export_waveforms(
         out_path,
         {
             "waveforms": {
-                **({"snippet": result.snippets} if config.export_waveforms else {}),
+                **({"snippet": result.snippets} if wf.export_snippets else {}),
                 "unit_id": plan.unit_id.astype(np.float64),
                 "channel": plan.channel.astype(np.float64),
                 "spike_sample": plan.sample.astype(np.float64),
+                "spike_index": plan.spike_index.astype(np.float64),
+                "spike_time_s": spike_time_s,
+                "timebase": timebase,
                 "mean": result.mean,
                 "std": result.std,
                 "mean_unit_id": result.unit_ids.astype(np.float64),
@@ -1390,17 +1494,35 @@ def export_waveforms(
                 "uv_per_digit": scale,
                 "mean_units": mean_units,
                 "fs": fs,
-                "window_ms": float(config.waveform_ms),
+                "window_ms": float(wf.window_ms),
                 "samples_before": float(before),
                 "n_dropped": float(plan.n_dropped),
+                "n_available": float(plan.n_available),
+                "max_spikes_per_unit": (
+                    float(wf.max_spikes) if wf.max_spikes is not None else np.nan
+                ),
+                "highpass_hz": (
+                    float(wf.highpass_hz) if wf.highpass_hz is not None else np.nan
+                ),
+                "highpass_order": float(wf.highpass_order),
+                "filter_pad_ms": float(wf.filter_pad_ms) if pad else 0.0,
                 "source": str(binary),
-                "kept_snippets": float(bool(config.export_waveforms)),
+                "kept_snippets": float(bool(wf.export_snippets)),
                 "note": (
                     "snippet is int16, nSamples x nSpikes in MATLAB, and is "
-                    "present only when export_waveforms is true; mean and std "
-                    f"are nSamples x nUnits in {mean_units}, measured from the raw "
-                    "samples rather than from Kilosort's templates. "
-                    f"{scale_note}"
+                    "present only when waveforms.export_snippets is true; mean "
+                    f"and std are nSamples x nUnits in {mean_units}, measured "
+                    "from the recording rather than from Kilosort's templates. "
+                    f"Signal was {band}. "
+                    + (
+                        f"Measured from {plan.n_spikes} of {plan.n_available} "
+                        "spikes, sampled uniformly over the recording rather "
+                        "than over the spike list, so the subset spans the "
+                        "session. "
+                        if wf.max_spikes is not None
+                        else "Measured from every spike. "
+                    )
+                    + f"spike_time_s is on the {timebase} timebase. {scale_note}"
                 ),
             }
         },
@@ -1409,11 +1531,14 @@ def export_waveforms(
     return {
         "path": out_path,
         "n_spikes": plan.n_spikes,
+        "n_available": plan.n_available,
         "n_units": int(result.unit_ids.size),
         "n_dropped": plan.n_dropped,
-        "snippets_kept": bool(config.export_waveforms),
+        "snippets_kept": bool(wf.export_snippets),
         "mean_units": mean_units,
-        "window_ms": float(config.waveform_ms),
+        "window_ms": float(wf.window_ms),
+        "highpass_hz": wf.highpass_hz,
+        "timebase": timebase,
         "result": result,
     }
 
@@ -1464,36 +1589,10 @@ def export_results(
         "curated" if phy.curated else "not curated in Phy", groups,
     )
 
-    aligned_dir = config.paths.aligned_for(probe_index)
-    aligned_path = aligned_dir / f"{system}_spike_seconds_blackrock.npy"
+    seconds, timebase, time_map = _resolve_spike_seconds(config, system, probe_index, phy)
     spike_times_s: dict[int, np.ndarray] | None = None
-    timebase = "sorter"
-    time_map = None
-    if aligned_path.exists():
-        aligned = np.load(aligned_path)
-        if aligned.size != phy.spike_samples.size:
-            log.warning(
-                "aligned times (%d) do not match spike count (%d); exporting in the "
-                "sorter timebase instead",
-                aligned.size, phy.spike_samples.size,
-            )
-        else:
-            spike_times_s = {int(uid): aligned[phy.spike_clusters == uid] for uid in unit_ids}
-            timebase = "blackrock"
-    elif system == "blackrock":
-        # No second system to align against, but the Utah array still has a clock
-        # of its own -- and it is not the one Kilosort's sample indices imply.
-        # nsp_time_map.json carries the origin (~1.5e9 s) and the measured rate;
-        # without it these times cannot be compared to the .nev markers or the
-        # eye traces recorded beside them.
-        time_map = read_nsp_time_map(results_dir)
-        if time_map is not None:
-            mapped = time_map.apply(phy.spike_samples)
-            spike_times_s = {
-                int(uid): mapped[phy.spike_clusters == uid] for uid in unit_ids
-            }
-            timebase = "nsp"
-            log.info("NSP clock: %s", time_map.summary())
+    if seconds is not None:
+        spike_times_s = {int(uid): seconds[phy.spike_clusters == uid] for uid in unit_ids}
     log.info("timebase: %s", timebase)
 
     # One bundle per stream, so an analysis gets a folder rather than a tour of

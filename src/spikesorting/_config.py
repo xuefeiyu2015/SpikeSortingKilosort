@@ -230,6 +230,70 @@ class MachineProfile:
 
 
 @dataclass(frozen=True)
+class WaveformSpec:
+    """How the waveform export cuts and filters snippets, for one system.
+
+    Every number the export uses lives here, so a session file is the whole
+    record of how a mean waveform was produced. It is a *per-system* block
+    because the one setting that matters most -- whether to high-pass -- depends
+    on which band the recording holds, and that differs by system and by rig.
+
+    **The high-pass is not optional cleanup; it is what makes the mean comparable
+    to anything else.** Kilosort sorts what its own 300 Hz pass produces and Phy
+    displays a 150 Hz-filtered trace, so a mean cut from a *broadband* recording
+    is neither. Blackrock ``.ns6`` is the broadband 30 kHz group, so it defaults
+    to 300 Hz. A Neuropixels AP binary arrives already high-passed on the probe,
+    so it defaults to ``None`` -- filtering it again would only cascade a second
+    rolloff onto the first.
+
+    Neither default is physics: NP 1.0's AP filter is a programmable imro bit and
+    a Blackrock sampling group's band is set in Central. Both are therefore
+    settable, which is the point of the block.
+    """
+
+    #: Snippet width in milliseconds, centred on the spike sample.
+    window_ms: float = 2.0
+    #: Spikes per unit to measure, spread uniformly over the *recording* rather
+    #: than over the spike list -- see ``_export.waveforms.plan_snippets``. None
+    #: measures every spike, which is the only way to get an every-spike mean.
+    max_spikes: int | None = 2000
+    #: Zero-phase Butterworth high-pass applied before cutting. None disables it.
+    highpass_hz: float | None = 300.0
+    #: Order of that filter.
+    highpass_order: int = 3
+    #: Extra signal read either side of a snippet and discarded after filtering,
+    #: so the kept samples carry no filter transient. Phy and Kilosort both skip
+    #: this and filter the bare window instead.
+    filter_pad_ms: float = 10.0
+    #: Whether the per-spike snippets are *kept*. The recording is read either
+    #: way -- the mean needs it -- so this only decides ~120 MB per million.
+    export_snippets: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None, default: "WaveformSpec") -> "WaveformSpec":
+        """Parse a ``waveforms:`` block, falling back to ``default`` per key.
+
+        ``default`` rather than the field defaults, so each system keeps its own
+        starting point and a block that states only one key changes only that.
+        """
+        data = data or {}
+        max_spikes = data.get("max_spikes", default.max_spikes)
+        highpass = data.get("highpass_hz", default.highpass_hz)
+        return cls(
+            window_ms=float(data.get("window_ms", default.window_ms)),
+            max_spikes=int(max_spikes) if max_spikes is not None else None,
+            highpass_hz=float(highpass) if highpass is not None else None,
+            highpass_order=int(data.get("highpass_order", default.highpass_order)),
+            filter_pad_ms=float(data.get("filter_pad_ms", default.filter_pad_ms)),
+            export_snippets=bool(data.get("export_snippets", default.export_snippets)),
+        )
+
+
+#: The Neuropixels starting point: the AP band is high-passed on the probe.
+_NPX_WAVEFORMS = WaveformSpec(highpass_hz=None)
+
+
+@dataclass(frozen=True)
 class BlackrockSpec:
     """Blackrock inputs.
 
@@ -264,6 +328,9 @@ class BlackrockSpec:
     cmp_file: Path | None = None
     #: Probe JSON from make_probe.py, used when no cmp_file is given.
     probe_file: Path | None = None
+    #: How the waveform export cuts and filters this system's snippets. The
+    #: .ns6 group is broadband, so the default high-passes.
+    waveforms: WaveformSpec = field(default_factory=WaveformSpec)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "BlackrockSpec":
@@ -279,6 +346,7 @@ class BlackrockSpec:
             allow_segments=bool(data.get("allow_segments", False)),
             probe_file=_as_config_path(data.get("probe_file")),
             cmp_file=_as_config_path(data.get("cmp_file")),
+            waveforms=WaveformSpec.from_dict(data.get("waveforms"), WaveformSpec()),
         )
 
 
@@ -319,6 +387,9 @@ class NeuropixelsSpec:
     #: the map from. The .meta wins where it exists: it records which sites were
     #: actually active, which a file built from another run cannot know.
     probe_file: Path | None = None
+    #: How the waveform export cuts and filters this system's snippets. The AP
+    #: band arrives high-passed from the probe, so the default does not filter.
+    waveforms: WaveformSpec = field(default_factory=lambda: _NPX_WAVEFORMS)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "NeuropixelsSpec":
@@ -342,6 +413,7 @@ class NeuropixelsSpec:
             burst_threshold_v=(float(thresh[0]), float(thresh[1])),
             burst_pulse_ms=int(data.get("burst_pulse_ms", 0)),
             probe_file=_as_config_path(data.get("probe_file")),
+            waveforms=WaveformSpec.from_dict(data.get("waveforms"), _NPX_WAVEFORMS),
         )
 
 
@@ -504,12 +576,6 @@ class SessionConfig:
     export_figures: bool = True
     #: Which Phy ``cluster_group`` labels the export stage keeps.
     export_groups: tuple[str, ...] = ("good", "mua")
-    #: Whether to cut a waveform snippet for every spike from the sorted binary.
-    #: Off by default: it is a full pass over the recording, and Kilosort's own
-    #: output carries no snippets to reuse.
-    export_waveforms: bool = False
-    #: Width of each snippet, in milliseconds, centred on the spike sample.
-    waveform_ms: float = 2.0
     #: Period of the fine-alignment square wave, in seconds. TPrime -syncperiod.
     sync_period_s: float = 1.0
     #: Nominal interval of the coarse coded burst, in seconds.
@@ -575,6 +641,17 @@ class SessionConfig:
         if system != "blackrock":
             merged.update(self.kilosort_by_probe.get(probe_index) or {})
         return merged
+
+    def waveforms_for(self, system: str) -> WaveformSpec:
+        """How to cut and filter waveforms for one system.
+
+        A plain lookup rather than a merge: unlike ``kilosort:``, every key here
+        already differs by system or is identical everywhere, so a shared layer
+        would only add a place for the two to disagree silently.
+        """
+        if system not in ("blackrock", "neuropixels"):
+            raise ValueError(f"unknown system {system!r}")
+        return self.blackrock.waveforms if system == "blackrock" else self.neuropixels.waveforms
 
     def has_data(self, system: str) -> bool:
         """Did this system record? Derived from whether its paths are *declared*.
@@ -808,6 +885,15 @@ _REMOVED_KEYS = {
         "every batch; set do_CAR / highpass_cutoff under 'kilosort:' instead"
     ),
     "kilosort_settings": "renamed to 'kilosort:', and settable per system",
+    "waveform_ms": (
+        "moved into a per-system 'waveforms:' block as window_ms -- the whole "
+        "waveform export is configured there now, because whether to high-pass "
+        "depends on which band that system recorded"
+    ),
+    "export_waveforms": (
+        "moved into a per-system 'waveforms:' block as export_snippets -- see "
+        "waveform_ms above. The --export-waveforms flag is unchanged"
+    ),
     "exclude_channels": (
         "the probe already drops channels its chanMap does not cover, and this "
         "ran first, shifting every contact after the excluded one. A broken "
@@ -1026,8 +1112,6 @@ def load_session_config(
         export_groups=tuple(
             str(group) for group in (data.get("export_groups") or ("good", "mua"))
         ),
-        export_waveforms=bool(data.get("export_waveforms", False)),
-        waveform_ms=float(data.get("waveform_ms", 2.0)),
         sync_period_s=float(data.get("sync_period_s", 1.0)),
         burst_interval_s=float(data.get("burst_interval_s", 14.0)),
         alignment_tolerance_s=float(data.get("alignment_tolerance_s", 1e-3)),
@@ -1042,5 +1126,23 @@ def load_session_config(
 
 
 def with_overrides(config: SessionConfig, **overrides: Any) -> SessionConfig:
-    """Return a copy of ``config`` with fields replaced (CLI flag support)."""
-    return replace(config, **overrides)
+    """Return a copy of ``config`` with fields replaced (CLI flag support).
+
+    ``waveforms=`` is the one nested case: it holds ``WaveformSpec`` keys and is
+    applied to *both* systems, since a flag says what this run should do rather
+    than which band a system recorded.
+    """
+    waveforms = overrides.pop("waveforms", None)
+    if waveforms:
+        config = replace(
+            config,
+            blackrock=replace(
+                config.blackrock,
+                waveforms=replace(config.blackrock.waveforms, **waveforms),
+            ),
+            neuropixels=replace(
+                config.neuropixels,
+                waveforms=replace(config.neuropixels.waveforms, **waveforms),
+            ),
+        )
+    return replace(config, **overrides) if overrides else config

@@ -1088,3 +1088,84 @@ def test_drift_correction_is_off_for_the_utah_array():
 
     assert session.kilosort_for("blackrock")["nblocks"] == 0
     assert session.kilosort_for("neuropixels")["nblocks"] == 1
+
+
+def _load_session(tmp_path: Path, body: str):
+    """A minimal session, loaded. Most waveform tests need only a system block."""
+    return cfg.load_session_config(
+        _write_session(
+            tmp_path,
+            "session: s\nblackrock_dir: '/b'\nneuropixels_dir: '/n'\n" + body,
+        ),
+        "windows_rig",
+        CONFIG_DIR,
+    )
+
+
+def test_each_system_states_its_own_waveform_band(tmp_path):
+    # The one waveform setting that is not the same everywhere. .ns6 is the
+    # broadband 30 kHz group, so its mean has to be filtered to be the signal
+    # Kilosort sorted; a Neuropixels AP binary arrives high-passed from the
+    # probe, and filtering it again would cascade a second rolloff onto the
+    # first. Both are recording-time settings, so both are stated, not derived.
+    session = _load_session(
+        tmp_path,
+        "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/HUB.ns6'\n"
+        "neuropixels:\n  bin_file: '/n/x.bin'\n",
+    )
+    assert session.waveforms_for("blackrock").highpass_hz == 300.0
+    assert session.waveforms_for("neuropixels").highpass_hz is None
+
+    # ...and everything else about the two matches, so the band is the only
+    # thing that differs by system rather than by taste.
+    br = cfg.replace(session.waveforms_for("blackrock"), highpass_hz=None)
+    assert br == session.waveforms_for("neuropixels")
+
+
+def test_a_waveforms_block_changes_only_the_keys_it_names(tmp_path):
+    # Stating one key must not silently reset the other five to the field
+    # defaults -- which for Neuropixels would switch its filter back on.
+    session = _load_session(
+        tmp_path,
+        "neuropixels:\n  bin_file: '/n/x.bin'\n  waveforms:\n    max_spikes: 50\n",
+    )
+    wf = session.waveforms_for("neuropixels")
+    assert wf.max_spikes == 50
+    assert wf.highpass_hz is None                  # not reset to the 300 default
+    assert wf.window_ms == 2.0
+
+
+def test_null_is_how_a_session_asks_for_every_spike(tmp_path):
+    session = _load_session(
+        tmp_path,
+        "blackrock:\n  spike_file: '/b/HUB.ns6'\n  waveforms:\n    max_spikes: null\n",
+    )
+    assert session.waveforms_for("blackrock").max_spikes is None
+
+
+def test_the_renamed_waveform_keys_raise_and_name_their_replacement(tmp_path):
+    # Session copies live on the rig. Ignoring a key someone tuned there would
+    # change what a run measured without a word, so each is refused by name.
+    for old, new in (
+        ("waveform_ms: 3.0", "window_ms"),
+        ("export_waveforms: true", "export_snippets"),
+    ):
+        with pytest.raises(ValueError, match=new):
+            _load_session(tmp_path, f"{old}\nblackrock:\n  spike_file: '/b/x.ns6'\n")
+
+
+def test_a_flag_override_reaches_both_systems(tmp_path):
+    # --export-waveforms says what this run should do, not which band a system
+    # recorded, so it applies to every stream rather than to one.
+    session = _load_session(
+        tmp_path,
+        "blackrock:\n  spike_file: '/b/HUB.ns6'\n"
+        "neuropixels:\n  bin_file: '/n/x.bin'\n",
+    )
+    assert not session.waveforms_for("blackrock").export_snippets
+
+    overridden = cfg.with_overrides(session, waveforms={"export_snippets": True})
+    assert overridden.waveforms_for("blackrock").export_snippets
+    assert overridden.waveforms_for("neuropixels").export_snippets
+    # ...and it changes nothing else, the band included.
+    assert overridden.waveforms_for("neuropixels").highpass_hz is None

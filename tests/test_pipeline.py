@@ -430,8 +430,8 @@ def test_the_waveform_export_cuts_snippets_from_the_sorted_binary(tmp_path, kilo
 
     session = _session(
         tmp_path,
-        "export_waveforms: true\nwaveform_ms: 2.0\n"
-        "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/HUB.ns6'\n",
+        "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/HUB.ns6'\n"
+        "  waveforms:\n    window_ms: 2.0\n    export_snippets: true\n",
     )
     sorted_dir = session.paths.sorted_for("blackrock", 0)
     sorted_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -496,8 +496,9 @@ def test_the_mean_is_measured_even_when_the_snippets_are_not_kept(
         root.mkdir()
         session = _session(
             root,
-            f"export_waveforms: {'true' if export_waveforms else 'false'}\n"
-            "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/HUB.ns6'\n",
+            "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/HUB.ns6'\n"
+            "  waveforms:\n    export_snippets: "
+            f"{'true' if export_waveforms else 'false'}\n",
         )
         sorted_dir = session.paths.sorted_for("blackrock", 0)
         sorted_dir.parent.mkdir(parents=True, exist_ok=True)
