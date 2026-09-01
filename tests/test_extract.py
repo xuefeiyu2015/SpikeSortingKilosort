@@ -30,8 +30,13 @@ def write_ap_with_sync(path, duration_s=20.0, phase_s=0.25, n_chan=385):
     return path
 
 
-def make_session(tmp_path, bin_file, **overrides):
-    """A SessionConfig pointing at a bare binary, resolved on a tool-free machine."""
+def make_session(tmp_path, bin_file, _name="synthetic", n_chan=385, fs=30000, **overrides):
+    """A SessionConfig naming one binary, resolved on a tool-free machine.
+
+    ``_name`` separates two sessions built in one tmp_path: output paths come from
+    ``neuropixels_dir`` alone, so two sessions sharing one would share a folder.
+    ``n_chan``/``fs`` are None for a binary that has a real ``.meta`` beside it.
+    """
     machines = tmp_path / "configs" / "machines"
     machines.mkdir(parents=True, exist_ok=True)
     (machines / "test.yaml").write_text(
@@ -40,17 +45,17 @@ def make_session(tmp_path, bin_file, **overrides):
         encoding="utf-8",
     )
     lines = [
-        "session: synthetic",
-        "output_dir: '{output_root}/synthetic'",
+        f"session: {_name}",
+        "output_dir: '{output_root}/" + _name + "'",
         "neuropixels:",
         f"  bin_file: '{bin_file}'",
-        "  n_chan_bin: 385",
-        "  sample_rate: 30000",
+        f"  n_chan_bin: {n_chan if n_chan is not None else 'null'}",
+        f"  sample_rate: {fs if fs is not None else 'null'}",
         "  sync_bit: 6",
         "  sync_pulse_ms: 500",
     ]
     lines.extend(f"{k}: {v}" for k, v in overrides.items())
-    session_path = tmp_path / "configs" / "synthetic.yaml"
+    session_path = tmp_path / "configs" / f"{_name}.yaml"
     session_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     session = cfg.load_session_config(session_path, "test", tmp_path / "configs")
@@ -87,78 +92,65 @@ def test_extract_reports_a_recording_with_no_sync_pulses(tmp_path):
 
 def test_extract_records_the_catgt_command_it_would_have_run(tmp_path):
     # On a machine without CatGT the fallback runs, but the command is still
-    # reported so a rig run can be reproduced by hand.
+    # reported so a rig run can be reproduced by hand. The session names only the
+    # binary: -dir/-run/-g/-t/-prb are read back off its SpikeGLX filename.
     run_dir = tmp_path / "rundir"
     probe_dir = run_dir / "run_g0" / "run_g0_imec0"
     probe_dir.mkdir(parents=True)
-    write_ap_with_sync(probe_dir / "run_g0_t0.imec0.ap.bin", duration_s=3.0)
-    spikeglx.meta_path_for(probe_dir / "run_g0_t0.imec0.ap.bin").write_text(
+    ap = probe_dir / "run_g0_t0.imec0.ap.bin"
+    write_ap_with_sync(ap, duration_s=3.0)
+    spikeglx.meta_path_for(ap).write_text(
         "nSavedChans=385\nimSampRate=30000\ntypeThis=imec\nsnsApLfSy=384,0,1\n", encoding="utf-8"
     )
 
-    machines = tmp_path / "configs" / "machines"
-    machines.mkdir(parents=True, exist_ok=True)
-    (machines / "test.yaml").write_text(
-        f"output_root: '{tmp_path / 'out'}'\ncache_dir: '{tmp_path / 'c'}'\n"
-        "catgt_dir: null\ntprime_dir: null\ndevice: cpu\n",
-        encoding="utf-8",
-    )
-    session_path = tmp_path / "configs" / "run.yaml"
-    session_path.write_text(
-        "session: run\noutput_dir: '{output_root}/run'\n"
-        f"neuropixels:\n  run_dir: '{run_dir}'\n  run_name: run\n  gate: 0\n  trigger: 0\n",
-        encoding="utf-8",
-    )
-    session = cfg.load_session_config(session_path, "test", tmp_path / "configs")
-    session.paths.mkdirs()
+    session = make_session(tmp_path, ap)
 
     report = extract.extract_neuropixels_edges(session)
     assert report.catgt_commands
     command = report.catgt_commands[0]
     assert "-xd=2,0,-1,6,500" in command
     assert "-ap" in command and "-prb=0" in command
+    assert f"-dir={run_dir}" in command and "-run=run" in command
+    assert "-g=0" in command and "-t=0" in command
     assert any("no catgt_dir" in note for note in report.notes)
 
 
-def make_run_session(tmp_path, run_dir, probes="[0, 1]"):
-    """A SessionConfig pointing at a SpikeGLX run rather than a bare binary."""
-    machines = tmp_path / "configs" / "machines"
-    machines.mkdir(parents=True, exist_ok=True)
-    (machines / "test.yaml").write_text(
-        f"output_root: '{tmp_path / 'out'}'\ncache_dir: '{tmp_path / 'c'}'\n"
-        "catgt_dir: null\ntprime_dir: null\ndevice: cpu\n",
-        encoding="utf-8",
-    )
-    session_path = tmp_path / "configs" / "run.yaml"
-    session_path.write_text(
-        "session: run\noutput_dir: '{output_root}/run'\n"
-        f"neuropixels:\n  run_dir: '{run_dir}'\n  run_name: run\n  probes: {probes}\n",
-        encoding="utf-8",
-    )
-    session = cfg.load_session_config(session_path, "test", tmp_path / "configs")
-    session.paths.mkdirs()
-    return session
+def test_a_bare_binary_has_no_run_so_catgt_is_skipped_by_name(tmp_path):
+    # The Kilosort demo file. Inventing CatGT arguments for it would point at a
+    # run that does not exist, so the report says why instead.
+    bin_file = write_ap_with_sync(tmp_path / "ZFM-02370_mini.imec0.ap.short.bin", duration_s=3.0)
+    session = make_session(tmp_path, bin_file)
+
+    report = extract.extract_neuropixels_edges(session)
+
+    assert report.catgt_commands == []
+    assert any("not named like SpikeGLX output" in note for note in report.notes)
+    assert report.edge_sets[extract.NPX_1HZ].source == "numpy"
 
 
-def test_each_probe_writes_its_own_edge_files(tmp_path):
-    # Two probes in one run are two clocks. Sharing one sync/ directory would
-    # leave whichever ran last, and the other probe would be aligned with it.
+def test_two_probes_of_one_run_are_two_sessions_with_their_own_edges(tmp_path):
+    # Two probes are two clocks. They are two session files now, each naming its
+    # own binary and its own neuropixels_dir -- so neither can land on the other's
+    # edge files, which is what sharing one sync/ directory used to risk.
     from conftest import spikeglx_run
 
-    run_dir = spikeglx_run(tmp_path / "npx", probes=(0, 1), phases={0: 0.25, 1: 0.75})
-    session = make_run_session(tmp_path, run_dir)
+    binaries = spikeglx_run(tmp_path / "npx", probes=(0, 1), phases={0: 0.25, 1: 0.75})
 
+    written = {}
     for probe, phase in ((0, 0.25), (1, 0.75)):
-        report = extract.extract_neuropixels_edges(session, probe)
-        written = session.paths.sync_for("neuropixels", probe) / f"{extract.NPX_1HZ}.txt"
+        session = make_session(
+                tmp_path, binaries[probe], _name=f"imec{probe}", n_chan=None, fs=None
+            )
+        report = extract.extract_neuropixels_edges(session)
+        path = session.paths.sync_for("neuropixels") / f"{extract.NPX_1HZ}.txt"
 
-        assert report.edge_sets[extract.NPX_1HZ].path == written
-        assert written.exists()
-        times = catgt.read_edge_file(written)
+        assert report.edge_sets[extract.NPX_1HZ].path == path
+        times = catgt.read_edge_file(path)
         assert times[0] == pytest.approx(phase, abs=1e-6)     # this probe's phase
         assert np.allclose(np.diff(times), 1.0, atol=1e-6)
+        written[probe] = path
 
-    assert "imec1" in str(session.paths.sync_for("neuropixels", 1))
+    assert written[0] != written[1]
 
 
 def test_extract_sync_returns_none_for_a_system_that_never_recorded(tmp_path):

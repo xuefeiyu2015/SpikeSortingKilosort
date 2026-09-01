@@ -20,16 +20,18 @@ from spikesorting import _config as cfg
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 
 
-def _session(tmp_path, body=""):
+def _session(tmp_path, body="", npx_dir=None):
     """A session declaring both systems, unless `body` declares them itself.
 
     Declaring paths is what says a system recorded, so a fixture that wants both
     systems present has to name files for both -- there is no flag any more.
+    ``npx_dir`` separates two sessions in one tmp_path: every output path comes
+    from ``neuropixels_dir`` alone, so sharing one means sharing all of them.
     """
     lines = [
         "session: s",
         f"blackrock_dir: '{tmp_path / 'br'}'",
-        f"neuropixels_dir: '{tmp_path / 'np'}'",
+        f"neuropixels_dir: '{npx_dir or tmp_path / 'np'}'",
     ]
     if "neuropixels:" not in body:
         lines.append("neuropixels:\n  bin_file: '/a/x.bin'")
@@ -124,18 +126,17 @@ def _meta_run(tmp_path, n_chan=4, with_geom=True):
             f"(0:{11 + 16 * (i % 2)}:{20 * (i // 2)}:1)" for i in range(n_chan)
         ))
     (run / "r_g0_t0.imec0.ap.meta").write_text("\n".join(meta) + "\n", encoding="utf-8")
-    return tmp_path / "np"
+    return run / "r_g0_t0.imec0.ap.bin"
 
 
 def test_the_runs_own_meta_wins_over_a_probe_file(tmp_path):
     # The .meta records which sites were actually active for *this* run, which a
     # file built from another run cannot know. So it is not an override target.
-    _meta_run(tmp_path)
+    binary = _meta_run(tmp_path)
     other = _probe_json(tmp_path / "probes" / "other.json", n=99)
     session = _session(
         tmp_path,
-        f"neuropixels:\n  run_dir: '{tmp_path / 'np'}'\n  run_name: r\n"
-        f"  probe_file: '{other}'\n",
+        f"neuropixels:\n  bin_file: '{binary}'\n  probe_file: '{other}'\n",
     )
 
     probe = ss.setup_probe(session, "neuropixels")
@@ -162,12 +163,11 @@ def test_probe_file_is_used_when_the_run_has_no_meta(tmp_path):
 def test_a_meta_without_geometry_falls_through_to_probe_file(tmp_path):
     # Runs predating ~snsGeomMap: the .meta exists but carries no geometry, so it
     # must fall through rather than raise past the configured fallback.
-    _meta_run(tmp_path, with_geom=False)
+    binary = _meta_run(tmp_path, with_geom=False)
     named = _probe_json(tmp_path / "probes" / "np1.json", n=4)
     session = _session(
         tmp_path,
-        f"neuropixels:\n  run_dir: '{tmp_path / 'np'}'\n  run_name: r\n"
-        f"  probe_file: '{named}'\n",
+        f"neuropixels:\n  bin_file: '{binary}'\n  probe_file: '{named}'\n",
     )
 
     assert ss.setup_probe(session, "neuropixels")["n_chan"] == 4
@@ -205,18 +205,22 @@ def test_a_utah_cmp_wins_over_a_probe_file(tmp_path):
 
 def test_each_probe_gets_the_geometry_from_its_own_meta(tmp_path):
     # Two probes in one run need not share an imro table: which sites are active
-    # is chosen per probe. Reading imec0's .meta for imec1 would put imec1's units
-    # on imec0's sites, and nothing downstream could tell.
+    # is chosen per probe. They are two sessions now, and each reads the .meta
+    # beside the binary it names -- so imec1 cannot end up on imec0's sites.
     from conftest import spikeglx_run
 
-    run_dir = spikeglx_run(tmp_path / "npx", probes=(0, 1), sites={0: 4, 1: 6})
-    session = _session(
-        tmp_path,
-        f"neuropixels:\n  run_dir: '{run_dir}'\n  run_name: run\n  probes: [0, 1]\n",
-    )
+    binaries = spikeglx_run(tmp_path / "npx", probes=(0, 1), sites={0: 4, 1: 6})
+    sessions = {
+        probe: _session(
+            tmp_path,
+            f"neuropixels:\n  bin_file: '{binaries[probe]}'\n",
+            npx_dir=tmp_path / f"np{probe}",
+        )
+        for probe in (0, 1)
+    }
 
-    assert ss.setup_probe(session, "neuropixels")["n_chan"] == 4
-    assert ss.setup_probe(session, "neuropixels", probe_index=1)["n_chan"] == 6
+    assert ss.setup_probe(sessions[0], "neuropixels")["n_chan"] == 4
+    assert ss.setup_probe(sessions[1], "neuropixels")["n_chan"] == 6
 
 
 def test_sorting_checks_the_recording_answers_before_importing_a_sorter(tmp_path, monkeypatch):
@@ -320,21 +324,20 @@ def test_export_results_reads_those_settings_rather_than_arguments(
     import shutil
 
     session = _session(tmp_path, "export_groups: [good]\nexport_figures: false\n")
-    sorted_dir = session.paths.sorted_for("neuropixels", 0)
+    sorted_dir = session.paths.sorted_for("neuropixels")
     sorted_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(kilosort_results, sorted_dir, dirs_exist_ok=True)
 
-    good_only = ss.export_results(session, "neuropixels", 0)
+    good_only = ss.export_results(session, "neuropixels")
     assert good_only["n_units"] == 2                       # units 0 and 2
-    assert not list(session.paths.figures_for("neuropixels", 0).glob("*.png"))
+    assert not list(session.paths.figures_for("neuropixels").glob("*.png"))
 
     with_mua = ss.export_results(
         cfg.with_overrides(session, export_groups=("good", "mua"), export_figures=True),
         "neuropixels",
-        0,
     )
     assert with_mua["n_units"] == 3
-    figures = sorted(p.name for p in session.paths.figures_for("neuropixels", 0).glob("*.png"))
+    figures = sorted(p.name for p in session.paths.figures_for("neuropixels").glob("*.png"))
     assert figures == ["overview.png", "unit_0000.png", "unit_0001.png", "unit_0002.png"]
 
 
@@ -389,7 +392,7 @@ def test_a_utah_export_lands_on_the_nsp_clock(tmp_path, kilosort_results):
         tmp_path,
         "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/HUB.ns6'\n",
     )
-    sorted_dir = session.paths.sorted_for("blackrock", 0)
+    sorted_dir = session.paths.sorted_for("blackrock")
     sorted_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(kilosort_results, sorted_dir, dirs_exist_ok=True)
 
@@ -404,7 +407,7 @@ def test_a_utah_export_lands_on_the_nsp_clock(tmp_path, kilosort_results):
         json.dumps(time_map.to_dict()), encoding="utf-8"
     )
 
-    out = ss.export_results(session, "blackrock", 0)
+    out = ss.export_results(session, "blackrock")
 
     assert out["timebase"] == "nsp"
     exported = np.load(sorted_dir / "export" / "spike_times.npy")
@@ -433,7 +436,7 @@ def test_the_waveform_export_cuts_snippets_from_the_sorted_binary(tmp_path, kilo
         "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/HUB.ns6'\n"
         "  waveforms:\n    window_ms: 2.0\n    export_snippets: true\n",
     )
-    sorted_dir = session.paths.sorted_for("blackrock", 0)
+    sorted_dir = session.paths.sorted_for("blackrock")
     sorted_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(kilosort_results, sorted_dir, dirs_exist_ok=True)
 
@@ -457,7 +460,7 @@ def test_the_waveform_export_cuts_snippets_from_the_sorted_binary(tmp_path, kilo
         encoding="utf-8",
     )
 
-    out = ss.export_waveforms(session, "blackrock", 0)
+    out = ss.export_waveforms(session, "blackrock")
 
     assert out["n_spikes"] > 0
     with h5py.File(out["path"], "r") as handle:
@@ -500,7 +503,7 @@ def test_the_mean_is_measured_even_when_the_snippets_are_not_kept(
             "  waveforms:\n    export_snippets: "
             f"{'true' if export_waveforms else 'false'}\n",
         )
-        sorted_dir = session.paths.sorted_for("blackrock", 0)
+        sorted_dir = session.paths.sorted_for("blackrock")
         sorted_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(kilosort_results, sorted_dir, dirs_exist_ok=True)
 
@@ -519,7 +522,7 @@ def test_the_mean_is_measured_even_when_the_snippets_are_not_kept(
             ),
             encoding="utf-8",
         )
-        return ss.export_waveforms(session, "blackrock", 0)
+        return ss.export_waveforms(session, "blackrock")
 
     kept, dropped = run(True), run(False)
 
@@ -542,7 +545,7 @@ def test_an_unreachable_binary_costs_the_waveforms_and_nothing_else(tmp_path, ki
     session = _session(
         tmp_path, "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/HUB.ns6'\n"
     )
-    sorted_dir = session.paths.sorted_for("blackrock", 0)
+    sorted_dir = session.paths.sorted_for("blackrock")
     sorted_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(kilosort_results, sorted_dir, dirs_exist_ok=True)
     (sorted_dir / "run_info.json").write_text(
@@ -550,7 +553,7 @@ def test_an_unreachable_binary_costs_the_waveforms_and_nothing_else(tmp_path, ki
         encoding="utf-8",
     )
 
-    assert ss.export_waveforms(session, "blackrock", 0) is None
+    assert ss.export_waveforms(session, "blackrock") is None
 
 
 def test_the_fitted_map_is_stamped_into_an_lfp_written_hours_earlier(tmp_path):
@@ -572,7 +575,7 @@ def test_the_fitted_map_is_stamped_into_an_lfp_written_hours_earlier(tmp_path):
         f"snsApLfSy={n_chan - 1},0,1\nimAiRangeMax=0.6\nimMaxInt=512\n",
         encoding="utf-8",
     )
-    out = export_lfp(lf, session.paths.export_for("neuropixels", 0), decimate=1)
+    out = export_lfp(lf, session.paths.export_for("neuropixels"), decimate=1)
 
     with h5py.File(out, "r") as handle:
         assert bytes(handle["lfp/timebase"][()].ravel().astype(np.uint8)).decode() == "stream"
@@ -582,7 +585,7 @@ def test_the_fitted_map_is_stamped_into_an_lfp_written_hours_earlier(tmp_path):
 
     mapping = LinearMap(slope=1.0000045, intercept=1_521_182_029.171103,
                         n_points=10, residuals_s=np.zeros(1))
-    stamped = ss.stamp_lfp_timebase(session, mapping, 0)
+    stamped = ss.stamp_lfp_timebase(session, mapping)
 
     assert stamped == out
     with h5py.File(out, "r") as handle:
@@ -616,6 +619,8 @@ def test_an_lfp_exported_after_alignment_picks_up_the_map_immediately(tmp_path):
     run = tmp_path / "np" / "r_g0" / "r_g0_imec0"
     run.mkdir(parents=True, exist_ok=True)
     n_chan = 4
+    ap = run / "r_g0_t0.imec0.ap.bin"
+    ap.write_bytes(np.zeros(100 * n_chan, dtype=np.int16).tobytes())
     lf = run / "r_g0_t0.imec0.lf.bin"
     lf.write_bytes(np.arange(2000 * n_chan, dtype=np.int16).tobytes())
     meta_path_for(lf).write_text(
@@ -624,19 +629,19 @@ def test_an_lfp_exported_after_alignment_picks_up_the_map_immediately(tmp_path):
         encoding="utf-8",
     )
 
+    # bin_file names the AP band; the LF one is found beside it by run_layout, so
+    # this session states only the binary a real one would.
     session = _session(
-        tmp_path,
-        "export_lfp: true\n"
-        f"neuropixels:\n  run_dir: '{tmp_path / 'np'}'\n  run_name: r\n",
+        tmp_path, "export_lfp: true\n" + f"neuropixels:\n  bin_file: '{ap}'\n"
     )
-    aligned = session.paths.aligned_for(0)
+    aligned = session.paths.aligned
     aligned.mkdir(parents=True, exist_ok=True)
     (aligned / "time_map.json").write_text(
         json.dumps({"slope": 1.0000045, "intercept": 1_521_182_029.171103, "n_points": 99}),
         encoding="utf-8",
     )
 
-    path = ss.extract_lfp(session, "neuropixels", 0)
+    path = ss.extract_lfp(session, "neuropixels")
 
     assert path is not None
     with h5py.File(path, "r") as handle:
@@ -656,7 +661,7 @@ def test_stamping_is_a_no_op_when_no_lfp_was_exported(tmp_path):
     session = _session(tmp_path)
     mapping = LinearMap(slope=1.0, intercept=0.0, n_points=2, residuals_s=np.zeros(1))
 
-    assert ss.stamp_lfp_timebase(session, mapping, 0) is None
+    assert ss.stamp_lfp_timebase(session, mapping) is None
 
 
 def test_skip_reason_is_none_when_the_verb_will_actually_run(tmp_path):
@@ -736,15 +741,19 @@ def _fake_kilosort(monkeypatch, seen: list[dict]):
     return package
 
 
-def _npx_session(tmp_path, body_extra="", probes="[0]"):
-    """A Neuropixels session pointing at a real (tiny) SpikeGLX run."""
+def _npx_session(tmp_path, body_extra="", probe=0, npx_dir=None):
+    """A Neuropixels session naming one AP binary inside a real (tiny) run.
+
+    ``probe`` picks which of the run's two binaries it names; ``npx_dir`` gives a
+    second session its own output folder, since paths come from that alone.
+    """
     from conftest import spikeglx_run
 
-    run_dir = spikeglx_run(tmp_path / "npx", probes=(0, 1), sites={0: 4, 1: 6})
+    binaries = spikeglx_run(tmp_path / "npx", probes=(0, 1), sites={0: 4, 1: 6})
     return _session(
         tmp_path,
-        f"neuropixels:\n  run_dir: '{run_dir}'\n  run_name: run\n"
-        f"  probes: {probes}\n{body_extra}",
+        f"neuropixels:\n  bin_file: '{binaries[probe]}'\n{body_extra}",
+        npx_dir=npx_dir,
     )
 
 
@@ -793,37 +802,43 @@ def test_the_session_cannot_set_what_the_pipeline_passes(tmp_path, monkeypatch):
         ss.sort_with_kilosort(session, "neuropixels")
 
 
-def test_each_probe_is_sorted_into_its_own_directory(tmp_path, monkeypatch):
-    # Two probes are two streams with two clocks. Sorting both into one directory
-    # would leave the second on top of the first with nothing to say so.
+def test_two_probes_are_sorted_into_their_own_directories(tmp_path, monkeypatch):
+    # Two probes are two streams with two clocks, and now two session files.
+    # Each names its own binary and its own neuropixels_dir, so the second cannot
+    # land on top of the first.
     seen: list[dict] = []
     _fake_kilosort(monkeypatch, seen)
-    session = _npx_session(tmp_path, probes="[0, 1]")
+    sessions = [
+        _npx_session(tmp_path, probe=probe, npx_dir=tmp_path / f"np{probe}")
+        for probe in (0, 1)
+    ]
 
-    first = ss.sort_with_kilosort(session, "neuropixels", probe_index=0)
-    second = ss.sort_with_kilosort(session, "neuropixels", probe_index=1)
+    first, second = (ss.sort_with_kilosort(s, "neuropixels") for s in sessions)
 
     assert first.results_dir != second.results_dir
-    assert first.results_dir.name == "kilosort4"
-    assert first.results_dir.parent.name == "imec0"
-    assert second.results_dir.parent.name == "imec1"
+    assert first.results_dir.name == second.results_dir.name == "kilosort4"
+    assert first.results_dir.parent == tmp_path / "np0"
+    assert second.results_dir.parent == tmp_path / "np1"
     # ...and each read its own probe's binary, not the other's.
     assert "imec0" in str(seen[0]["filename"]) and "imec1" in str(seen[1]["filename"])
 
 
 def test_a_probes_own_bad_channels_reach_the_sorter(tmp_path, monkeypatch):
-    # A dead site is a fact about one probe, not about the run.
+    # A dead site is a fact about one probe. It goes in that probe's own session
+    # file now, rather than in a by_probe: block inside a shared one.
     seen: list[dict] = []
     _fake_kilosort(monkeypatch, seen)
-    session = _npx_session(
+    plain = _npx_session(tmp_path, "  kilosort:\n    nblocks: 1\n", probe=0,
+                         npx_dir=tmp_path / "np0")
+    dead = _npx_session(
         tmp_path,
-        "  kilosort:\n    nblocks: 1\n"
-        "  by_probe:\n    1:\n      kilosort:\n        bad_channels: [2, 5]\n",
-        probes="[0, 1]",
+        "  kilosort:\n    nblocks: 1\n    bad_channels: [2, 5]\n",
+        probe=1,
+        npx_dir=tmp_path / "np1",
     )
 
-    ss.sort_with_kilosort(session, "neuropixels", probe_index=0)
-    ss.sort_with_kilosort(session, "neuropixels", probe_index=1)
+    ss.sort_with_kilosort(plain, "neuropixels")
+    ss.sort_with_kilosort(dead, "neuropixels")
 
     assert seen[0]["bad_channels"] is None          # imec0 said nothing
     assert seen[1]["bad_channels"] == [2, 5]
@@ -861,7 +876,7 @@ def test_the_results_are_published_out_of_the_cache_without_the_dat(tmp_path, mo
     assert "n_channels_dat = 8" in params        # the rest of the file is untouched
 
     info = json.loads((result.results_dir / "run_info.json").read_text(encoding="utf-8"))
-    assert info["stream"] == "imec0" and info["device"] == "cpu"
+    assert info["stream"] == "neuropixels" and info["device"] == "cpu"
     assert info["settings"]["n_chan_bin"] == 8
 
 
@@ -1004,7 +1019,7 @@ def test_the_ns6_is_transformed_once_beside_the_recording(tmp_path, monkeypatch)
 
     assert transformed[0]["dtype"] == "int16"
     assert transformed[0]["data_name"] == "HUB-A_001.bin"
-    binary = tmp_path / "br" / "blackrock" / "HUB-A_001.bin"
+    binary = tmp_path / "br" / "HUB-A_001.bin"
     assert binary.exists()                       # beside the recording, not in the cache
     assert Path(seen[0]["filename"]) == binary
     assert seen[0]["settings"]["n_chan_bin"] == 96
@@ -1045,41 +1060,45 @@ def test_time_remapping_recovers_a_planted_offset_and_drift(tmp_path):
     assert result.method == "map_only"
     assert result.mapping.intercept == pytest.approx(offset, abs=1e-6)
     assert result.mapping.drift_ppm == pytest.approx(-20.0, abs=0.1)
-    assert (session.paths.aligned_for(0) / "time_map.json").exists()
+    assert (session.paths.aligned / "time_map.json").exists()
     assert "ppm" in result.summary()
 
 
-def test_each_probe_is_fitted_onto_blackrock_time_on_its_own(tmp_path):
-    # Two probes in one run are two oscillators. One fit cannot serve both, so
-    # each gets its own map in its own directory -- and planting *different*
-    # drifts is what proves the second probe is not reading the first's edges.
+def test_two_probes_are_each_fitted_onto_blackrock_time_on_their_own(tmp_path):
+    # Two probes in one run are two oscillators, and now two session files. One
+    # fit cannot serve both, so each gets its own map in its own directory -- and
+    # planting *different* drifts is what proves the second session is not
+    # reading the first's edges.
     from spikesorting._sync import catgt
 
-    session = _session(
-        tmp_path,
-        "neuropixels:\n  run_dir: '/npx'\n  run_name: run\n  probes: [0, 1]\n",
-    )
-    session.paths.sync_for("blackrock").mkdir(parents=True, exist_ok=True)
-
     br = np.arange(0.0, 600.0, 1.0) + 100.0
-    catgt.write_edge_file(session.paths.sync_for("blackrock") / "blackrock_1hz.txt", br)
-
     planted = {0: (12.3456, 20e-6), 1: (34.5678, -5e-6)}
+
+    results = {}
     for probe, (offset, ppm) in planted.items():
-        sync_dir = session.paths.sync_for("neuropixels", probe)
+        session = _session(
+            tmp_path,
+            f"neuropixels:\n  bin_file: '/npx/run_g0_t0.imec{probe}.ap.bin'\n",
+            npx_dir=tmp_path / f"np{probe}",
+        )
+        # Both sessions share one Blackrock recording -- it is the reference, and
+        # it was recorded once.
+        session.paths.sync_for("blackrock").mkdir(parents=True, exist_ok=True)
+        catgt.write_edge_file(session.paths.sync_for("blackrock") / "blackrock_1hz.txt", br)
+
+        sync_dir = session.paths.sync_for("neuropixels")
         sync_dir.mkdir(parents=True, exist_ok=True)
         catgt.write_edge_file(sync_dir / "npx_1hz.txt", (br - offset) * (1 + ppm))
 
-    for probe, (offset, ppm) in planted.items():
-        result = ss.time_remapping(session, "neuropixels", probe)
-
+        result = ss.time_remapping(session, "neuropixels")
         assert result.mapping.intercept == pytest.approx(offset, abs=1e-6)
         assert result.mapping.drift_ppm == pytest.approx(-ppm * 1e6, abs=0.1)
-        assert (session.paths.aligned_for(probe) / "time_map.json").exists()
+        results[probe] = result
 
-    # ...and the two maps are files of their own, not one overwritten twice.
-    maps = sorted(p.parent.name for p in session.paths.aligned.rglob("time_map.json"))
-    assert maps == ["imec0", "imec1"]
+    # ...and the two fits really are different, which is the point of planting
+    # different drifts: one map serving both would show identical numbers.
+    assert results[0].mapping.intercept != results[1].mapping.intercept
+    assert results[0].mapping.slope != results[1].mapping.slope
 
 
 def test_the_reference_timebase_is_not_remapped_onto_itself(tmp_path):

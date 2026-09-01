@@ -1004,7 +1004,7 @@ def test_a_broadband_stream_with_no_highpass_configured_is_reported(tmp_path):
         encoding="utf-8",
     )
     session = cfg.load_session_config(tmp_path / "off.yaml", "m", tmp_path)
-    sorted_dir = session.paths.sorted_for("blackrock", 0)
+    sorted_dir = session.paths.sorted_for("blackrock")
     sorted_dir.mkdir(parents=True, exist_ok=True)
     binary = tmp_path / "raw" / "HUB.bin"
     _write_band_binary(binary, fs, n_chan, "broadband")
@@ -1029,7 +1029,7 @@ def test_a_spike_band_stream_that_matches_its_config_is_fine(tmp_path):
 
     fs, n_chan = 30000.0, 4
     session = _blackrock_session(tmp_path)      # blackrock defaults to 300 Hz
-    sorted_dir = session.paths.sorted_for("blackrock", 0)
+    sorted_dir = session.paths.sorted_for("blackrock")
     sorted_dir.mkdir(parents=True, exist_ok=True)
     binary = tmp_path / "raw" / "HUB.bin"
     _write_band_binary(binary, fs, n_chan, "broadband")

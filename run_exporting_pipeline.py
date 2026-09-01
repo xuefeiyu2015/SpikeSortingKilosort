@@ -39,7 +39,7 @@ from pathlib import Path
 # The shared CLI helpers live in tools/; _cli adds src/ itself.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 
-from _cli import Runner, build_parser, load, run_probes  # noqa: E402
+from _cli import Runner, build_parser, load  # noqa: E402
 
 import spikesorting as ss  # noqa: E402
 
@@ -113,66 +113,30 @@ def main() -> int:
     run = Runner(config, keep_going=args.keep_going)
     print()
 
-    # Extraction first: everything below reads the edge files it writes. Each
-    # Neuropixels probe is its own stream with its own clock, so it is extracted,
-    # mapped and validated on its own; Blackrock yields one stream and is not
-    # re-read per probe.
+    # Extraction first: everything below reads the edge files it writes.
     for stage, verb in (("extract_sync", ss.extract_sync), ("lfp", ss.extract_lfp)):
         if stage not in steps:
             continue
         for system in ss.SYSTEMS:
-            for probe_index in run_probes(config, system, args.probe):
-                run(verb, config, system, probe_index, system=system, probe=probe_index)
+            run(verb, config, system, system=system)
 
     # Blackrock is the reference timebase, so it is what the other system is
     # mapped *onto* rather than a system to remap.
     if "time_remapping" in steps:
         for system in ss.SYSTEMS:
-            for probe_index in run_probes(config, system, args.probe):
-                run(
-                    ss.time_remapping,
-                    config,
-                    system,
-                    probe_index=probe_index,
-                    system=system,
-                    probe=probe_index,
-                )
+            run(ss.time_remapping, config, system, system=system)
 
     if "validate_remapping" in steps:
-        for probe_index in run_probes(config, "neuropixels", args.probe):
-            run(
-                ss.validate_remapping,
-                config,
-                config.export_figures,
-                probe_index=probe_index,
-                system="neuropixels",
-                probe=probe_index,
-            )
+        run(ss.validate_remapping, config, config.export_figures, system="neuropixels")
 
     if "export_results" in steps:
         for system in ss.SYSTEMS:
-            for probe_index in run_probes(config, system, args.probe):
-                run(
-                    ss.export_results,
-                    config,
-                    system,
-                    probe_index,
-                    system=system,
-                    probe=probe_index,
-                )
+            run(ss.export_results, config, system, system=system)
 
     # Last: the only stage here that re-reads the recording itself.
     if "waveforms" in steps:
         for system in ss.SYSTEMS:
-            for probe_index in run_probes(config, system, args.probe):
-                run(
-                    ss.export_waveforms,
-                    config,
-                    system,
-                    probe_index,
-                    system=system,
-                    probe=probe_index,
-                )
+            run(ss.export_waveforms, config, system, system=system)
 
     return run.finish("exporting pipeline")
 

@@ -10,10 +10,6 @@ here needs a GPU, Kilosort, torch or the HPC: a probe file is plain JSON.
     python tools/make_probe.py neuropixels --meta /data/run_g0_t0.imec0.ap.meta \\
            --out configs/probes/np_athos_2026_08_13.json --plot
 
-    # Neuropixels, from a SpikeGLX run folder
-    python tools/make_probe.py neuropixels --run-dir /data --run-name Athos_2026_08_13 \\
-           --out configs/probes/np_athos.json
-
     # Utah array, from the array's .cmp map file
     python tools/make_probe.py utah --cmp /data/array.cmp \\
            --out configs/probes/utah_athos.json --plot
@@ -52,18 +48,12 @@ from spikesorting._probes import (
 
 
 def build_neuropixels(args: argparse.Namespace) -> dict:
-    if args.meta:
-        meta = spikeglx.read_meta(args.meta)
-    elif args.run_dir and args.run_name:
-        files = spikeglx.find_run_files(
-            args.run_dir, args.run_name, args.gate, args.trigger, args.probe
+    if not args.meta:
+        raise SystemExit(
+            "neuropixels needs --meta <run>.imec0.ap.meta (the .ap.bin beside it "
+            "works too -- read_meta accepts either)"
         )
-        if files["ap"] is None:
-            raise SystemExit(f"no AP binary found for run {args.run_name} g{args.gate}")
-        print(f"reading meta beside {files['ap'].name}")
-        meta = spikeglx.read_meta(files["ap"])
-    else:
-        raise SystemExit("neuropixels needs either --meta or --run-dir plus --run-name")
+    meta = spikeglx.read_meta(args.meta)
 
     probe = probe_from_meta(meta)
     print(f"built from ~snsGeomMap: {probe['n_chan']} channels")
@@ -145,10 +135,6 @@ def main() -> int:
 
     # neuropixels
     parser.add_argument("--meta", default=None, help="SpikeGLX .meta (or .bin beside it)")
-    parser.add_argument("--run-dir", default=None)
-    parser.add_argument("--run-name", default=None)
-    parser.add_argument("--gate", type=int, default=0)
-    parser.add_argument("--trigger", default=0)
     parser.add_argument("--probe", default=None, help="probe index, or a .json path for 'show'")
 
     # utah

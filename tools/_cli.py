@@ -21,7 +21,6 @@ from spikesorting import (  # noqa: E402
     SessionConfig,
     load_session_config,
     skip_reason,
-    stream_label,
 )
 from spikesorting._config import with_overrides  # noqa: E402
 
@@ -49,12 +48,6 @@ def build_parser(description: str) -> argparse.ArgumentParser:
         "--machine",
         default=default_machine(),
         help=f"machine profile in configs/machines/ (default: {default_machine()})",
-    )
-    parser.add_argument(
-        "--probe",
-        type=int,
-        default=None,
-        help="run one Neuropixels probe instead of every probe the session declares",
     )
     parser.add_argument(
         "--skip-checks",
@@ -108,14 +101,6 @@ def load(args: argparse.Namespace, require_inputs: bool = True) -> SessionConfig
     if require_inputs and not getattr(args, "skip_checks", False):
         config.require_inputs()
 
-    only = getattr(args, "probe", None)
-    declared = config.probe_indices("neuropixels")
-    if only is not None and only not in declared:
-        raise SystemExit(
-            f"--probe {only}: this session declares probes {list(declared)}. "
-            "Add it to neuropixels.probes, or drop the flag to run them all."
-        )
-
     print(f"session '{config.session}' on machine '{config.machine.name}'")
     if overrides:
         print(
@@ -127,28 +112,8 @@ def load(args: argparse.Namespace, require_inputs: bool = True) -> SessionConfig
         directory = config.paths.dir_for(system)
         if directory is None:
             continue
-        streams = ""
-        if system == "neuropixels":
-            streams = " (%s)" % ", ".join(
-                stream_label(system, p) for p in run_probes(config, system, only)
-            )
-        print(f"  {system}: {directory}{streams}")
+        print(f"  {system}: {directory}")
     return config
-
-
-def run_probes(
-    config: SessionConfig, system: str, only: int | None = None
-) -> tuple[int, ...]:
-    """Which streams of ``system`` this run covers.
-
-    Blackrock has one, so the drivers' inner loop runs once for it however many
-    probes the run holds -- the NSP file is not re-extracted per probe. ``only``
-    is ``--probe``, already checked against the declared list by :func:`load`.
-    """
-    declared = config.probe_indices(system)
-    if only is None or system != "neuropixels":
-        return declared
-    return (only,)
 
 
 class Runner:
@@ -167,16 +132,12 @@ class Runner:
         #: True when the last call raised, so a caller can skip what depended on it.
         self.last_failed = False
 
-    def __call__(self, verb, *args, system: str | None = None, probe: int | None = None, **kwargs):
-        """Run one verb. Returns its value, or None if it was skipped or failed.
-
-        ``probe`` only names the line: a run holding imec0 and imec1 prints two
-        of most stages, and "which probe" has to be readable at a glance.
-        """
+    def __call__(self, verb, *args, system: str | None = None, **kwargs):
+        """Run one verb. Returns its value, or None if it was skipped or failed."""
         if self.stopped:
             return None
         self.last_failed = False
-        label = verb.__name__ + (f"({_scope(system, probe)})" if system else "")
+        label = verb.__name__ + (f"({system})" if system else "")
 
         why = skip_reason(self.config, verb, system)
         if why:
@@ -206,14 +167,6 @@ class Runner:
             return 1
         print(f"{name} finished")
         return 0
-
-
-def _scope(system: str | None, probe: int | None) -> str:
-    """``blackrock`` / ``neuropixels imec1`` -- what a status line is about."""
-    if system is None:
-        return ""
-    stream = stream_label(system, probe or 0)
-    return system if stream == system or probe is None else f"{system} {stream}"
 
 
 def _describe(value) -> str:

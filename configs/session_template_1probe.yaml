@@ -1,27 +1,18 @@
-# Template for a session with ONE Neuropixels probe and NO Utah array, where
-# Blackrock records only the synchronization pulses.
-# Copy to configs/<session>.yaml and edit. Copies are gitignored; this is tracked.
-#
-# It is session_template_utah_probe.yaml with the Utah array taken out: Blackrock keeps its
-# sync_file and loses spike_file, cmp_file and probe_file, because there is no
-# array in the animal. Everything else is deliberately identical, and a test pins
-# that, so a value tuned in one template and not the others fails here rather
-# than on the rig.
+# Template for a session whose spikes come from ONE Neuropixels probe, with
+# Blackrock present only to carry the sync pulses. Copy and edit.
+# Copies are gitignored; this template is tracked.
 #
 #   python run_sorting_pipeline.py --config configs/session_template_1probe.yaml \
 #          --machine windows_rig
-#   # curate in Phy, 
-# 
+# curation in phy
 #   conda activate phy
-#   cd {rootpath}/{monkey}/{session}/{system}/kilosort4/ (directory where params.py stored)
+#   cd {monkey}/{session}/kilosort4/     (the directory holding params.py)
 #   phy template-gui params.py
-
-#.  then:
-#   python run_exporting_pipeline.py --config configs/session_template_1probe.yaml \
+# after curation
+#  python run_exporting_pipeline.py --config configs/session_template_1probe.yaml \
 #          --machine windows_rig
-#
-# A new session means editing four values: monkey, session, the Blackrock sync
-# filename, and the SpikeGLX run name. Each block puts what changes first and
+# A new session means editing five values: monkey, session, the two Blackrock
+# filenames, and the SpikeGLX bin_file. Each block puts what changes first and
 # fences off what does not. Below a fence are the defaults -- change one only if
 # you know what it means. The notes at the end explain every choice made here.
 #
@@ -38,12 +29,7 @@ session: "2026-08-13"
 #
 # false = extract that system's LFP and sync pulses, but do not sort it.
 kilosort_on_neuropixels: true
-#
-# There is deliberately no kilosort_on_blackrock here. Sorting Blackrock needs a
-# spike_file, and this session has none, so the sort stage skips itself with
-# "no blackrock.spike_file, so there is no spike data to sort" -- see "No Utah
-# array". Add a spike_file later and it starts sorting, with nothing else to
-# remember to change.
+kilosort_on_blackrock: true
 
 export_lfp: false      # LF-band copy, ~7 GB/hour at 385 channels -- see "LFP"
 lfp_decimate: 1        # stride for it; 2 is safe, more aliases
@@ -53,19 +39,24 @@ export_groups: ["good", "mua"]   # Phy cluster_group labels to export
 # Roots stop at the share; each system's directory is <root>/<monkey>/<session>.
 # Changes when the share moves, not per session. See "Paths" below.
 roots:
-  blackrock: "Z:/jeurissenlab.cns.nyu.edu/server"
-  neuropixels: "Z:/jeurissenlab.cns.nyu.edu/server"
+  blackrock: "Z:/"
+  neuropixels: "Z:/"
+
+blackrock_dir:   "{blackrock}/{monkey}/{session}"
+# The SpikeGLX probe folder itself, not the session folder: each system
+# writes everything it produces to <dir>/kilosort4/, so the two systems
+# must not share a directory. Loading raises if they do.
+neuropixels_dir: "{neuropixels}/{monkey}/{session}/Athos_2026_08_13_g0/Athos_2026_08_13_g0_imec0"
 
 blackrock:
   # ---------- edit for this session ----------
-  # The whole of Blackrock's job in this session: carry the pulse train that
-  # Neuropixels time is mapped onto. Blackrock is still the reference timebase.
+  spike_file: null   # no Utah array in this session -- sync only
   sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"    # the two sync channels
+  probe_file: null       # ...so no channel map is needed, or looked for
+  # ...and no kilosort: block either: those settings describe how to sort an
+  # array that is not in this session.
 
   # ---------- defaults: change only if you know what they mean ----------
-  spike_file: null       # no Utah array in this session -- see "No Utah array"
-  probe_file: null       # ...so no channel map is needed, or looked for
-  cmp_file: null
   sync_1hz_channel: 1    # NSP-*.ns5 channel carrying the 1 Hz square wave
   burst_channel: 2       # ...and the one carrying the 14 s coded burst
   sync_threshold: 2.5    # rising-edge thresholds, in volts after neo scaling
@@ -73,6 +64,7 @@ blackrock:
   stream_id: null        # pin one when a .nsX exposes several streams
   gap_tolerance_ms: 10   # absorb PTP timestamp glitches -- see "The NSP clock"
   allow_segments: false  # a larger jump is a paused recording: stop, do not guess
+  cmp_file: null         # the array's own .cmp, read when probe_file is null
   waveforms:             # the mean-waveform export -- see "Waveforms"
     window_ms: 2.0       # snippet width, centred on the spike sample
     max_spikes: 2000     # per unit, spread over the session; null = every spike
@@ -83,17 +75,18 @@ blackrock:
 
 neuropixels:
   # ---------- edit for this session ----------
-  run_dir: "{neuropixels_dir}"      # SpikeGLX run: <run_dir>/<run_name>_g<gate>/
-  run_name: "Athos_2026_08_13"
-  probes: [0]            # one entry per probe in the run -- see "Two probes"
+  # The AP binary, named outright. CatGT still runs: its -dir/-run/-g/-t/-prb are
+  # read back off this filename -- see "Where the SpikeGLX run went".
+  bin_file: "{neuropixels_dir}/Athos_2026_08_13_g0_t0.imec0.ap.bin"
+  lf_file: null          # only when the LF band is not beside the AP one
   kilosort:
-    bad_channels: []     # a dead site goes here -- see "Bad channels"
+    bad_channels: []     # same key, same meaning as the blackrock one
     nblocks: 1           # rigid drift correction -- see "Drift correction"
+    #tmin : 0     # sort from this second of the binary; omit for the start
+    #tmax : 1800   # ...to this one; omit for the end. See "Sort window".
 
   # ---------- defaults: change only if you know what they mean ----------
-  gate: 0
-  trigger: 0
-  probe_file: null       # the run's own .meta wins -- see "Probes"
+  probe_file: null       # the .meta beside bin_file wins -- see "Probes"
   n_chan_bin: null       # read from the .meta
   sync_bit: 6            # SY-word bit carrying the 1 Hz wave (SpikeGLX default)
   sync_pulse_ms: 500     # its high duration; a CatGT -xd argument
@@ -122,27 +115,6 @@ kilosort: {}
 # ===========================================================================
 # Notes -- why the values above are what they are.
 # ===========================================================================
-#
-# No Utah array
-#   This is the shape of a session where the spikes come from Neuropixels alone
-#   and Blackrock is there for the pulses -- and for whatever else Central
-#   recorded, which this pipeline does not read.
-#
-#   Nothing needs to say "do not sort Blackrock". Sorting it requires a
-#   spike_file, and there is none, so:
-#
-#     sort_with_kilosort(blackrock)   [--] no blackrock.spike_file, so there is
-#                                          no spike data to sort
-#     extract_sync(blackrock)         [ok] the pulses are read as usual
-#
-#   has_data("blackrock") stays TRUE, which is the important part: Blackrock did
-#   record, so a missing NSP-*.ns5 is still reported loudly rather than read as
-#   "Blackrock was not used". Cross-system alignment (steps 8-9) runs exactly as
-#   it does with an array present -- that is the entire point of this session.
-#
-#   No cmp_file or probe_file either. Those describe an array that is not in the
-#   animal, and check_env.py does not ask for one once there is no spike_file to
-#   sort.
 #
 # Paths
 #   {blackrock_dir} and {neuropixels_dir} come from roots + monkey + session, and
@@ -186,31 +158,65 @@ kilosort: {}
 #   Derived from whether a block declares paths, not from a flag. To say a system
 #   did not record, remove its block; there is then nothing to keep in step with
 #   the paths beside it. Cross-system alignment (steps 8-9) runs when both blocks
-#   are present -- which, for this session, is the reason Blackrock is here.
+#   are present.
 #
-# Outputs -- beside the recording that produced them
-#   {neuropixels_dir}/neuropixels/imec0/kilosort4/  sorted Neuropixels
-#   {neuropixels_dir}/sync/imec0/, lfp/imec0/       edge files, per-channel LFP
-#   {blackrock_dir}/sync/                           NSP edge files
-#   {blackrock_dir}/aligned/imec0/                  time map + mapped spike times
-#   {blackrock_dir}/figures/                        cross-system figures
+#   Declaring paths means the data is *expected*, not that it is present: a share
+#   that is not mounted still fails loudly with "does not exist" rather than being
+#   read as "this system never recorded". The one question paths cannot answer is
+#   whether to sort, which is what kilosort_on_* is for.
 #
-#   Cross-system output goes under the Blackrock directory even with no array
-#   there, because Blackrock is the reference timebase.
+# Outputs -- one folder per system, beside its own recording
+#   {blackrock_dir}/kilosort4/          sorted Utah array, NSP edge files,
+#                                       the cross-system time map, and export/
+#   {neuropixels_dir}/kilosort4/        sorted Neuropixels, SpikeGLX edge files,
+#                                       the LF band, and export/
+#
+#   Everything derived from one recording lands in one directory, so handing an
+#   analysis a sorting means handing it a folder rather than a tour of three
+#   trees. There is no system or probe level above it: the directory this file
+#   names already says which recording it is. Cross-system results go under the
+#   Blackrock one, because Blackrock is the reference timebase.
+#
+# Where the SpikeGLX run went
+#   A session names one binary -- bin_file -- and nothing else. There is no
+#   run_dir/run_name/gate/trigger/probes, because everything they were for is
+#   recoverable from the binary's own SpikeGLX filename:
+#
+#     <dir>/<run>_g<gate>/<run>_g<gate>_imec<probe>/<run>_g<gate>_t<trig>.imec<probe>.ap.bin
+#
+#   CatGT is still the preferred extractor and still runs first wherever the
+#   machine has it: its -dir/-run/-g/-t/-prb come from that parse. So does the
+#   OneBox .obx holding the 14 s burst, and the .lf.bin beside the AP file. A
+#   binary NOT named that way -- a hand-cut extract, the Kilosort demo file --
+#   simply has no run: CatGT is skipped with that reason in the report, the NumPy
+#   detector stands alone, and lf_file must be named explicitly if you want one.
 #
 # Two probes
-#   List them: `probes: [0, 1]`. Each is sorted on its own and fitted onto
-#   Blackrock time on its own -- they are separate streams with separate clocks.
-#   configs/session_template_2probes.yaml is that file, and is otherwise this
-#   one with a Utah array present.
+#   Two session files, each naming its own bin_file and its own neuropixels_dir.
+#   They are separate streams with separate clocks, so each is sorted, extracted
+#   and fitted onto Blackrock time entirely on its own -- which is exactly what
+#   two files already express, with no probe dimension inside either one.
+#
+#   Point the two neuropixels_dir values at the two *_imec<n> folders and their
+#   outputs cannot collide. Pointing both at a shared parent would put two
+#   sortings in one kilosort4/, and _publish merges rather than clobbers, so the
+#   result would be a blend of the two.
 #
 # Probes
-#   The run's .meta wins wherever it has ~snsGeomMap, because it records which
-#   sites were actually active for this recording -- something no external file
-#   can know. A meta that predates ~snsGeomMap is read by probeinterface
-#   instead. probe_file is the fallback for a run neither can read; with none of
-#   the three, setup_probe raises rather than guess a layout. Leave it null for
-#   NP 1.0 NHP long.
+#   Blackrock: cmp_file (the array's own wiring map) is tried first, then
+#   probe_file (a JSON built once by tools/make_probe.py). With neither, sorting
+#   REFUSES to start: a grid in channel order would put units on the wrong
+#   electrodes, and its channel count would silently drop every electrode past it.
+#   Which array is in which monkey is a property of the session, which is why it
+#   is named here and not passed as a flag. If you truly want a grid, build one --
+#   make_probe.py utah with no --cmp -- and name it here, so the choice is written
+#   down rather than assumed.
+#
+#   Neuropixels: the .meta beside bin_file wins wherever it has ~snsGeomMap,
+#   because it records which sites were actually active for this recording --
+#   something no external file can know. probe_file is the fallback for a binary
+#   with no usable .meta; with neither, setup_probe raises rather than guess a
+#   layout. Leave it null for NP 1.0 NHP long.
 #
 # The NSP clock
 #   Blackrock timestamps everything -- .nev markers, eye traces, online spikes --
@@ -280,15 +286,24 @@ kilosort: {}
 #
 # Bad channels
 #   Kilosort removes the channels you list and has no detection of its own, so
-#   look at the data and name them. Entries are recording channel numbers -- rows
-#   in the binary, matched against the probe's chanMap -- not positions on the
-#   probe.
+#   look at the data and name them per array. Entries are recording channel
+#   numbers -- rows in the binary, matched against the probe's chanMap -- not
+#   positions on the array, and a number means a different site on each system.
+#
+#   Non-neural channels sharing a .ns6 (sync, analog in) need no entry: attaching
+#   the probe drops whatever its chanMap does not cover.
 #
 # Drift correction
 #   nblocks is how many depth blocks Kilosort tracks: 1 is rigid (the whole shank
 #   moves together), 5 gives 5 non-overlapping blocks plus 4 straddling their
-#   boundaries, 0 disables it. 1 is right for a Neuropixels shank, whose 16-20 um
-#   site spacing is what the correction interpolates across.
+#   boundaries, 0 disables it.
+#
+#   It is off on the Utah array because the correction interpolates between
+#   neighbouring contacts with a Gaussian kernel of sig_interp = 20 um. At 400 um
+#   pitch the weight to the nearest neighbour is ~1e-87, so there is nothing to
+#   interpolate from, and a nonzero shift estimate scales the data toward zero
+#   rather than moving it -- the correction can only subtract signal here. Drift
+#   on a chronic array is real; this is not the tool for it.
 #
 # Kilosort settings
 #   There is no preprocessing outside Kilosort, because Kilosort already does it
@@ -297,14 +312,16 @@ kilosort: {}
 #   is which of *those* to turn on, not what to do beforehand.
 #
 #     do_CAR                       true    subtract the median across channels
+#                                          (the name says average; the code takes
+#                                          a median, which is what an array wants)
 #     highpass_cutoff              300     Hz
 #     whitening_range              32      channels used for local whitening
 #     artifact_threshold           inf     zero out any batch exceeding this
 #     skip_kilosort_preprocessing  false   only if you filtered the data yourself
-#     nblocks                      1       drift blocks; see above
-#     bad_channels                 null    see above
+#     nblocks                      1       drift blocks; per system, see above
+#     bad_channels                 null    per system, see above
 #
-#   Every other Kilosort parameter passes through unchanged: the block is split
-#   against the installed Kilosort's DEFAULT_SETTINGS and run_kilosort signature,
-#   so each key reaches whichever of the two it belongs to and a key in neither
-#   is refused by name.
+#   Every other Kilosort parameter passes through unchanged. Any of them can be
+#   given per system, not just those two, and a per-system value *replaces* the
+#   shared one -- a list is overridden, not extended. A key Kilosort does not know
+#   fails at sort time with the full list of valid ones, so a typo is loud.

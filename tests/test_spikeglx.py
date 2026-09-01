@@ -210,9 +210,9 @@ def test_the_stall_error_is_an_oserror(tmp_path, monkeypatch):
 
 
 def test_a_directory_is_probed_by_looking_inside_it(tmp_path):
-    # A SpikeGLX run is named by its directory, and find_run_files globs before
-    # anything has a filename to check -- so the mount has to be answerable from
-    # the directory alone, which cannot be probed by reading bytes from it.
+    # A directory has no bytes to read, so the mount has to be answerable from
+    # the directory alone -- which is what the pipeline probes when it checks an
+    # output tree rather than an input file.
     write_stream(tmp_path, n_samples=600)
 
     probe = reachable.check_reachable(tmp_path)
@@ -264,31 +264,67 @@ def test_parse_geom_map_returns_none_when_absent():
     assert spikeglx.parse_geom_map({"nSavedChans": "385"}) is None
 
 
-def test_find_run_files_locates_ap_lf_and_obx(tmp_path):
+def test_run_layout_recovers_catgt_arguments_from_the_binarys_own_name(tmp_path):
+    # The session names only bin_file, so CatGT's -dir/-run/-g/-t/-prb and the
+    # OneBox file have to come from the path itself.
     gate = tmp_path / "run_g0"
-    probe = gate / "run_g0_imec0"
-    probe.mkdir(parents=True)
-    (probe / "run_g0_t0.imec0.ap.bin").write_bytes(b"")
-    (probe / "run_g0_t0.imec0.lf.bin").write_bytes(b"")
+    probe_dir = gate / "run_g0_imec0"
+    probe_dir.mkdir(parents=True)
+    ap = probe_dir / "run_g0_t0.imec0.ap.bin"
+    ap.write_bytes(b"")
+    (probe_dir / "run_g0_t0.imec0.lf.bin").write_bytes(b"")
     (gate / "run_g0_t0.obx0.obx.bin").write_bytes(b"")
 
-    found = spikeglx.find_run_files(tmp_path, "run", gate=0, trigger=0, probe=0)
-    assert found["ap"].name == "run_g0_t0.imec0.ap.bin"
-    assert found["lf"].name == "run_g0_t0.imec0.lf.bin"
-    assert found["obx"].name == "run_g0_t0.obx0.obx.bin"
+    layout = spikeglx.run_layout(ap)
+
+    assert layout.directory == tmp_path        # CatGT -dir is *above* the gate folder
+    assert layout.run_name == "run"
+    assert (layout.gate, layout.trigger, layout.probe) == (0, 0, 0)
+    assert layout.sibling("lf").name == "run_g0_t0.imec0.lf.bin"
+    assert layout.obx.name == "run_g0_t0.obx0.obx.bin"
 
 
-def test_find_run_files_also_finds_catgt_output(tmp_path):
+def test_run_layout_reads_the_last_gate_trigger_pair_not_the_first(tmp_path):
+    # Real run names carry their own _t: "Tank_20210825_t1229_d10500_L11_exp".
+    # Taking the first _g<n>_t<n> would cut the name in half and hand CatGT a run
+    # that does not exist.
+    name = "Tank_20210825_t1229_d10500_L11_exp"
+    gate = tmp_path / f"{name}_g0"
+    gate.mkdir(parents=True)
+    ap = gate / f"{name}_g0_t0.imec0.ap.bin"
+    ap.write_bytes(b"")
+
+    layout = spikeglx.run_layout(ap)
+
+    assert layout.run_name == name
+    assert (layout.gate, layout.trigger) == (0, 0)
+    assert layout.gate_dir == gate             # no probe subfolder in this run
+
+
+def test_run_layout_handles_catgt_output(tmp_path):
     gate = tmp_path / "run_g0"
     gate.mkdir(parents=True)
-    (gate / "run_g0_tcat.imec0.ap.bin").write_bytes(b"")
-    found = spikeglx.find_run_files(tmp_path, "run", trigger="cat")
-    assert found["ap"].name == "run_g0_tcat.imec0.ap.bin"
+    ap = gate / "run_g0_tcat.imec0.ap.bin"
+    ap.write_bytes(b"")
+
+    assert spikeglx.run_layout(ap).trigger == "cat"
 
 
-def test_find_run_files_missing_run_raises(tmp_path):
-    with pytest.raises(FileNotFoundError):
-        spikeglx.find_run_files(tmp_path / "absent", "run")
+def test_a_binary_that_is_not_spikeglx_output_has_no_run(tmp_path):
+    # The Kilosort demo file. There is nothing to hand CatGT, and saying so is the
+    # point: the callers skip it with a reason rather than inventing arguments.
+    assert spikeglx.run_layout(tmp_path / "ZFM-02370_mini.imec0.ap.short.bin") is None
+
+
+def test_a_missing_lf_sibling_is_none_rather_than_a_guess(tmp_path):
+    gate = tmp_path / "run_g0"
+    gate.mkdir(parents=True)
+    ap = gate / "run_g0_t0.imec0.ap.bin"
+    ap.write_bytes(b"")
+
+    layout = spikeglx.run_layout(ap)
+    assert layout.sibling("lf") is None
+    assert layout.obx is None
 
 
 def test_export_lfp_writes_a_matlab_struct(tmp_path):

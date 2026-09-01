@@ -32,7 +32,7 @@ from pathlib import Path
 # The shared CLI helpers live in tools/; _cli adds src/ itself.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 
-from _cli import Runner, build_parser, load, run_probes  # noqa: E402
+from _cli import Runner, build_parser, load  # noqa: E402
 
 import spikesorting as ss  # noqa: E402
 
@@ -62,20 +62,15 @@ def main() -> int:
     run = Runner(config, keep_going=args.keep_going)
     print()
 
-    # The whole pipeline. The inner loop is the probes of a SpikeGLX run: two
-    # probes are two streams with two clocks, sorted separately. Blackrock yields
-    # one, so it is sorted once however many probes the Neuropixels run holds.
+    # The whole pipeline: one sort per system the session declares.
     for system in ss.SYSTEMS:
-        for probe_index in run_probes(config, system, args.probe):
-            run(
-                ss.sort_with_kilosort,
-                config,
-                system,
-                probe_index,
-                dry_run=args.dry_run,
-                system=system,
-                probe=probe_index,
-            )
+        run(
+            ss.sort_with_kilosort,
+            config,
+            system,
+            dry_run=args.dry_run,
+            system=system,
+        )
 
     code = run.finish("sorting pipeline")
     if code == 0 and not args.dry_run:
@@ -84,9 +79,8 @@ def main() -> int:
         for system in ss.SYSTEMS:
             if not getattr(config, f"sorts_{system}"):
                 continue
-            for probe_index in run_probes(config, system, args.probe):
-                sorted_dir = config.paths.sorted_for(system, probe_index)
-                print(f"    phy template-gui {sorted_dir}/params.py")
+            sorted_dir = config.paths.sorted_for(system)
+            print(f"    phy template-gui {sorted_dir}/params.py")
         print("then:")
         print(f"    python run_exporting_pipeline.py --config {args.config}")
     return code

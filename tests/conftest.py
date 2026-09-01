@@ -77,15 +77,20 @@ def spikeglx_run(
     sites: dict[int, int] | None = None,
     duration_s: float = 5.0,
     n_chan: int = 8,
-) -> Path:
+) -> dict[int, Path]:
     """A SpikeGLX run folder holding one AP binary + ``.meta`` per probe.
 
     Each probe gets its own SY-bit-6 phase and its own site count, so a test can
-    tell *which* probe's files were read -- which is the whole question once a run
-    holds more than one.
+    tell *which* probe's files were read -- which is the whole question once two
+    sessions point into the same run.
+
+    Returns ``{probe index: AP binary}``. A session names the binary, so that is
+    what a caller needs; the run folder around it is what ``run_layout`` reads
+    back to drive CatGT.
     """
     fs = 30000.0
     gate_dir = Path(root) / f"{run_name}_g{gate}"
+    built: dict[int, Path] = {}
     for probe in probes:
         probe_dir = gate_dir / f"{run_name}_g{gate}_imec{probe}"
         probe_dir.mkdir(parents=True, exist_ok=True)
@@ -99,7 +104,8 @@ def spikeglx_run(
         bin_path.with_suffix(".meta").write_text(
             _imec_meta(n_chan, (sites or {}).get(probe, 4)), encoding="utf-8"
         )
-    return Path(root)
+        built[probe] = bin_path
+    return built
 
 
 def coded_burst_times(

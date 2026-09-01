@@ -10,6 +10,7 @@ carries the SMA1 1 Hz square wave used for fine alignment.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -34,7 +35,8 @@ __all__ = [
     "iter_channel",
     "read_sy_word",
     "raw_to_volts",
-    "find_run_files",
+    "RunLayout",
+    "run_layout",
     "parse_geom_map",
     "parse_geom_header",
     "export_lfp",
@@ -284,44 +286,101 @@ def raw_to_volts(info: StreamInfo, raw: np.ndarray, gain: float = 1.0) -> np.nda
     return np.asarray(raw, dtype=np.float64) * (ai_range / max_int) / gain
 
 
-def find_run_files(
-    run_dir: str | Path,
-    run_name: str,
-    gate: int = 0,
-    trigger: int | str = 0,
-    probe: int = 0,
-) -> dict[str, Path | None]:
-    """Locate the AP / LF / OBX binaries of a SpikeGLX run.
+#: A SpikeGLX AP/LF filename: ``<run>_g<gate>_t<trigger>.imec<probe>.ap.bin``.
+#: ``<run>`` is greedy so a run name that itself contains ``_t1229`` still gives
+#: up only the *last* ``_g<n>_t<n>`` -- which is the one SpikeGLX appended.
+#: The trigger is ``cat`` in CatGT output, so it is not restricted to digits.
+_RUN_FILENAME = re.compile(
+    r"^(?P<run>.+)_g(?P<gate>\d+)_t(?P<trigger>\w+)\.imec(?P<probe>\d+)\.(ap|lf)\.bin$"
+)
 
-    Globs rather than assembling exact names, so both the raw layout
-    (``run_g0_t0.imec0.ap.bin``) and CatGT output (``run_g0_tcat.imec0.ap.bin``)
-    are found, with or without the per-probe subfolder.
 
-    Returns a dict with keys ``ap``, ``lf``, ``obx``; values are None when absent.
+@dataclass(frozen=True)
+class RunLayout:
+    """The SpikeGLX run a binary belongs to, recovered from its own path.
+
+    A session names one binary and nothing else, but CatGT is driven by
+    ``-dir``/``-run``/``-g``/``-t``/``-prb`` and the OneBox burst lives in a
+    separate ``.obx`` file. Both are recoverable, because SpikeGLX's layout is
+    fixed::
+
+        <dir>/<run>_g<gate>/<run>_g<gate>_imec<probe>/<run>_g<gate>_t<trig>.imec<probe>.ap.bin
+
+    so nothing has to be restated in the session file. A binary that does not
+    follow the convention -- the Kilosort demo file, a hand-made extract -- has no
+    layout, :func:`run_layout` returns ``None``, and the callers degrade to what
+    the binary alone supports.
     """
-    run_dir = Path(run_dir)
-    gate_dir = run_dir / f"{run_name}_g{gate}"
-    if not gate_dir.exists():
-        gate_dir = run_dir  # already pointed at the gate folder
 
-    probe_dir = gate_dir / f"{run_name}_g{gate}_imec{probe}"
-    search_dirs = [d for d in (probe_dir, gate_dir) if d.exists()]
-    if not search_dirs:
-        raise FileNotFoundError(f"no SpikeGLX run folder found under {run_dir} for {run_name}_g{gate}")
+    #: CatGT's ``-dir``: the directory *containing* the gate folder.
+    directory: Path
+    run_name: str
+    gate: int
+    #: ``0`` for raw SpikeGLX output, ``"cat"`` for CatGT's own.
+    trigger: int | str
+    probe: int
+    #: The ``<run>_g<gate>`` folder itself, which holds any ``.obx``.
+    gate_dir: Path
 
-    def first_match(pattern: str) -> Path | None:
-        for directory in search_dirs:
-            matches = sorted(directory.glob(pattern))
-            if matches:
-                return matches[0]
+    def sibling(self, suffix: str) -> Path | None:
+        """The matching ``lf``/``ap`` binary for this run, if it is on disk.
+
+        Looks beside the AP file first, then in the gate folder, since SpikeGLX
+        writes the per-probe subfolder only when asked to.
+        """
+        name = f"{self.run_name}_g{self.gate}_t{self.trigger}.imec{self.probe}.{suffix}.bin"
+        for directory in (self.gate_dir / f"{self.run_name}_g{self.gate}_imec{self.probe}",
+                          self.gate_dir):
+            candidate = directory / name
+            if candidate.exists():
+                return candidate
         return None
 
-    tag = f"t{trigger}"
-    return {
-        "ap": first_match(f"*_{tag}.imec{probe}.ap.bin") or first_match(f"*.imec{probe}.ap.bin"),
-        "lf": first_match(f"*_{tag}.imec{probe}.lf.bin") or first_match(f"*.imec{probe}.lf.bin"),
-        "obx": first_match(f"*_{tag}.obx*.bin") or first_match("*.obx*.bin"),
-    }
+    @property
+    def obx(self) -> Path | None:
+        """The OneBox binary carrying the 14 s coded burst, if the run has one.
+
+        One per *run*, not per probe: the burst comes from the OneBox, so both
+        probes of a run read the same file.
+        """
+        matches = sorted(self.gate_dir.glob(f"*_t{self.trigger}.obx*.bin"))
+        return matches[0] if matches else None
+
+
+def run_layout(bin_path: str | Path) -> RunLayout | None:
+    """Recover the SpikeGLX run around ``bin_path``, or None if it is not one.
+
+    Read off the *filename*, not the directory tree, so it works whether or not
+    the per-probe subfolder is present and whether or not the file has been moved
+    -- the ``-dir`` it reports is simply wrong in the latter case, and CatGT says
+    so rather than silently extracting the wrong run.
+    """
+    bin_path = Path(bin_path)
+    match = _RUN_FILENAME.match(bin_path.name)
+    if match is None:
+        return None
+
+    run_name = match["run"]
+    gate = int(match["gate"])
+    trigger: int | str = match["trigger"]
+    if isinstance(trigger, str) and trigger.isdigit():
+        trigger = int(trigger)
+
+    # The gate folder is whichever ancestor is named <run>_g<gate>. Directly the
+    # parent when SpikeGLX wrote no per-probe subfolder, its parent when it did.
+    gate_name = f"{run_name}_g{gate}"
+    gate_dir = bin_path.parent
+    if gate_dir.name != gate_name and gate_dir.parent.name == gate_name:
+        gate_dir = gate_dir.parent
+
+    return RunLayout(
+        directory=gate_dir.parent,
+        run_name=run_name,
+        gate=gate,
+        trigger=trigger,
+        probe=int(match["probe"]),
+        gate_dir=gate_dir,
+    )
 
 
 def parse_geom_header(meta: dict[str, str]) -> dict[str, float | str] | None:

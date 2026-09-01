@@ -48,19 +48,15 @@ SORTER_NAME = "kilosort4"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def stream_label(system: str, probe: int = 0) -> str:
-    """What one stream is called in paths, cache tags and status lines.
+def stream_label(system: str) -> str:
+    """What one stream is called in cache tags and status lines.
 
-    Blackrock records one stream, so it is just the system. A SpikeGLX run can
-    hold several probes, each with its own clock and its own sync word, so each is
-    named the way SpikeGLX names it: ``imec0``, ``imec1``.
+    One session names one binary per system, so a stream *is* a system and the
+    label is just its name. It is no longer a path component: results go to
+    ``<system>_dir/<sorter>/``, which the directory itself already identifies.
+    Two probes means two session files with two ``neuropixels_dir`` values.
     """
-    return "blackrock" if system == "blackrock" else f"imec{int(probe)}"
-
-
-def _with_probe(directory: Path, system: str, probe: int) -> Path:
-    """Add the probe level for Neuropixels; leave Blackrock's paths alone."""
-    return directory if system == "blackrock" else directory / stream_label(system, probe)
+    return system
 
 
 def default_config_dir() -> Path:
@@ -300,6 +296,11 @@ class BlackrockSpec:
     Channel defaults follow ``SynchronizePulse_setup.md``: in ``NSP-*.ns5``,
     channel 1 carries the 1 Hz square wave from SpikeGLX and channel 2 carries
     the 14 s coded burst emitted by Blackrock DO1.
+
+    Its Neuropixels counterpart is the OneBox ``.obx`` file, found from the AP
+    binary's own path -- see ``_io.spikeglx.run_layout``. A binary that is not
+    laid out as a SpikeGLX run has no ``.obx`` to match against, and alignment
+    falls back to the 1 Hz train alone.
     """
 
     #: NSP-*.ns5 -- holds the two sync channels.
@@ -352,21 +353,24 @@ class BlackrockSpec:
 
 @dataclass(frozen=True)
 class NeuropixelsSpec:
-    """SpikeGLX inputs.
+    """SpikeGLX inputs: the AP binary, and optionally the LF one beside it.
 
-    Two ways to point at the data:
+    One session names one binary. There is no SpikeGLX *run* model -- no
+    ``run_dir``/``run_name``, no gate/trigger, no probe list -- because a run adds
+    nothing to sorting a file that is already sitting in a folder, and everything
+    it did add (CatGT, the OneBox burst, ``probes:``) came with a second way to
+    say where the data is. Two probes is two session files.
 
-    * a SpikeGLX *run* (``run_dir`` + ``run_name`` + gate/trigger/probe indices),
-      which is what CatGT consumes; or
-    * a single ``bin_file``, for one-off binaries outside a run folder.
+    ``bin_file`` is the AP band: sorted, and the source of the 1 Hz sync train in
+    its SY word. ``lf_file`` is the LF band, read only by ``extract_lfp``.
     """
 
-    run_dir: Path | None = None
-    run_name: str | None = None
-    gate: int = 0
-    trigger: int = 0
-    probes: tuple[int, ...] = (0,)
+    #: The AP binary. Its ``.meta``, when there is one beside it, supplies the
+    #: channel count, the sample rate and the probe geometry.
     bin_file: Path | None = None
+    #: The LF binary, for ``export_lfp``. Unset means there is no LF band to
+    #: export, and the stage skips itself.
+    lf_file: Path | None = None
     #: Total channels in the binary, including the SY word. Derived from the
     #: .meta file when absent.
     n_chan_bin: int | None = None
@@ -376,6 +380,7 @@ class NeuropixelsSpec:
     #: SY-word bit carrying the SMA1 1 Hz square wave. 6 is the SpikeGLX default.
     sync_bit: int = 6
     #: High duration of the 1 Hz square wave, in ms (1 s period, 50% duty).
+    #: A CatGT ``-xd`` argument.
     sync_pulse_ms: int = 500
     #: Word index of the XA1 analog input in the obx stream (14 s coded burst).
     burst_word: int = 1
@@ -383,9 +388,9 @@ class NeuropixelsSpec:
     burst_threshold_v: tuple[float, float] = (1.0, 0.0)
     #: Expected burst pulse width in ms; 0 accepts any width.
     burst_pulse_ms: int = 0
-    #: Probe JSON from make_probe.py, used when the run has no ``.meta`` to build
-    #: the map from. The .meta wins where it exists: it records which sites were
-    #: actually active, which a file built from another run cannot know.
+    #: Probe JSON from make_probe.py, used when the binary has no ``.meta`` to
+    #: build the map from. The .meta wins where it exists: it records which sites
+    #: were actually active, which a file built from another run cannot know.
     probe_file: Path | None = None
     #: How the waveform export cuts and filters this system's snippets. The AP
     #: band arrives high-passed from the probe, so the default does not filter.
@@ -399,12 +404,8 @@ class NeuropixelsSpec:
         n_chan = data.get("n_chan_bin")
         rate = data.get("sample_rate")
         return cls(
-            run_dir=_as_path(data.get("run_dir")),
-            run_name=data.get("run_name"),
-            gate=int(data.get("gate", 0)),
-            trigger=int(data.get("trigger", 0)),
-            probes=tuple(int(p) for p in data.get("probes", (0,))),
             bin_file=_as_path(data.get("bin_file")),
+            lf_file=_as_path(data.get("lf_file")),
             n_chan_bin=int(n_chan) if n_chan is not None else None,
             sample_rate=float(rate) if rate is not None else None,
             sync_bit=int(data.get("sync_bit", 6)),
@@ -419,28 +420,27 @@ class NeuropixelsSpec:
 
 @dataclass(frozen=True)
 class OutputPaths:
-    """Where one session's outputs go: beside the recording that produced them.
+    """Where one session's outputs go: one folder per system, beside its data.
 
-    Each system has its own data directory, so each system's products stay with
-    it -- sorted spikes, its own sync edges, and (Neuropixels only) LFP. Only the
-    cross-system results have nowhere natural to live; they go under the
-    Blackrock directory, because Blackrock is the reference timebase everything
-    is mapped onto.
+    Everything derived from a system lands in ``<system>_dir/<sorter>/`` -- the
+    sorting, that system's sync edges, and the export bundle inside it. Handing
+    an analysis a recording means handing it one directory, and there is no
+    system or probe level above it: the directory the session names already says
+    which recording it is. Cross-system results (the time map) go under the
+    Blackrock one, because Blackrock is the reference timebase everything is
+    mapped onto.
 
     ``sorted_np`` and ``sorted_br`` both name a directory holding the sorter's
     own results -- ``spike_times.npy``, ``params.py``, ``cluster_KSLabel.tsv``.
     That is the invariant every consumer depends on: :mod:`.pipeline` reads
-    ``spike_times.npy`` straight out of them, and Phy is opened on them. Nesting
-    the sorter name one level down keeps a second sorter's run beside the first
+    ``spike_times.npy`` straight out of them, and Phy is opened on them. Naming
+    the directory after the sorter keeps a second sorter's run beside the first
     instead of on top of it.
     """
 
     blackrock_dir: Path | None = None
     neuropixels_dir: Path | None = None
     sorter: str = SORTER_NAME
-    #: Which probes this session recorded, for :meth:`all`. One SpikeGLX run can
-    #: hold several, and each is a stream of its own with its own clock.
-    npx_probes: tuple[int, ...] = (0,)
 
     def dir_for(self, system: str) -> Path | None:
         """That system's directory, or None when it never recorded."""
@@ -463,21 +463,17 @@ class OutputPaths:
                 return directory
         raise ValueError("session has neither a blackrock_dir nor a neuropixels_dir")
 
-    def sync_for(self, system: str, probe: int = 0) -> Path:
-        """Edge files, beside the recording they were extracted from."""
-        return _with_probe(self._require(system) / "sync", system, probe)
-
-    @property
-    def lfp(self) -> Path:
-        # Neuropixels only: Blackrock LFPs are already saved separately by Central.
-        return self._require("neuropixels") / "lfp"
-
-    def lfp_for(self, probe: int = 0) -> Path:
-        return self.lfp / stream_label("neuropixels", probe)
-
-    def sorted_for(self, system: str, probe: int = 0) -> Path:
+    def sorted_for(self, system: str) -> Path:
         """Where one system's sorting lands. The system-agnostic form."""
-        return _with_probe(self._require(system) / system, system, probe) / self.sorter
+        return self._require(system) / self.sorter
+
+    def sync_for(self, system: str) -> Path:
+        """Edge files, in the same folder as the sorting they are aligned with.
+
+        Computable before anything is sorted, which is what lets ``extract_sync``
+        run on the rig straight after the session.
+        """
+        return self.sorted_for(system)
 
     @property
     def sorted_np(self) -> Path:
@@ -489,51 +485,29 @@ class OutputPaths:
 
     @property
     def aligned(self) -> Path:
-        return self.primary / "aligned"
+        """The time map's home: the reference system's folder, or the only one."""
+        return self.primary / self.sorter
 
-    def aligned_for(self, probe: int = 0) -> Path:
-        """One probe's time map and mapped spike times.
-
-        Per probe rather than per system: each probe has its own clock, so its
-        map, its trimmed edge trains and its validation are its own.
-        """
-        return self.aligned / stream_label("neuropixels", probe)
-
-    def export_for(self, system: str, probe: int = 0) -> Path:
-        """The copy-paste bundle for one stream: everything derived from it.
+    def export_for(self, system: str) -> Path:
+        """The copy-paste bundle for one system: everything derived from it.
 
         Figures, the manifest, the ``.mat`` products and the plain arrays all
         land here, so handing the analysis a sorting means handing it one folder.
         Computable whether or not sorting ran -- a session that only exports the
         LFP gets a bundle holding just that, which keeps one rule instead of two.
         """
-        return self.sorted_for(system, probe) / "export"
+        return self.sorted_for(system) / "export"
 
-    @property
-    def figures(self) -> Path:
-        return self.primary / "figures"
-
-    def figures_for(self, system: str, probe: int = 0) -> Path:
-        """Per-unit and overview plots, inside that stream's bundle."""
-        return self.export_for(system, probe) / "figures"
+    def figures_for(self, system: str) -> Path:
+        """Per-unit and overview plots, inside that system's bundle."""
+        return self.export_for(system) / "figures"
 
     def all(self) -> tuple[Path, ...]:
         """Every directory this session can actually write to."""
-        paths: list[Path] = [self.aligned]
-        if self.neuropixels_dir is not None:
-            for probe in self.npx_probes:
-                paths += [
-                    self.sync_for("neuropixels", probe),
-                    self.sorted_for("neuropixels", probe),
-                    self.export_for("neuropixels", probe),
-                    self.aligned_for(probe),
-                ]
-        if self.blackrock_dir is not None:
-            paths += [
-                self.sync_for("blackrock"),
-                self.sorted_br,
-                self.export_for("blackrock"),
-            ]
+        paths: list[Path] = []
+        for system in ("neuropixels", "blackrock"):
+            if self.dir_for(system) is not None:
+                paths += [self.sorted_for(system), self.export_for(system)]
         return tuple(dict.fromkeys(paths))
 
     def mkdirs(self) -> None:
@@ -588,29 +562,10 @@ class SessionConfig:
     #: systems genuinely want different answers -- a 400 um Utah array and a dense
     #: probe are not the same problem -- but they share most settings.
     kilosort_by_system: dict[str, dict[str, Any]] = field(default_factory=dict)
-    #: Per-probe ``kilosort:`` blocks from ``neuropixels.by_probe``, merged last.
-    #: A dead site is a fact about one probe, not about the run.
-    kilosort_by_probe: dict[int, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def paths(self) -> OutputPaths:
-        return OutputPaths(
-            self.blackrock_dir,
-            self.neuropixels_dir,
-            self.sorter,
-            npx_probes=self.probe_indices("neuropixels"),
-        )
-
-    def probe_indices(self, system: str) -> tuple[int, ...]:
-        """Which streams of ``system`` this session recorded.
-
-        Blackrock has one, so the drivers' inner loop runs once for it and does
-        not re-extract the NSP file per Neuropixels probe. A bare ``bin_file``
-        also has one: it names a single binary, with no imec dimension to iterate.
-        """
-        if system == "blackrock" or self.neuropixels.bin_file is not None:
-            return (0,)
-        return tuple(self.neuropixels.probes)
+        return OutputPaths(self.blackrock_dir, self.neuropixels_dir, self.sorter)
 
     @property
     def output_root(self) -> Path:
@@ -621,25 +576,22 @@ class SessionConfig:
     def cache_dir(self) -> Path | None:
         return self.machine.cache_dir
 
-    def kilosort_for(self, system: str, probe_index: int = 0) -> dict[str, Any]:
-        """Kilosort settings for one stream: shared, then system, then probe.
+    def kilosort_for(self, system: str) -> dict[str, Any]:
+        """Kilosort settings for one system: the shared block, then that system's.
 
         Merged key by key rather than replaced, so a system can change ``nblocks``
-        without discarding the rest of the shared block, and a probe can name its
-        own dead sites without restating how you want sorting done. Each layer is
-        one level deep: a per-probe ``bad_channels`` *replaces* the list above it
-        rather than extending it. Everything here is passed straight to
-        ``run_sorter`` -- Kilosort's own parameters plus the ones SpikeInterface
-        adds (``do_CAR``, ``bad_channels``, ``invert_sign``,
-        ``skip_kilosort_preprocessing``, ``save_preprocessed_copy``).
+        without discarding the rest of the shared block. The layer is one level
+        deep: a per-system ``bad_channels`` *replaces* the list above it rather
+        than extending it. Everything here is passed straight to ``run_sorter`` --
+        Kilosort's own parameters plus the ones SpikeInterface adds (``do_CAR``,
+        ``bad_channels``, ``invert_sign``, ``skip_kilosort_preprocessing``,
+        ``save_preprocessed_copy``).
 
         Empty means Kilosort's defaults, which already highpass at 300 Hz and
         subtract the median across channels on every batch.
         """
         merged = dict(self.kilosort)
         merged.update(self.kilosort_by_system.get(system) or {})
-        if system != "blackrock":
-            merged.update(self.kilosort_by_probe.get(probe_index) or {})
         return merged
 
     def waveforms_for(self, system: str) -> WaveformSpec:
@@ -662,10 +614,7 @@ class SessionConfig:
         system never recorded", which would skip it in silence.
         """
         if system == "neuropixels":
-            npx = self.neuropixels
-            return npx.bin_file is not None or (
-                npx.run_dir is not None and bool(npx.run_name)
-            )
+            return self.neuropixels.bin_file is not None
         brk = self.blackrock
         return brk.sync_file is not None or brk.spike_file is not None
 
@@ -691,31 +640,6 @@ class SessionConfig:
         """
         return self.blackrock.spike_file is not None and self.kilosort_on_blackrock
 
-    def _missing_probe_binaries(self) -> list[str]:
-        """Every declared probe whose AP binary is not in the run folder.
-
-        A run holding imec0 and imec1 looks complete from ``run_dir`` alone, so
-        without this a typo'd ``probes:`` entry is only discovered after the first
-        probe has been sorted.
-        """
-        from ._io import spikeglx  # local: keeps the config layer import-light
-
-        npx = self.neuropixels
-        problems: list[str] = []
-        for probe in self.probe_indices("neuropixels"):
-            try:
-                files = spikeglx.find_run_files(
-                    npx.run_dir, npx.run_name, npx.gate, npx.trigger, probe
-                )
-            except FileNotFoundError as error:
-                return [str(error)]
-            if files["ap"] is None:
-                problems.append(
-                    f"neuropixels {stream_label('neuropixels', probe)}: no AP binary "
-                    f"for run {npx.run_name} g{npx.gate} under {npx.run_dir}"
-                )
-        return problems
-
     def missing_inputs(self) -> list[str]:
         """Return human-readable problems with the *input* paths.
 
@@ -729,20 +653,12 @@ class SessionConfig:
         # needs them to be there.
         if self.has_data("neuropixels"):
             npx = self.neuropixels
-            if npx.bin_file is not None:
-                if not npx.bin_file.exists():
-                    problems.append(f"neuropixels.bin_file does not exist: {npx.bin_file}")
-            elif npx.run_dir is not None:
-                if not npx.run_dir.exists():
-                    problems.append(f"neuropixels.run_dir does not exist: {npx.run_dir}")
-                elif npx.run_name:
-                    problems += self._missing_probe_binaries()
-                if not npx.run_name:
-                    problems.append("neuropixels.run_name is required when run_dir is set")
-            else:
-                problems.append(
-                    "neuropixels needs either bin_file or run_dir+run_name"
-                )
+            if not npx.bin_file.exists():
+                problems.append(f"neuropixels.bin_file does not exist: {npx.bin_file}")
+            # Only when named: an unset lf_file means there is no LF band to
+            # export, which is the ordinary case, not a missing input.
+            if npx.lf_file is not None and not npx.lf_file.exists():
+                problems.append(f"neuropixels.lf_file does not exist: {npx.lf_file}")
 
         if self.has_data("blackrock"):
             brk = self.blackrock
@@ -899,18 +815,26 @@ _REMOVED_KEYS = {
         "ran first, shifting every contact after the excluded one. A broken "
         "electrode is kilosort.bad_channels -- the same on both systems"
     ),
-}
-
-#: Keys one system understands and the other does not. Same reason as above: a
-#: block written where nothing reads it would sort with settings the file says
-#: are different.
-_WRONG_SYSTEM_KEYS = {
-    "blackrock": {
-        "by_probe": (
-            "Blackrock records one stream; by_probe is for the probes of a "
-            "SpikeGLX run. Put a dead electrode in blackrock.kilosort.bad_channels"
-        ),
-    },
+    # The SpikeGLX run model. A session names the binary and nothing else; where
+    # a run folder is still needed -- CatGT's arguments, the OneBox burst -- it is
+    # derived from the binary's own path by ``_io.spikeglx.run_layout``. These sit
+    # in session copies on the rig, so each has to say what replaces it.
+    "run_dir": (
+        "name the AP binary outright: neuropixels.bin_file, with neuropixels_dir "
+        "pointing at the folder holding it. CatGT still runs -- its -dir/-run/-g/"
+        "-t/-prb come from the binary's own SpikeGLX filename"
+    ),
+    "run_name": "derived from the bin_file name -- see run_dir above",
+    "gate": "derived from the bin_file name -- see run_dir above",
+    "trigger": "derived from the bin_file name -- see run_dir above",
+    "probes": (
+        "one session names one binary. Two probes is two session files, each "
+        "with its own neuropixels_dir and bin_file"
+    ),
+    "by_probe": (
+        "there is no probe dimension in a session any more -- give the second "
+        "probe its own session file, with its own kilosort: block"
+    ),
 }
 
 
@@ -931,67 +855,6 @@ def _reject_removed_keys(data: dict[str, Any], path: Path) -> None:
                 f"{path}: '{prefix}{key}' is no longer a session setting "
                 f"-- {_REMOVED_KEYS[key]}"
             )
-        wrong = _WRONG_SYSTEM_KEYS.get(prefix.rstrip("."), {})
-        for key in sorted(set(block) & set(wrong)):
-            raise ValueError(f"{path}: '{prefix}{key}' does not apply -- {wrong[key]}")
-
-
-def _reject_probes_without_a_run(data: dict[str, Any], path: Path) -> None:
-    """A bare ``bin_file`` names one binary, so it cannot hold two probes.
-
-    Reading past this would sort the same file twice and file the two identical
-    results under imec0 and imec1.
-    """
-    npx = data.get("neuropixels") or {}
-    probes = npx.get("probes")
-    if npx.get("bin_file") and probes is not None and len(probes) > 1:
-        raise ValueError(
-            f"{path}: neuropixels.probes lists {len(probes)} probes beside a "
-            "bin_file, which names a single binary. Point at a SpikeGLX run "
-            "(run_dir + run_name) to sort more than one probe."
-        )
-
-
-def _kilosort_by_probe(data: dict[str, Any], path: Path) -> dict[int, dict[str, Any]]:
-    """Parse ``neuropixels.by_probe`` into ``{probe index: kilosort settings}``.
-
-    Only ``kilosort:`` is accepted under a probe. Geometry already comes from that
-    probe's own ``.meta``, and a key nothing reads is worse than no key at all:
-    it would sit in the session file describing a run that never happened.
-    """
-    npx = data.get("neuropixels") or {}
-    raw = npx.get("by_probe")
-    if not raw:
-        return {}
-    if not isinstance(raw, dict):
-        raise ValueError(
-            f"{path}: neuropixels.by_probe must map a probe index to its settings, "
-            f"got {type(raw).__name__}"
-        )
-
-    declared = [int(p) for p in npx.get("probes", (0,))]
-    resolved: dict[int, dict[str, Any]] = {}
-    for key, block in raw.items():
-        if not isinstance(key, int):
-            raise ValueError(
-                f"{path}: neuropixels.by_probe key {key!r} is not a probe index "
-                "-- write '1:', the same number as in 'probes:'"
-            )
-        if key not in declared:
-            raise ValueError(
-                f"{path}: neuropixels.by_probe names probe {key}, which is not in "
-                f"probes: {declared}. Settings there would apply to nothing."
-            )
-        block = block or {}
-        extra = sorted(set(block) - {"kilosort"})
-        if extra:
-            raise ValueError(
-                f"{path}: neuropixels.by_probe.{key} may only carry 'kilosort:', "
-                f"got {', '.join(extra)}. Geometry comes from that probe's own .meta."
-            )
-        if block.get("kilosort"):
-            resolved[key] = dict(block["kilosort"])
-    return resolved
 
 
 def load_machine(name: str, config_dir: Path | None = None) -> MachineProfile:
@@ -1019,7 +882,6 @@ def load_session_config(
 
     data = _read_yaml(session_path)
     _reject_removed_keys(data, session_path)
-    _reject_probes_without_a_run(data, session_path)
     profile = load_machine(machine, config_dir) if isinstance(machine, str) else machine
 
     session_name = str(data.get("session") or session_path.stem)
@@ -1096,7 +958,7 @@ def load_session_config(
             "neuropixels_dir outright."
         )
 
-    return SessionConfig(
+    config = SessionConfig(
         session=session_name,
         machine=profile,
         monkey=monkey,
@@ -1121,7 +983,37 @@ def load_session_config(
             for system in ("neuropixels", "blackrock")
             if (data.get(system) or {}).get("kilosort")
         },
-        kilosort_by_probe=_kilosort_by_probe(data, session_path),
+    )
+    _reject_colliding_system_dirs(config, session_path)
+    return config
+
+
+def _reject_colliding_system_dirs(config: SessionConfig, path: Path) -> None:
+    """Two recording systems may not share a directory.
+
+    Everything a system produces lands in ``<system>_dir/<sorter>/`` and nothing
+    in that path names the system -- the directory is supposed to *be* the
+    identity. So two systems pointed at one directory would write one sorting on
+    top of the other: same ``spike_times.npy``, same ``params.py``, same export
+    bundle, and ``_publish`` copies with ``dirs_exist_ok`` so the second would
+    merge into the first rather than replace it.
+
+    Easy to hit by accident, because ``<root>/<monkey>/<session>`` is the same
+    string for both systems whenever the two roots agree -- which is the ordinary
+    case when one share holds everything.
+    """
+    if not (config.has_data("blackrock") and config.has_data("neuropixels")):
+        return
+    if config.blackrock_dir != config.neuropixels_dir:
+        return
+    raise ValueError(
+        f"{path}: blackrock_dir and neuropixels_dir are the same directory "
+        f"({config.blackrock_dir}), but each system writes everything it "
+        f"produces to <dir>/{config.sorter}/ -- so the two sortings would land on "
+        "top of each other.\n"
+        "  Point them at the two recordings' own folders. A SpikeGLX run nests "
+        "its own, so neuropixels_dir is usually the <run>_g<n>_imec<n> directory "
+        "holding the .ap.bin, while blackrock_dir is where the .ns5/.ns6 sit."
     )
 
 

@@ -1,8 +1,8 @@
 """Drive sync-edge extraction for a session (pipeline steps 2 and 4).
 
-Produces four canonical edge files, each in the ``sync/`` directory beside the
-recording it came from -- the SpikeGLX pair under ``neuropixels_dir``, the NSP
-pair under ``blackrock_dir``:
+Produces four canonical edge files, each in the folder beside the recording it
+came from -- the SpikeGLX pair under ``neuropixels_dir/kilosort4/``, the NSP pair
+under ``blackrock_dir/kilosort4/``:
 
 ===================== ==============================================
 ``npx_1hz.txt``       SpikeGLX SY-word bit 6, the 1 Hz square wave
@@ -18,6 +18,13 @@ these, so it does not care which extractor produced them.
 SpikeGLX edges are produced twice where possible -- once by CatGT, once by the
 NumPy fallback -- and compared. Agreement is the correctness check that lets the
 fallback be trusted on machines without CatGT.
+
+**CatGT is the preferred extractor and runs first wherever it is installed.** It
+is driven by ``-dir``/``-run``/``-g``/``-t``/``-prb``, none of which the session
+states: all five are read back off the AP binary's own SpikeGLX filename by
+``_io.spikeglx.run_layout``. A binary not named that way -- the Kilosort demo
+file, a hand-cut extract -- has no run, so CatGT is skipped with that reason and
+the NumPy detector stands alone.
 """
 
 from __future__ import annotations
@@ -152,27 +159,33 @@ def _announce_read(info: spikeglx.StreamInfo, report: ExtractionReport) -> None:
         )
 
 
-def _resolve_ap_stream(config: SessionConfig, probe: int) -> spikeglx.StreamInfo | None:
+def _resolve_ap_stream(config: SessionConfig) -> spikeglx.StreamInfo | None:
+    """The AP stream the session names."""
     npx = config.neuropixels
-    if npx.bin_file is not None:
-        return spikeglx.stream_info(npx.bin_file, npx.n_chan_bin, npx.sample_rate)
-    if npx.run_dir is None or not npx.run_name:
+    if npx.bin_file is None:
         return None
-    files = spikeglx.find_run_files(npx.run_dir, npx.run_name, npx.gate, npx.trigger, probe)
-    if files["ap"] is None:
-        return None
-    return spikeglx.stream_info(files["ap"])
+    return spikeglx.stream_info(npx.bin_file, npx.n_chan_bin, npx.sample_rate)
 
 
-def _resolve_obx_stream(config: SessionConfig, probe: int) -> spikeglx.StreamInfo | None:
+def _resolve_obx_stream(config: SessionConfig) -> spikeglx.StreamInfo | None:
+    """The OneBox stream carrying the 14 s burst, found from the AP binary's run.
+
+    One per run rather than per probe: the burst comes from the OneBox, so two
+    probes of the same run read the same file.
+    """
+    layout = _run_layout(config)
+    if layout is None or layout.obx is None:
+        return None
+    return spikeglx.stream_info(layout.obx)
+
+
+def _run_layout(config: SessionConfig) -> spikeglx.RunLayout | None:
+    """The SpikeGLX run around this session's AP binary, if it is laid out as one."""
     npx = config.neuropixels
-    if npx.run_dir is None or not npx.run_name:
-        return None
-    files = spikeglx.find_run_files(npx.run_dir, npx.run_name, npx.gate, npx.trigger, probe)
-    return spikeglx.stream_info(files["obx"]) if files["obx"] is not None else None
+    return None if npx.bin_file is None else spikeglx.run_layout(npx.bin_file)
 
 
-def _catgt_specs(config: SessionConfig) -> list[catgt.ExtractorSpec]:
+def _catgt_specs(config: SessionConfig, layout: spikeglx.RunLayout) -> list[catgt.ExtractorSpec]:
     """The extractors this session needs, in CatGT terms."""
     npx = config.neuropixels
     specs = [
@@ -180,7 +193,9 @@ def _catgt_specs(config: SessionConfig) -> list[catgt.ExtractorSpec]:
             catgt.JS_AP, 0, -1, npx.sync_bit, npx.sync_pulse_ms, label=NPX_1HZ
         )
     ]
-    if npx.run_dir is not None:
+    # Only when the run actually has a OneBox file: asking CatGT for an -xa
+    # extraction from a stream that is not there is an error, not an empty result.
+    if layout.obx is not None:
         specs.append(
             catgt.analog_spec(
                 catgt.JS_OB,
@@ -196,28 +211,33 @@ def _catgt_specs(config: SessionConfig) -> list[catgt.ExtractorSpec]:
 
 
 def _run_catgt_extraction(
-    config: SessionConfig, report: ExtractionReport, probe: int
+    config: SessionConfig, report: ExtractionReport
 ) -> dict[str, np.ndarray]:
-    """Run CatGT if it is both available and applicable. Returns name -> times."""
-    npx = config.neuropixels
+    """Run CatGT if it is both available and applicable. Returns name -> times.
+
+    CatGT is the preferred extractor and runs first wherever the machine has it.
+    Its five arguments are derived from the AP binary's own SpikeGLX filename, so
+    the session states only ``bin_file``.
+    """
     machine = config.machine
 
-    if npx.run_dir is None or not npx.run_name:
+    layout = _run_layout(config)
+    if layout is None:
         report.note(
-            "CatGT skipped: this session points at a bare .bin, and CatGT needs a "
-            "SpikeGLX run (run_dir + run_name + _g<n>_t<n> naming)."
+            "CatGT skipped: neuropixels.bin_file is not named like SpikeGLX output "
+            "(<run>_g<n>_t<n>.imec<n>.ap.bin), so there is no run for it to read."
         )
         return {}
 
-    specs = _catgt_specs(config)
+    specs = _catgt_specs(config, layout)
     args = catgt.build_extract_args(
-        run_dir=npx.run_dir,
-        run_name=npx.run_name,
+        run_dir=layout.directory,
+        run_name=layout.run_name,
         specs=specs,
-        gate=npx.gate,
-        trigger=npx.trigger,
-        probes=(probe,),
-        dest=config.paths.sync_for("neuropixels", probe) / "catgt",
+        gate=layout.gate,
+        trigger=layout.trigger,
+        probes=(layout.probe,),
+        dest=config.paths.sync_for("neuropixels") / "catgt",
     )
     report.catgt_commands.append("runit " + " ".join(args))
 
@@ -229,7 +249,7 @@ def _run_catgt_extraction(
         return {}
 
     catgt.run_catgt(machine.catgt_dir, args)
-    produced = catgt.find_edge_files(config.paths.sync_for("neuropixels", probe) / "catgt")
+    produced = catgt.find_edge_files(config.paths.sync_for("neuropixels") / "catgt")
 
     result: dict[str, np.ndarray] = {}
     for spec in specs:
@@ -247,7 +267,6 @@ def _run_catgt_extraction(
 
 def extract_neuropixels_edges(
     config: SessionConfig,
-    probe: int = 0,
     chunk_bytes: int = spikeglx.DEFAULT_CHUNK_BYTES,
 ) -> ExtractionReport:
     """Extract the SpikeGLX sync trains (pipeline step 2).
@@ -256,12 +275,12 @@ def extract_neuropixels_edges(
     and writes the canonical edge files.
     """
     report = ExtractionReport()
-    sync_dir = config.paths.sync_for("neuropixels", probe)
+    sync_dir = config.paths.sync_for("neuropixels")
     sync_dir.mkdir(parents=True, exist_ok=True)
 
-    catgt_times = _run_catgt_extraction(config, report, probe)
+    catgt_times = _run_catgt_extraction(config, report)
 
-    ap_info = _resolve_ap_stream(config, probe)
+    ap_info = _resolve_ap_stream(config)
     if ap_info is None:
         report.note("Neuropixels 1 Hz extraction skipped: no AP binary found.")
     elif ap_info.sy_index is None:
@@ -291,7 +310,7 @@ def extract_neuropixels_edges(
                 "not a failure -- but alignment cannot use this stream."
             )
 
-    obx_info = _resolve_obx_stream(config, probe)
+    obx_info = _resolve_obx_stream(config)
     if obx_info is None:
         report.note("Neuropixels 14 s burst extraction skipped: no OneBox (obx) stream found.")
     else:
@@ -438,7 +457,7 @@ def _finalize(
     return EdgeSet(name=name, times_s=times, fs=fs, source=source, path=path, stream=stream)
 
 
-def extract_session_edges(config: SessionConfig, probe: int = 0) -> ExtractionReport:
+def extract_session_edges(config: SessionConfig) -> ExtractionReport:
     """Run both systems' extraction, for whichever systems have data.
 
     Gated on whether a system's paths are declared rather than on sorting: pulses
@@ -450,7 +469,7 @@ def extract_session_edges(config: SessionConfig, probe: int = 0) -> ExtractionRe
     if not config.has_data("neuropixels"):
         report.note("Neuropixels extraction skipped: no neuropixels paths declared.")
     else:
-        npx_report = extract_neuropixels_edges(config, probe)
+        npx_report = extract_neuropixels_edges(config)
         report.edge_sets.update(npx_report.edge_sets)
         report.comparisons.update(npx_report.comparisons)
         report.notes.extend(npx_report.notes)

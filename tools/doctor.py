@@ -1265,64 +1265,63 @@ def check_recorded_band(config: SessionConfig) -> list[Check]:
     for system in ("blackrock", "neuropixels"):
         if not config.has_data(system):
             continue
-        for probe in config.probe_indices(system):
-            binary = config.paths.sorted_for(system, probe) / "run_info.json"
-            if not binary.exists():
-                continue
-            try:
-                info = json.loads(binary.read_text(encoding="utf-8"))
-                source = Path(info["binary"])
-                n_chan = int(info["settings"]["n_chan_bin"])
-                fs = float(info["settings"]["fs"])
-            except Exception as error:
-                checks.append(Check(
-                    f"recorded band ({system})", WARN,
-                    f"could not read {binary}: {type(error).__name__}",
-                    section="Session",
-                ))
-                continue
-            if not source.exists():
-                continue
+        binary = config.paths.sorted_for(system) / "run_info.json"
+        if not binary.exists():
+            continue
+        try:
+            info = json.loads(binary.read_text(encoding="utf-8"))
+            source = Path(info["binary"])
+            n_chan = int(info["settings"]["n_chan_bin"])
+            fs = float(info["settings"]["fs"])
+        except Exception as error:
+            checks.append(Check(
+                f"recorded band ({system})", WARN,
+                f"could not read {binary}: {type(error).__name__}",
+                section="Session",
+            ))
+            continue
+        if not source.exists():
+            continue
 
-            wanted = config.waveforms_for(system).highpass_hz
-            cutoff = float(wanted or 300.0)
-            try:
-                fraction = compute_band_fraction(source, n_chan, fs, cutoff)
-            except Exception as error:
-                checks.append(Check(
-                    f"recorded band ({system})", WARN,
-                    f"could not measure {source.name}: {type(error).__name__}: {error}",
-                    section="Session",
-                ))
-                continue
+        wanted = config.waveforms_for(system).highpass_hz
+        cutoff = float(wanted or 300.0)
+        try:
+            fraction = compute_band_fraction(source, n_chan, fs, cutoff)
+        except Exception as error:
+            checks.append(Check(
+                f"recorded band ({system})", WARN,
+                f"could not measure {source.name}: {type(error).__name__}: {error}",
+                section="Session",
+            ))
+            continue
 
-            broadband = fraction >= _BAND_ALREADY_FILTERED
-            detail = (
-                f"{source.name}: {fraction:.0%} of power below {cutoff:g} Hz "
-                f"-- {'broadband' if broadband else 'already the spike band'}"
+        broadband = fraction >= _BAND_ALREADY_FILTERED
+        detail = (
+            f"{source.name}: {fraction:.0%} of power below {cutoff:g} Hz "
+            f"-- {'broadband' if broadband else 'already the spike band'}"
+        )
+        if broadband and wanted is None:
+            checks.append(Check(
+                f"recorded band ({system})", WARN, detail, section="Session",
+                fix=(
+                    f"set {system}.waveforms.highpass_hz: {cutoff:g} -- this "
+                    "stream still carries the LFP, so its mean waveform will "
+                    "sit on it"
+                ),
+            ))
+        elif not broadband and wanted is not None:
+            checks.append(Check(
+                f"recorded band ({system})", WARN, detail, section="Session",
+                fix=(
+                    f"set {system}.waveforms.highpass_hz: null -- this stream "
+                    "is already high-passed, so filtering it again cascades a "
+                    "second rolloff onto the first"
+                ),
+            ))
+        else:
+            checks.append(
+                Check(f"recorded band ({system})", OK, detail, section="Session")
             )
-            if broadband and wanted is None:
-                checks.append(Check(
-                    f"recorded band ({system})", WARN, detail, section="Session",
-                    fix=(
-                        f"set {system}.waveforms.highpass_hz: {cutoff:g} -- this "
-                        "stream still carries the LFP, so its mean waveform will "
-                        "sit on it"
-                    ),
-                ))
-            elif not broadband and wanted is not None:
-                checks.append(Check(
-                    f"recorded band ({system})", WARN, detail, section="Session",
-                    fix=(
-                        f"set {system}.waveforms.highpass_hz: null -- this stream "
-                        "is already high-passed, so filtering it again cascades a "
-                        "second rolloff onto the first"
-                    ),
-                ))
-            else:
-                checks.append(
-                    Check(f"recorded band ({system})", OK, detail, section="Session")
-                )
     return checks
 
 

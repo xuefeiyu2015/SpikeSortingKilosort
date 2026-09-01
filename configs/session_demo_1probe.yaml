@@ -28,12 +28,16 @@ export_groups: ["good", "mua"]
 
 # Roots stop at the share; each system's directory is <root>/<monkey>/<session>.
 roots:
-  neuropixels: "/Volumes/server"
+  neuropixels: "Z:/"
+
+neuropixels_dir: "{neuropixels}/{monkey}/{session}"
 
 neuropixels:
   # ---------- edit for this session ----------
-  # The download is a bare .bin: no .meta beside it and no SpikeGLX run folder,
-  # so there is no run_dir/run_name and the channel count and rate are stated.
+  # The download is a bare .bin: no .meta beside it, and its name is not
+  # SpikeGLX's <run>_g0_t0.imec0.ap.bin, so there is no run to recover. CatGT
+  # is skipped with that reason, and the channel count and rate are stated here
+  # because there is no .meta to read them from.
   bin_file: "{neuropixels_dir}/ZFM-02370_mini.imec0.ap.short.bin"
   n_chan_bin: 385        # 384 AP channels + the SY word
   sample_rate: 30000
