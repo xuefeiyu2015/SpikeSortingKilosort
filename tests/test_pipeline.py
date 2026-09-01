@@ -29,7 +29,6 @@ def _session(tmp_path, body="", npx_dir=None):
     from ``neuropixels_dir`` alone, so sharing one means sharing all of them.
     """
     lines = [
-        "session: s",
         f"blackrock_dir: '{tmp_path / 'br'}'",
         f"neuropixels_dir: '{npx_dir or tmp_path / 'np'}'",
     ]
@@ -1140,3 +1139,72 @@ def test_the_probe_is_what_drops_non_neural_channels(tmp_path):
     assert recording.get_num_channels() == 8
     assert attached.get_num_channels() == 6
     assert [str(c) for c in attached.channel_ids] == ["0", "1", "2", "3", "4", "5"]
+
+
+# ---------------------------------------------------------------------------
+# params.py, which Phy executes
+# ---------------------------------------------------------------------------
+
+
+def test_a_repointed_params_py_is_still_executable_python(tmp_path):
+    # Phy loads params.py with exec(), so the path has to survive being a Python
+    # string literal. A Windows path written verbatim does not: "\N" starts a
+    # named-unicode escape, and "Z:\Shared\NPix data\..." killed the GUI before
+    # its window opened. Kilosort writes the same field with as_posix() for
+    # exactly this reason.
+    from spikesorting.pipeline import Binary, _repoint_params
+
+    (tmp_path / "params.py").write_text(
+        "dat_path = 'D:/cache/kilosort4_np/temp_wh.dat'\n"      # gone with the cache
+        "n_channels_dat = 383\n"
+        "dtype = 'int16'\n"
+        "offset = 0\n"
+        "sample_rate = 30000.\n"
+        "hp_filtered = True\n",
+        encoding="utf-8",
+    )
+    binary = Binary(Path(r"Z:/Shared/NPix data/Practice/run_g0_t0.imec0.ap.bin"), 385, 30000.0)
+
+    _repoint_params(tmp_path, binary)
+
+    written = (tmp_path / "params.py").read_text(encoding="utf-8")
+    params: dict = {}
+    exec(written, {}, params)                                   # what Phy does
+
+    assert params["dat_path"] == str(binary.path.as_posix())
+    # The stride moves with the path: temp_wh.dat holds only the probe's
+    # channels, the raw binary holds every channel in the file. Left at 383
+    # against a 385-channel file, every trace is sheared and nothing errors.
+    assert params["n_channels_dat"] == 385
+    assert params["hp_filtered"] is False
+    assert params["sample_rate"] == 30000.0                     # untouched
+
+
+def test_a_params_py_that_still_resolves_is_left_alone(tmp_path):
+    # A path that resolves is Kilosort's own and is not second-guessed.
+    from spikesorting.pipeline import Binary, _repoint_params
+
+    existing = tmp_path / "temp_wh.dat"
+    existing.write_bytes(b"\x00")
+    original = f"dat_path = '{existing.as_posix()}'\nn_channels_dat = 383\nhp_filtered = True\n"
+    (tmp_path / "params.py").write_text(original, encoding="utf-8")
+
+    _repoint_params(tmp_path, Binary(tmp_path / "raw.ap.bin", 385, 30000.0))
+
+    assert (tmp_path / "params.py").read_text(encoding="utf-8") == original
+
+
+def test_a_dat_path_kilosort_wrote_as_a_list_is_still_understood(tmp_path):
+    # Without save_preprocessed_copy, Kilosort writes dat_path as a *list* of the
+    # source files. Read as a bare string that never resolves, so a still-valid
+    # params.py would be rewritten for no reason.
+    from spikesorting.pipeline import Binary, _repoint_params
+
+    source = tmp_path / "run_g0_t0.imec0.ap.bin"
+    source.write_bytes(b"\x00")
+    original = f"dat_path = ['{source.as_posix()}']\nn_channels_dat = 385\n"
+    (tmp_path / "params.py").write_text(original, encoding="utf-8")
+
+    _repoint_params(tmp_path, Binary(source, 385, 30000.0))
+
+    assert (tmp_path / "params.py").read_text(encoding="utf-8") == original

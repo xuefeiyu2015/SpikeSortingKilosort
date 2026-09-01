@@ -55,6 +55,23 @@ STAGES = [
 ]
 
 
+def _log_pipeline_messages() -> None:
+    """Show this pipeline's own log lines, and only its own.
+
+    ``logging.basicConfig`` would configure the *root* logger, which turns on
+    INFO for every installed package too -- faiss announcing which build it
+    loaded, matplotlib announcing a backend -- all wearing this project's indent.
+    Everything here logs to one named logger (``pipeline.py``, ``_sync/``), so
+    that is the one to attach a handler to.
+    """
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("       %(message)s"))
+    log = logging.getLogger("spikesorting")
+    log.handlers[:] = [handler]
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+
 def main() -> int:
     parser = build_parser(__doc__)
     parser.add_argument(
@@ -97,7 +114,7 @@ def main() -> int:
     )
     parser.add_argument("--no-figures", action="store_true", help="skip figure generation")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="       %(message)s")
+    _log_pipeline_messages()
 
     # An LFP on the probe's own clock cannot be compared with anything else that
     # was recorded, so asking for it asks for the map that fixes that. Harmless

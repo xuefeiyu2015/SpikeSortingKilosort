@@ -11,16 +11,18 @@ unchanged on the Windows rig, on the HPC, and on a laptop:
     Where *this* machine keeps things -- data root, SSD scratch for ``temp.dat``,
     CatGT/TPrime install dirs, torch device. Machine-local.
 
-Session paths may contain the placeholders ``{data_root}``, ``{output_root}``,
-``{cache}``, ``{downloads}`` and ``{session}``; they are substituted from the
-machine profile when the session is loaded.
+A session file states each system's directory outright and may refer back to it
+as ``{blackrock_dir}`` / ``{neuropixels_dir}``. Those two are the only
+placeholders there are: nothing is composed from a subject, a date or a machine
+root, so the path in the file is the path on disk.
 """
 
 from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
+from difflib import get_close_matches
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +38,6 @@ __all__ = [
     "load_machine",
     "load_session_config",
     "default_config_dir",
-    "downloads_dir",
 ]
 
 #: The sorter this pipeline runs, and the directory results land in. One value so
@@ -63,20 +64,6 @@ def default_config_dir() -> Path:
     """Directory holding the YAML configs, overridable with ``SPIKESORTING_CONFIG_DIR``."""
     env = os.environ.get("SPIKESORTING_CONFIG_DIR")
     return Path(env) if env else REPO_ROOT / "configs"
-
-
-def downloads_dir() -> Path:
-    """Kilosort's downloads directory, behind the ``{downloads}`` placeholder.
-
-    Falls back to ``~/.kilosort`` when the ``kilosort`` package is not installed,
-    so a config using the placeholder still *loads* on a machine without it.
-    """
-    try:
-        from kilosort.utils import DOWNLOADS_DIR  # type: ignore[import-not-found]
-
-        return Path(DOWNLOADS_DIR)
-    except Exception:
-        return Path.home() / ".kilosort"
 
 
 def _as_path(value: Any) -> Path | None:
@@ -450,8 +437,8 @@ class OutputPaths:
         directory = self.dir_for(system)
         if directory is None:
             raise ValueError(
-                f"session has no {system}_dir: give one directly, or set a "
-                f"roots.{system} together with monkey and session"
+                f"session has no {system}_dir: state one in the session file, "
+                f"pointing at the folder holding that system's recording"
             )
         return directory
 
@@ -519,12 +506,13 @@ class OutputPaths:
 class SessionConfig:
     """One recording session, resolved against one machine."""
 
+    #: What this session is called in output filenames, the cache tag and the
+    #: manifests. Derived from the config file's own name -- it is a label, never
+    #: a path ingredient, so it cannot disagree with the file that carries it.
     session: str
     machine: MachineProfile
-    #: Subject folder between a root and the session, e.g. ``"Monkey Athos"``.
-    monkey: str = ""
     #: Each system's own directory: raw recording and everything derived from it.
-    #: Built as ``<roots.<system>>/<monkey>/<session>`` unless stated outright.
+    #: Stated outright in the session file; nothing composes it.
     blackrock_dir: Path | None = None
     neuropixels_dir: Path | None = None
     #: Names the level below ``neuropixels/`` and ``blackrock/`` that results are
@@ -786,75 +774,79 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
-#: Keys a session file used to carry that are now derived or belong to the code.
-#: Ignoring one silently would change what a run does without a word, so each is
-#: refused with the thing to do instead.
-_REMOVED_KEYS = {
-    "has_neuropixels_data": "declare a neuropixels: block (or remove it) instead",
-    "has_blackrock_data": "declare a blackrock: block (or remove it) instead",
-    "skip_neuropixels": "remove the neuropixels: block instead",
-    "skip_blackrock": "remove the blackrock: block instead",
-    "skip_sync": "derived: alignment runs when both systems are declared",
-    "sorter": "which sorter ran is a property of the code, not the recording",
-    "preprocess": (
-        "Kilosort highpasses and subtracts the median across channels itself on "
-        "every batch; set do_CAR / highpass_cutoff under 'kilosort:' instead"
-    ),
-    "kilosort_settings": "renamed to 'kilosort:', and settable per system",
-    "waveform_ms": (
-        "moved into a per-system 'waveforms:' block as window_ms -- the whole "
-        "waveform export is configured there now, because whether to high-pass "
-        "depends on which band that system recorded"
-    ),
-    "export_waveforms": (
-        "moved into a per-system 'waveforms:' block as export_snippets -- see "
-        "waveform_ms above. The --export-waveforms flag is unchanged"
-    ),
-    "exclude_channels": (
-        "the probe already drops channels its chanMap does not cover, and this "
-        "ran first, shifting every contact after the excluded one. A broken "
-        "electrode is kilosort.bad_channels -- the same on both systems"
-    ),
-    # The SpikeGLX run model. A session names the binary and nothing else; where
-    # a run folder is still needed -- CatGT's arguments, the OneBox burst -- it is
-    # derived from the binary's own path by ``_io.spikeglx.run_layout``. These sit
-    # in session copies on the rig, so each has to say what replaces it.
-    "run_dir": (
-        "name the AP binary outright: neuropixels.bin_file, with neuropixels_dir "
-        "pointing at the folder holding it. CatGT still runs -- its -dir/-run/-g/"
-        "-t/-prb come from the binary's own SpikeGLX filename"
-    ),
-    "run_name": "derived from the bin_file name -- see run_dir above",
-    "gate": "derived from the bin_file name -- see run_dir above",
-    "trigger": "derived from the bin_file name -- see run_dir above",
-    "probes": (
-        "one session names one binary. Two probes is two session files, each "
-        "with its own neuropixels_dir and bin_file"
-    ),
-    "by_probe": (
-        "there is no probe dimension in a session any more -- give the second "
-        "probe its own session file, with its own kilosort: block"
-    ),
-}
+#: Top-level session keys the loader reads itself. The per-system sets below are
+#: *derived* from the dataclasses, so they cannot drift; only this one is written
+#: by hand, and ``tests/test_config.py`` pins it by loading every tracked config.
+_SESSION_KEYS = frozenset({
+    "blackrock_dir",
+    "neuropixels_dir",
+    "blackrock",
+    "neuropixels",
+    "kilosort",
+    "kilosort_on_neuropixels",
+    "kilosort_on_blackrock",
+    "export_lfp",
+    "lfp_decimate",
+    "export_figures",
+    "export_groups",
+    "sync_period_s",
+    "burst_interval_s",
+    "alignment_tolerance_s",
+})
 
 
-def _reject_removed_keys(data: dict[str, Any], path: Path) -> None:
-    """Refuse a removed or reserved key, at the top level or in a system's block.
+def _spec_keys(spec: type) -> frozenset[str]:
+    """The YAML keys one spec dataclass accepts, read off the dataclass itself."""
+    return frozenset(f.name for f in fields(spec))
 
-    ``preprocess:`` was settable per system, so checking only the top level would
-    drop one in silence -- exactly what this exists to prevent.
+
+#: ``kilosort`` is not a field of either spec -- the loader lifts it out into
+#: ``kilosort_by_system`` -- so it is added here rather than derived.
+_BLACKROCK_KEYS = _spec_keys(BlackrockSpec) | {"kilosort"}
+_NEUROPIXELS_KEYS = _spec_keys(NeuropixelsSpec) | {"kilosort"}
+_WAVEFORM_KEYS = _spec_keys(WaveformSpec)
+
+
+def _reject_unknown_keys(data: dict[str, Any], path: Path) -> None:
+    """Refuse any key the config model does not define, and suggest the real one.
+
+    YAML does not care about a key nobody reads, so without this a typo loads
+    clean and runs with the default: ``export_figure:`` silently keeps figures
+    on, ``kilosort_on_neuropixel:`` silently keeps sorting. That is a wrong
+    result rather than a wrong path, and nothing downstream can tell. The same
+    check retires keys that have been removed -- ``monkey``, ``roots``,
+    ``run_dir``, ``exclude_channels`` -- with no list to maintain: they are
+    simply not defined any more.
+
+    Nested blocks are checked too, since ``waveforms:`` is per system and a typo
+    there would quietly restore a default the session meant to change.
+
+    **The contents of a ``kilosort:`` block are deliberately not checked.** Those
+    keys pass through to Kilosort, and ``pipeline._kilosort_arguments`` already
+    validates them against the installed ``DEFAULT_SETTINGS`` and
+    ``inspect.signature(run_kilosort)``. A second copy of that split here would
+    go stale the first time Kilosort moved a parameter.
     """
-    blocks = [("", data)] + [
-        (f"{system}.", data[system])
-        for system in ("neuropixels", "blackrock")
-        if isinstance(data.get(system), dict)
-    ]
-    for prefix, block in blocks:
-        for key in sorted(set(block) & set(_REMOVED_KEYS)):
-            raise ValueError(
-                f"{path}: '{prefix}{key}' is no longer a session setting "
-                f"-- {_REMOVED_KEYS[key]}"
-            )
+    scopes: list[tuple[str, dict[str, Any], frozenset[str]]] = [("", data, _SESSION_KEYS)]
+    for system, known in (
+        ("blackrock", _BLACKROCK_KEYS),
+        ("neuropixels", _NEUROPIXELS_KEYS),
+    ):
+        block = data.get(system)
+        if not isinstance(block, dict):
+            continue
+        scopes.append((f"{system}.", block, known))
+        waveforms = block.get("waveforms")
+        if isinstance(waveforms, dict):
+            scopes.append((f"{system}.waveforms.", waveforms, _WAVEFORM_KEYS))
+
+    for prefix, block, known in scopes:
+        for key in sorted(str(k) for k in block):
+            if key in known:
+                continue
+            close = get_close_matches(key, sorted(known), n=1, cutoff=0.7)
+            hint = f"\n  did you mean: {prefix}{close[0]}?" if close else ""
+            raise ValueError(f"{path}: unknown setting '{prefix}{key}'{hint}")
 
 
 def load_machine(name: str, config_dir: Path | None = None) -> MachineProfile:
@@ -881,53 +873,24 @@ def load_session_config(
         session_path = candidate
 
     data = _read_yaml(session_path)
-    _reject_removed_keys(data, session_path)
+    _reject_unknown_keys(data, session_path)
     profile = load_machine(machine, config_dir) if isinstance(machine, str) else machine
 
-    session_name = str(data.get("session") or session_path.stem)
-   # session_name = session_path.stem
-    monkey = str(data.get("monkey") or "")
+    # The session label, and only a label: it names the .mat products, the cache
+    # tag and the manifests, and never takes part in building a path. Taken from
+    # the file so it cannot disagree with the config that carries it.
+    session_name = session_path.stem
 
-    # Built-ins first. An unset one is *omitted* rather than mapped to "": a
-    # machine profile supplies no roots any more, and "{data_root}/Monkey Athos"
-    # collapsing to "/Monkey Athos" is a wrong path that fails much later, if at
-    # all. Left in place it is caught below instead.
-    builtin = {"session": session_name, "downloads": str(downloads_dir())}
-    #if monkey:
-    #    builtin["monkey"] = monkey
-    #for key, value in (
-    #    ("cache", profile.cache_dir),
-    #    ("data_root", profile.data_root),
-    #    ("output_root", profile.output_root),
-    #):
-    #    if value:
-    #        builtin[key] = str(value)
-
-    # Then the session's own roots, which may themselves use the built-ins --
-    # `blackrock: "Z:/server/{monkey}"` is legal, though the usual form stops at
-    # the share and lets the monkey/session levels be built below.
-    roots = data.get("roots") or {}
-    if not isinstance(roots, dict):
-        raise ValueError(
-            f"{session_path}: 'roots' must be a mapping of name to path, "
-            f"got {type(roots).__name__}"
-        )
-    mapping = dict(builtin)
-    for key, value in roots.items():
-        mapping[str(key)] = _substitute(str(value), builtin)
-
-    # Finally each system's directory: <root>/<monkey>/<session>, unless the file
-    # states one outright. Everything that system produces hangs off it, so it is
-    # exposed as a placeholder too -- "{blackrock_dir}/NSP-Athos_001.ns5".
+    # Each system's directory, stated outright. Everything that system produces
+    # hangs off it, so it is exposed as a placeholder for the rest of the file --
+    # ``sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"``. These two names are the
+    # whole substitution table: nothing is composed from a subject, a date or a
+    # machine root, so what the file says is what lands on disk.
     system_dirs: dict[str, Path | None] = {}
+    mapping: dict[str, str] = {}
     for system in ("blackrock", "neuropixels"):
         stated = data.get(f"{system}_dir")
-        if stated:
-            system_dirs[system] = _as_path(_substitute(str(stated), mapping))
-        #elif system in mapping and monkey:
-        #    system_dirs[system] = _as_path(mapping[system]) / monkey / session_name
-        else:
-            system_dirs[system] = None
+        system_dirs[system] = _as_path(stated) if stated else None
         if system_dirs[system] is not None:
             mapping[f"{system}_dir"] = str(system_dirs[system])
 
@@ -939,30 +902,20 @@ def load_session_config(
         raise ValueError(
             f"{session_path}: unresolved placeholder in {stale!r}.\n"
             f"  known names: {known}\n"
-            "  declare the missing one under 'roots:' in this file."
+            "  a session file has only {blackrock_dir} and {neuropixels_dir}; "
+            "write every other path out in full."
         )
-
-    # `output_dir:` is the older single-tree spelling. Outputs now sit beside the
-    # recording that produced them, so it is read as the directory of whichever
-    # system has no directory of its own -- enough to keep a Neuropixels-only
-    # session file working unchanged.
-    stated_output = _as_path(data.get("output_dir"))
-    if stated_output is not None:
-        for system in ("neuropixels", "blackrock"):
-            if system_dirs[system] is None and (data.get(system) or {}):
-                system_dirs[system] = stated_output
 
     if system_dirs["blackrock"] is None and system_dirs["neuropixels"] is None:
         raise ValueError(
-            f"{session_path}: no directory for either system. Give a "
-            "'monkey:' plus a 'roots:' entry, or state blackrock_dir / "
-            "neuropixels_dir outright."
+            f"{session_path}: no directory for either system. State "
+            "blackrock_dir and/or neuropixels_dir, each pointing at the folder "
+            "holding that system's recording."
         )
 
     config = SessionConfig(
         session=session_name,
         machine=profile,
-        monkey=monkey,
         blackrock_dir=system_dirs["blackrock"],
         neuropixels_dir=system_dirs["neuropixels"],
         blackrock=BlackrockSpec.from_dict(data.get("blackrock") or {}),
@@ -985,7 +938,7 @@ def load_session_config(
             if (data.get(system) or {}).get("kilosort")
         },
     )
-   # _reject_colliding_system_dirs(config, session_path)
+    _reject_colliding_system_dirs(config, session_path)
     return config
 
 
@@ -999,9 +952,11 @@ def _reject_colliding_system_dirs(config: SessionConfig, path: Path) -> None:
     bundle, and ``_publish`` copies with ``dirs_exist_ok`` so the second would
     merge into the first rather than replace it.
 
-    Easy to hit by accident, because ``<root>/<monkey>/<session>`` is the same
-    string for both systems whenever the two roots agree -- which is the ordinary
-    case when one share holds everything.
+    Easy to hit by accident whenever one share holds everything and the obvious
+    directory to name is the session folder both systems dropped files into. The
+    fix it names is the real layout: a SpikeGLX run nests its own
+    ``<run>_g<n>_imec<n>`` folder below that, while the ``.ns5``/``.ns6`` sit at
+    the top.
     """
     if not (config.has_data("blackrock") and config.has_data("neuropixels")):
         return

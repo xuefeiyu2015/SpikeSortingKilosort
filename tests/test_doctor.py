@@ -910,7 +910,7 @@ def _blackrock_session(tmp_path, extra: str = ""):
     sync = tmp_path / "NSP.ns5"
     sync.write_bytes(b"")
     (tmp_path / "s.yaml").write_text(
-        f"session: s\nblackrock_dir: '{tmp_path}'\n{extra}"
+        f"blackrock_dir: '{tmp_path}'\n{extra}"
         f"blackrock:\n  sync_file: '{sync}'\n  spike_file: '{spike}'\n",
         encoding="utf-8",
     )
@@ -998,7 +998,7 @@ def test_a_broadband_stream_with_no_highpass_configured_is_reported(tmp_path):
         f"cache_dir: '{tmp_path / 'c'}'\n", encoding="utf-8"
     )
     (tmp_path / "off.yaml").write_text(
-        f"session: s\nblackrock_dir: '{tmp_path}'\n"
+        f"blackrock_dir: '{tmp_path}'\n"
         f"blackrock:\n  spike_file: '{tmp_path / 'HUB.ns6'}'\n"
         "  waveforms:\n    highpass_hz: null\n",
         encoding="utf-8",

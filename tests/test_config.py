@@ -21,7 +21,7 @@ def test_demo_config_is_an_ordinary_session():
     # The demo is just a config: a binary path plus a couple of flags. Nothing in
     # the code branches on it being "the demo".
     session = cfg.load_session_config(CONFIG_DIR / "session_demo_1probe.yaml", "mac", CONFIG_DIR)
-    assert session.session == "demo"
+    assert session.session == "session_demo_1probe"   # the config's own filename
     assert session.aligns_systems is False   # no blackrock: block
     assert session.has_data("blackrock") is False
     assert session.sorts_blackrock is False
@@ -30,26 +30,19 @@ def test_demo_config_is_an_ordinary_session():
     assert session.neuropixels.sample_rate == 30000.0
 
 
-def test_demo_paths_are_derived_the_same_way_a_real_session_is():
-    # The demo uses roots + monkey + session like anything else, rather than
-    # stating its directory outright -- so it exercises the derivation instead of
-    # side-stepping it, and the path it produces is the one the file references
-    # as {neuropixels_dir}.
+def test_demo_paths_are_stated_outright_like_any_other_session():
+    # The demo names its directory the same way a real session does -- there is
+    # no derivation left to exercise, and the path it produces is the one the
+    # file references below as {neuropixels_dir}.
     session = cfg.load_session_config(CONFIG_DIR / "session_demo_1probe.yaml", "mac", CONFIG_DIR)
 
     assert session.neuropixels_dir == session.paths.dir_for("neuropixels")
-    assert session.neuropixels_dir.name == session.session
-    assert session.neuropixels_dir.parent.name == session.monkey
 
     binary = session.neuropixels.bin_file
     assert binary.name == "ZFM-02370_mini.imec0.ap.short.bin"
     assert binary.parent == session.neuropixels_dir
-    # Rooted at the share, with nothing left unexpanded. Not `is_absolute()`:
-    # the roots are Windows drive letters, which POSIX reads as relative, and
-    # these tests run wherever the pure-compute suite runs.
-    assert "{" not in str(binary)
-    assert str(binary).startswith("Z:/")
-    assert str(session.output_root).startswith("Z:/")
+    assert "{" not in str(binary)               # nothing left unexpanded
+    assert session.output_root == session.neuropixels_dir
 
 
 def _template_paths(session):
@@ -62,14 +55,15 @@ def _template_paths(session):
 
 
 def test_template_leaves_no_unresolved_placeholders():
-    # A stale {data_root} would not raise: _substitute only knows five names and
-    # an unknown one is left alone, while a known-but-unset one becomes "" --
-    # silently turning "{data_root}/Monkey Athos" into "/Monkey Athos".
+    # _substitute leaves an unknown name alone rather than raising, so without
+    # _first_unresolved a typo'd placeholder would become a literal directory
+    # named "{...}" and fail much later, if at all.
     session = cfg.load_session_config(CONFIG_DIR / "session_template_utah_probe.yaml", "windows_rig", CONFIG_DIR)
     for path in _template_paths(session):
         assert "{" not in str(path)
         assert str(path).startswith("Z:")
-    assert str(session.output_root).endswith(session.session)
+    # The label names outputs, never a directory -- so it must not appear in one.
+    assert session.session not in str(session.output_root)
 
 
 _FENCE = "---------- defaults"
@@ -150,7 +144,8 @@ def test_the_one_probe_template_differs_only_by_the_missing_array():
     assert none.kilosort_by_system["neuropixels"] == one.kilosort_by_system["neuropixels"]
     assert "blackrock" not in none.kilosort_by_system   # no array, no settings for one
 
-    stated = {"blackrock", "kilosort_by_system"}
+    # `session` is the config filename, so two files necessarily differ there.
+    stated = {"session", "blackrock", "kilosort_by_system"}
     differing = [
         f
         for f in one.__dataclass_fields__
@@ -183,7 +178,13 @@ def test_the_utah_only_template_differs_only_by_the_missing_probe():
     assert utah.blackrock == one.blackrock
     assert utah.sorts_blackrock is True
 
-    stated = {"neuropixels", "neuropixels_dir", "kilosort_on_neuropixels", "kilosort_by_system"}
+    stated = {
+        "session",            # the config filename, so necessarily different
+        "neuropixels",
+        "neuropixels_dir",
+        "kilosort_on_neuropixels",
+        "kilosort_by_system",
+    }
     differing = [
         f
         for f in one.__dataclass_fields__
@@ -192,35 +193,29 @@ def test_the_utah_only_template_differs_only_by_the_missing_probe():
     assert differing == [], differing
 
 
-def test_two_probes_is_two_session_files_not_a_probes_list():
-    # The 2probes template is gone: a probe list cannot exist any more, because a
-    # session names one binary. The practice configs are the worked example, and
-    # what matters is that two of them cannot collide.
-    a, b = (
-        cfg.load_session_config(CONFIG_DIR / name, "windows_rig", CONFIG_DIR)
-        for name in ("practise_20210819.yaml", "practise_20210825.yaml")
-    )
+def test_two_probes_is_two_session_files_not_a_probes_list(tmp_path):
+    # A probe list cannot exist any more, because a session names one binary.
+    # Two probes of one run are two files, and what matters is that they cannot
+    # collide: every output path comes from neuropixels_dir alone, so pointing
+    # each at its own _imec<n> folder is what keeps the two sortings apart.
+    run = "Y:/npx/Tank_g0"
+    sessions = []
+    for probe in (0, 1):
+        path = tmp_path / f"probe{probe}.yaml"
+        path.write_text(
+            f'neuropixels_dir: "{run}/Tank_g0_imec{probe}"\n'
+            "neuropixels:\n"
+            f'  bin_file: "{{neuropixels_dir}}/Tank_g0_t0.imec{probe}.ap.bin"\n',
+            encoding="utf-8",
+        )
+        sessions.append(cfg.load_session_config(path, "windows_rig", CONFIG_DIR))
+    a, b = sessions
 
     assert a.neuropixels.bin_file != b.neuropixels.bin_file
     assert a.paths.sorted_for("neuropixels") != b.paths.sorted_for("neuropixels")
     # Each writes inside its own recording's folder, so nothing is shared.
     assert a.paths.sorted_for("neuropixels").parent == a.neuropixels_dir
     assert b.paths.sorted_for("neuropixels").parent == b.neuropixels_dir
-
-
-def test_the_practice_configs_hand_catgt_the_right_run():
-    # Nothing in those files states run_dir/run_name/gate/trigger. All four come
-    # from the bin_file name -- including a run name that itself contains "_t1229".
-    from spikesorting._io import spikeglx
-
-    session = cfg.load_session_config(
-        CONFIG_DIR / "practise_20210825.yaml", "windows_rig", CONFIG_DIR
-    )
-    layout = spikeglx.run_layout(session.neuropixels.bin_file)
-
-    assert layout.run_name == "Tank_20210825_t1229_d10500_L11_exp"
-    assert (layout.gate, layout.trigger, layout.probe) == (0, 0, 0)
-    assert layout.directory.name == "practise spike sorting"
 
 
 def test_output_paths_are_derived_from_each_systems_directory(tmp_path):
@@ -275,16 +270,14 @@ def test_the_time_map_goes_under_the_reference_timebase(tmp_path):
 def test_two_systems_may_not_share_a_directory(tmp_path):
     # Nothing in an output path names the system any more -- the directory *is*
     # the identity -- so both systems pointed at one folder would write one
-    # sorting on top of the other. Easy to hit by accident: <root>/<monkey>/
-    # <session> is the same string for both whenever the two roots agree.
+    # sorting on top of the other. Easy to hit by accident whenever one share
+    # holds everything and the obvious folder to name is the session folder both
+    # systems dropped files into.
     path = _write_session(
         tmp_path,
         """
-monkey: Monkey Athos
-session: "2026-08-13"
-roots:
-  blackrock: "Z:/"
-  neuropixels: "Z:/"
+blackrock_dir: "Z:/Monkey Athos/2026-08-13"
+neuropixels_dir: "Z:/Monkey Athos/2026-08-13"
 blackrock:
   sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"
 neuropixels:
@@ -308,10 +301,7 @@ def test_one_system_alone_may_sit_anywhere(tmp_path):
         _write_session(
             tmp_path,
             """
-monkey: Monkey Demo
-session: "2026-08-13"
-roots:
-  neuropixels: "Z:/"
+neuropixels_dir: "Z:/Monkey Demo/2026-08-13"
 neuropixels:
   bin_file: "{neuropixels_dir}/demo_g0_t0.imec0.ap.bin"
 """,
@@ -352,18 +342,15 @@ def _write_session(tmp_path: Path, body: str) -> Path:
     return path
 
 
-def test_roots_declared_in_the_session_file_expand_in_its_paths(tmp_path):
-    # The point of the block: two systems whose data lives on different shares,
-    # each named once instead of being spelled out on every line below.
+def test_each_system_names_its_own_directory_and_they_stay_independent(tmp_path):
+    # Two systems whose data lives on different shares. Each directory is named
+    # once and everything below refers back to it -- which is also why the two
+    # do not collide in the flat output layout.
     path = _write_session(
         tmp_path,
         """
-session: Athos_2026_08_13
-roots:
-  blackrock: "Z:/server/Monkey Athos/2026-08-13"
-  neuropixels: "Y:/npx/Monkey Athos/2026-08-13"
-blackrock_dir: "{blackrock}"
-neuropixels_dir: "{neuropixels}"
+blackrock_dir: "Z:/server/Monkey Athos/2026-08-13"
+neuropixels_dir: "Y:/npx/Monkey Athos/2026-08-13"
 blackrock:
   sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"
   spike_file: "{blackrock_dir}/HUB-Athos_001.ns6"
@@ -376,100 +363,67 @@ neuropixels:
 
     assert str(session.blackrock.sync_file).startswith("Z:/server/Monkey Athos/2026-08-13")
     assert session.blackrock.sync_file.name == "NSP-Athos_001.ns5"
-    # The two roots stay independent -- this is why one data_root is not enough,
-    # and why the two systems do not collide in the flat output layout.
     assert str(session.neuropixels.bin_file.parent) == "Y:/npx/Monkey Athos/2026-08-13"
     # Cross-system output goes under the reference timebase's directory.
     assert str(session.output_root) == "Z:/server/Monkey Athos/2026-08-13"
 
 
-def test_the_legacy_output_dir_still_serves_a_single_system(tmp_path):
-    # `output_dir:` predates per-system directories and names one tree. That is
-    # still enough for a session where only one system recorded -- and it is now
-    # only enough for that, since two systems sharing one directory collide.
-    session = cfg.load_session_config(
-        _write_session(
-            tmp_path,
-            """
-session: Athos_2026_08_13
-roots:
-  output: "Z:/server/sorted"
-output_dir: "{output}/{session}"
-neuropixels:
-  bin_file: "Y:/npx/Athos_g0_t0.imec0.ap.bin"
-""",
-        ),
-        "windows_rig",
-        CONFIG_DIR,
-    )
-
-    assert str(session.output_root) == "Z:/server/sorted/Athos_2026_08_13"
-    assert session.blackrock_dir is None
-
-
-def test_a_root_may_itself_contain_a_placeholder(tmp_path):
-    # Roots are resolved before they are used, so {monkey} and {session} work
-    # inside one -- for a share that is already organised by subject.
-    path = _write_session(
-        tmp_path,
-        """
-monkey: Monkey Athos
-session: "2026-08-13"
-roots:
-  neuropixels: "Y:/npx/{monkey}/raw"
-""",
-    )
+def test_the_session_label_comes_from_the_file_not_from_a_key(tmp_path):
+    # It names the .mat products and the cache tag and nothing else, so it is
+    # read off the config's own filename -- one fewer thing that can disagree
+    # with the file describing it.
+    path = tmp_path / "Athos_2026_08_13.yaml"
+    path.write_text('neuropixels_dir: "Y:/npx/run_g0_imec0"\n', encoding="utf-8")
 
     session = cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
 
-    assert str(session.neuropixels_dir) == "Y:/npx/Monkey Athos/raw/Monkey Athos/2026-08-13"
+    assert session.session == "Athos_2026_08_13"
+    assert "Athos_2026_08_13" not in str(session.neuropixels_dir)
 
 
-def test_a_misspelled_root_raises_instead_of_resolving_to_nothing(tmp_path):
+def test_a_misspelled_placeholder_raises_instead_of_resolving_to_nothing(tmp_path):
     # The trap this closes: an unknown placeholder used to be left as a literal
     # and a known-but-unset one became "", turning "{root}/Monkey Athos" into
     # "/Monkey Athos" -- a wrong path that only fails much later, if at all.
     path = _write_session(
         tmp_path,
         """
-session: s
-roots:
-  blackrock: "Z:/server"
-output_dir: "{blackrock}/out"
+blackrock_dir: "Z:/server"
 blackrock:
-  sync_file: "{blackrok}/NSP.ns5"
+  sync_file: "{blackrok_dir}/NSP.ns5"
 """,
     )
 
     with pytest.raises(ValueError) as excinfo:
         cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
 
-    assert "{blackrok}" in str(excinfo.value)
+    assert "{blackrok_dir}" in str(excinfo.value)
 
 
-def test_a_stale_data_root_raises_now_that_no_profile_supplies_one(tmp_path):
-    # The old two-layer placeholder, left behind in a session file. No machine
-    # profile defines data_root any more, so this must fail loudly.
+def test_a_placeholder_from_the_old_composed_layout_raises(tmp_path):
+    # {monkey}, {session}, {data_root} and the roots: block are all gone. A
+    # session file left over from them must fail loudly rather than build a path
+    # around a literal brace.
     path = _write_session(
         tmp_path,
         """
-session: s
-output_dir: "{data_root}/Monkey Athos"
+neuropixels_dir: "Z:/npx/{monkey}/2026-08-13"
 neuropixels:
-  bin_file: "/a/x.bin"
+  bin_file: "{neuropixels_dir}/x.bin"
 """,
     )
 
     with pytest.raises(ValueError) as excinfo:
         cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
 
-    assert "{data_root}" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "{monkey}" in message
+    assert "{blackrock_dir}" in message and "{neuropixels_dir}" in message
 
 
 def _flags(tmp_path: Path, body: str):
     """Both directories stated, and both systems declared unless `body` does."""
     lines = [
-        "session: s",
         f"blackrock_dir: '{tmp_path / 'br'}'",
         f"neuropixels_dir: '{tmp_path / 'np'}'",
     ]
@@ -482,11 +436,8 @@ def _flags(tmp_path: Path, body: str):
 
 
 _TWO_SYSTEMS = """
-monkey: Monkey Athos
-session: "2026-08-13"
-roots:
-  blackrock: "Z:/server"
-  neuropixels: "Y:/npx"
+blackrock_dir: "Z:/server/Monkey Athos/2026-08-13"
+neuropixels_dir: "Y:/npx/Monkey Athos/2026-08-13"
 blackrock:
   sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"
 neuropixels:
@@ -548,10 +499,7 @@ def test_cross_system_output_falls_back_when_blackrock_never_recorded(tmp_path):
         _write_session(
             tmp_path,
             """
-monkey: Monkey Demo
-session: "2026-08-13"
-roots:
-  neuropixels: "Y:/npx"
+neuropixels_dir: "Y:/npx/Monkey Demo/2026-08-13"
 neuropixels:
   bin_file: "{neuropixels_dir}/demo_g0_t0.imec0.ap.bin"
 """,
@@ -571,7 +519,6 @@ def test_a_data_dir_may_be_stated_outright(tmp_path):
         _write_session(
             tmp_path,
             """
-session: demo
 neuropixels_dir: "~/ephys/demo_data"
 neuropixels:
   bin_file: "{neuropixels_dir}/x.bin"
@@ -687,8 +634,7 @@ def test_a_duplicate_key_is_rejected_rather_than_silently_dropped(tmp_path):
     # `neuropixels:` block, say. That is a wrong sort, not a wrong path.
     path = tmp_path / "s.yaml"
     path.write_text(
-        "session: s\n"
-        f"neuropixels_dir: '{tmp_path}'\n"
+                f"neuropixels_dir: '{tmp_path}'\n"
         ""
         "neuropixels:\n  run_dir: '/a'\n  run_name: r\n"
         "neuropixels:\n  bin_file: '/b/x.bin'\n",
@@ -705,8 +651,7 @@ def test_a_duplicate_key_is_rejected_rather_than_silently_dropped(tmp_path):
 def test_a_duplicate_key_nested_in_a_block_is_also_rejected(tmp_path):
     path = tmp_path / "s.yaml"
     path.write_text(
-        "session: s\n"
-        f"neuropixels_dir: '{tmp_path}'\n"
+                f"neuropixels_dir: '{tmp_path}'\n"
         ""
         "neuropixels:\n  bin_file: '/a/x.bin'\n  bin_file: '/b/y.bin'\n",
         encoding="utf-8",
@@ -723,8 +668,8 @@ def test_probe_name_is_gone(tmp_path):
     # plausible, wrong, and silent.
     assert not hasattr(cfg.NeuropixelsSpec(), "probe_name")
 
-    session = _flags(tmp_path, "neuropixels:\n  probe_name: 'NeuroPix1_default.mat'\n")
-    assert not hasattr(session.neuropixels, "probe_name")
+    with pytest.raises(ValueError, match="unknown setting 'neuropixels.probe_name'"):
+        _flags(tmp_path, "neuropixels:\n  probe_name: 'NeuroPix1_default.mat'\n")
 
 
 def test_a_relative_probe_file_resolves_against_the_repo_not_the_cwd(tmp_path, monkeypatch):
@@ -756,7 +701,7 @@ def test_an_absolute_probe_file_is_left_alone(tmp_path):
 def _declared(tmp_path, body):
     path = _write_session(
         tmp_path,
-        f"session: s\nblackrock_dir: '{tmp_path / 'br'}'\n"
+        f"blackrock_dir: '{tmp_path / 'br'}'\n"
         f"neuropixels_dir: '{tmp_path / 'np'}'\n{body}",
     )
     return cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
@@ -853,7 +798,7 @@ def test_a_removed_key_raises_rather_than_being_ignored(tmp_path, key, value):
     # would change what a run does without a word.
     path = _write_session(
         tmp_path,
-        f"session: s\nneuropixels_dir: '{tmp_path}'\n"
+        f"neuropixels_dir: '{tmp_path}'\n"
         f"neuropixels:\n  bin_file: '/a/x.bin'\n{key}: {value}\n",
     )
 
@@ -919,29 +864,30 @@ def test_a_system_replaces_a_shared_list_rather_than_extending_it(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "key, body, expected",
+    "key, body",
     [
-        ("run_dir", "neuropixels:\n  run_dir: '/npx'\n", "bin_file"),
-        ("run_name", "neuropixels:\n  run_name: 'r'\n", "bin_file"),
-        ("gate", "neuropixels:\n  gate: 0\n", "bin_file"),
-        ("trigger", "neuropixels:\n  trigger: 0\n", "bin_file"),
-        ("probes", "neuropixels:\n  probes: [0, 1]\n", "two session files"),
-        ("by_probe", "neuropixels:\n  by_probe:\n    1: {}\n", "own session file"),
+        ("run_dir", "neuropixels:\n  run_dir: '/npx'\n"),
+        ("run_name", "neuropixels:\n  run_name: 'r'\n"),
+        ("gate", "neuropixels:\n  gate: 0\n"),
+        ("trigger", "neuropixels:\n  trigger: 0\n"),
+        ("probes", "neuropixels:\n  probes: [0, 1]\n"),
+        ("by_probe", "neuropixels:\n  by_probe:\n    1: {}\n"),
     ],
 )
-def test_the_removed_run_model_keys_raise_by_name(tmp_path, key, body, expected):
+def test_the_removed_run_model_keys_raise_by_name(tmp_path, key, body):
     # These sit in session copies on the rig. Ignoring one would change what a run
-    # does without a word, so each raises and says what replaces it.
+    # does without a word -- and they are caught by simply not being settings any
+    # more, so there is no list of dead keys to keep in step with the code.
     path = _write_session(
-        tmp_path, f"session: s\nneuropixels_dir: '{tmp_path}'\n" + body
+        tmp_path, f"neuropixels_dir: '{tmp_path}'\n" + body
     )
 
     with pytest.raises(ValueError) as excinfo:
         cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
 
     message = str(excinfo.value)
-    assert key in message
-    assert expected in message
+    assert f"neuropixels.{key}" in message
+    assert "unknown setting" in message
 
 
 def test_catgt_settings_survive_the_removal_of_the_run_model(tmp_path):
@@ -1011,7 +957,7 @@ def test_an_external_preprocess_block_is_refused(tmp_path):
     # every batch. Doing it again outside was work done twice, and unsaid.
     path = _write_session(
         tmp_path,
-        f"session: s\nneuropixels_dir: '{tmp_path}'\n"
+        f"neuropixels_dir: '{tmp_path}'\n"
         "neuropixels:\n  bin_file: '/a/x.bin'\n"
         "preprocess:\n  apply: true\n  bandpass: [300, 6000]\n",
     )
@@ -1019,8 +965,7 @@ def test_an_external_preprocess_block_is_refused(tmp_path):
     with pytest.raises(ValueError) as excinfo:
         cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
 
-    assert "preprocess" in str(excinfo.value)
-    assert "kilosort" in str(excinfo.value)
+    assert "unknown setting 'preprocess'" in str(excinfo.value)
 
 
 def test_a_removed_key_nested_in_a_system_block_is_also_refused(tmp_path):
@@ -1028,7 +973,7 @@ def test_a_removed_key_nested_in_a_system_block_is_also_refused(tmp_path):
     # keys would drop one silently -- the failure this rejection exists to stop.
     path = _write_session(
         tmp_path,
-        f"session: s\nneuropixels_dir: '{tmp_path}'\n"
+        f"neuropixels_dir: '{tmp_path}'\n"
         "neuropixels:\n  bin_file: '/a/x.bin'\n  preprocess:\n    apply: true\n",
     )
 
@@ -1045,15 +990,14 @@ def test_exclude_channels_is_refused(tmp_path):
     # a broken electrode is kilosort.bad_channels, the same on both systems.
     path = _write_session(
         tmp_path,
-        f"session: s\nblackrock_dir: '{tmp_path}'\n"
+        f"blackrock_dir: '{tmp_path}'\n"
         "blackrock:\n  spike_file: '/b/y.ns6'\n  exclude_channels: ['129']\n",
     )
 
     with pytest.raises(ValueError) as excinfo:
         cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
 
-    assert "exclude_channels" in str(excinfo.value)
-    assert "bad_channels" in str(excinfo.value)
+    assert "unknown setting 'blackrock.exclude_channels'" in str(excinfo.value)
 
 
 def test_drift_correction_is_off_for_the_utah_array():
@@ -1076,7 +1020,7 @@ def _load_session(tmp_path: Path, body: str):
     return cfg.load_session_config(
         _write_session(
             tmp_path,
-            "session: s\nblackrock_dir: '/b'\nneuropixels_dir: '/n'\n" + body,
+            "blackrock_dir: '/b'\nneuropixels_dir: '/n'\n" + body,
         ),
         "windows_rig",
         CONFIG_DIR,
@@ -1124,14 +1068,12 @@ def test_null_is_how_a_session_asks_for_every_spike(tmp_path):
     assert session.waveforms_for("blackrock").max_spikes is None
 
 
-def test_the_renamed_waveform_keys_raise_and_name_their_replacement(tmp_path):
+def test_the_renamed_waveform_keys_raise_rather_than_being_ignored(tmp_path):
     # Session copies live on the rig. Ignoring a key someone tuned there would
-    # change what a run measured without a word, so each is refused by name.
-    for old, new in (
-        ("waveform_ms: 3.0", "window_ms"),
-        ("export_waveforms: true", "export_snippets"),
-    ):
-        with pytest.raises(ValueError, match=new):
+    # change what a run measured without a word. Both moved into the per-system
+    # waveforms: block, so at the top level they are simply not settings.
+    for old in ("waveform_ms: 3.0", "export_waveforms: true"):
+        with pytest.raises(ValueError, match="unknown setting"):
             _load_session(tmp_path, f"{old}\nblackrock:\n  spike_file: '/b/x.ns6'\n")
 
 
@@ -1150,3 +1092,61 @@ def test_a_flag_override_reaches_both_systems(tmp_path):
     assert overridden.waveforms_for("neuropixels").export_snippets
     # ...and it changes nothing else, the band included.
     assert overridden.waveforms_for("neuropixels").highpass_hz is None
+
+
+# ---------------------------------------------------------------------------
+# A key that is not a setting
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "body, named, suggested",
+    [
+        ("export_figure: false\n", "export_figure", "export_figures"),
+        ("kilosort_on_neuropixel: false\n", "kilosort_on_neuropixel", "kilosort_on_neuropixels"),
+        ("neuropixels:\n  bin_files: '/a/x.bin'\n", "neuropixels.bin_files", "neuropixels.bin_file"),
+        (
+            "neuropixels:\n  waveforms:\n    window_msec: 2.0\n",
+            "neuropixels.waveforms.window_msec",
+            "neuropixels.waveforms.window_ms",
+        ),
+    ],
+)
+def test_a_mistyped_key_raises_and_names_the_real_one(tmp_path, body, named, suggested):
+    # YAML does not care about a key nobody reads, so without this the typo loads
+    # clean and the run silently keeps the default -- a wrong result rather than
+    # a wrong path, and nothing downstream can tell. Nested blocks are checked
+    # too: waveforms: is per system, so a typo there quietly restores a default
+    # the session meant to change.
+    path = _write_session(tmp_path, f"neuropixels_dir: '{tmp_path}'\n" + body)
+
+    with pytest.raises(ValueError) as excinfo:
+        cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
+
+    message = str(excinfo.value)
+    assert f"unknown setting '{named}'" in message
+    assert f"did you mean: {suggested}?" in message
+
+
+def test_a_key_inside_a_kilosort_block_is_never_checked(tmp_path):
+    # Those keys pass through to Kilosort, and pipeline._kilosort_arguments
+    # already splits them against the *installed* DEFAULT_SETTINGS and
+    # run_kilosort signature. A second copy of that split here would go stale the
+    # first time Kilosort moved a parameter -- and would refuse a real one.
+    session = _flags(
+        tmp_path,
+        "kilosort:\n  a_setting_added_after_this_test: 7\n"
+        "neuropixels:\n  bin_file: '/a/x.bin'\n  kilosort:\n    and_another: 3\n",
+    )
+
+    assert session.kilosort_for("neuropixels")["a_setting_added_after_this_test"] == 7
+    assert session.kilosort_for("neuropixels")["and_another"] == 3
+
+
+@pytest.mark.parametrize(
+    "config", sorted(p.name for p in CONFIG_DIR.glob("*.yaml"))
+)
+def test_every_tracked_config_uses_only_real_settings(config):
+    # The top-level key set is the one part of the check written by hand, so it
+    # is pinned against the files that have to keep loading.
+    cfg.load_session_config(CONFIG_DIR / config, "windows_rig", CONFIG_DIR)

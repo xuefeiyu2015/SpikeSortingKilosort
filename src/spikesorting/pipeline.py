@@ -41,6 +41,7 @@ a machine with none of them installed.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import shutil
@@ -585,7 +586,7 @@ def sort_with_kilosort(
         )
         if work_dir != final_dir:
             _publish(work_dir, final_dir)
-            _repoint_params(final_dir, binary.path)
+            _repoint_params(final_dir, binary)
     finally:
         if work_dir != final_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -639,31 +640,80 @@ def _publish(work_dir: Path, final_dir: Path) -> None:
     )
 
 
-def _repoint_params(final_dir: Path, binary: Path) -> None:
-    """Make ``params.py``'s ``dat_path`` absolute, if it is not already.
+def _repoint_params(final_dir: Path, binary: Binary) -> None:
+    """Point ``params.py`` at a file that still exists, consistently.
 
-    Phy reads the raw traces through that line. Kilosort writes it relative to
-    the directory it sorted in, in some versions -- and that directory was the
-    cache, which is deleted -- so a path that does not resolve from where the
-    results now live is rewritten to the binary's own. A path that does resolve
-    is left exactly as Kilosort wrote it.
+    Phy reads the raw traces through ``dat_path``, and Kilosort writes that line
+    for the file *it* sorted in the cache -- either ``temp_wh.dat``, which
+    :func:`_publish` skips because it is the size of the recording, or a path
+    relative to a directory that has since been deleted. Either way it no longer
+    resolves from where the results now live, so it is repointed at the binary
+    the sorter actually read. A path that does resolve is left exactly as
+    Kilosort wrote it.
+
+    **Three lines move together, not one.** ``temp_wh.dat`` holds only the
+    probe's channels while the raw binary holds every channel in the file, and
+    ``n_channels_dat`` is the stride Phy walks the file with -- leave it behind
+    and every trace is silently sheared rather than erroring. ``hp_filtered``
+    goes with them: the raw file is not the filtered copy, so Phy applies its own
+    150 Hz pass for display.
+
+    Written with forward slashes, as Kilosort writes it
+    (``kilosort/io.py``: ``dat_path.resolve().as_posix()``). Phy *executes*
+    ``params.py``, so a Windows path in a single-quoted literal makes ``\\N`` a
+    named-unicode escape and the GUI dies on ``exec`` before it opens.
     """
     params = final_dir / "params.py"
     if not params.exists():
         return
+
     lines = params.read_text(encoding="utf-8").splitlines(keepends=True)
-    out, changed = [], False
+    stated = _stated_dat_path(lines)
+    if stated is not None and ((final_dir / stated).exists() or Path(stated).exists()):
+        return
+
+    replacements = {
+        "dat_path": f"dat_path = '{binary.path.as_posix()}'\n",
+        "n_channels_dat": f"n_channels_dat = {binary.n_chan_bin}\n",
+        "hp_filtered": "hp_filtered = False\n",
+    }
+    out = [replacements.pop(_assigned_name(line), line) for line in lines]
+    out.extend(replacements.values())   # keys this params.py did not carry
+    params.write_text("".join(out), encoding="utf-8")
+    log.info(
+        "params.py: dat_path repointed at %s (%d channels)",
+        binary.path,
+        binary.n_chan_bin,
+    )
+
+
+def _assigned_name(line: str) -> str:
+    """The name a ``params.py`` line assigns to, or ``""`` for anything else."""
+    name, sep, _ = line.partition("=")
+    return name.strip() if sep else ""
+
+
+def _stated_dat_path(lines: list[str]) -> str | None:
+    """The path ``params.py`` currently names, or None if it names none.
+
+    Kilosort writes this field two ways -- a bare string for ``temp_wh.dat``, a
+    *list* of the source files otherwise -- so the value is parsed rather than
+    unquoted. A value that will not parse is a Windows path whose backslashes
+    are unicode escapes: exactly the case being repaired, and one that must not
+    raise here.
+    """
     for line in lines:
-        if line.startswith("dat_path"):
-            stated = line.partition("=")[2].strip().strip("'\"")
-            if not (final_dir / stated).exists() and not Path(stated).exists():
-                #line = f"dat_path = '{binary}'\n"
-                line = f"dat_path = '{binary.as_posix()}'\n"
-                changed = True
-        out.append(line)
-    if changed:
-        params.write_text("".join(out), encoding="utf-8")
-        log.info("params.py: dat_path repointed at %s", binary)
+        if _assigned_name(line) != "dat_path":
+            continue
+        value = line.partition("=")[2].strip()
+        try:
+            parsed = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            return value.strip("'\"")
+        if isinstance(parsed, (list, tuple)):
+            return str(parsed[0]) if parsed else None
+        return None if parsed is None else str(parsed)
+    return None
 
 
 def _dry_run(
