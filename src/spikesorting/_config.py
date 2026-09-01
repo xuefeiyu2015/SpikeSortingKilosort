@@ -885,6 +885,7 @@ def load_session_config(
     profile = load_machine(machine, config_dir) if isinstance(machine, str) else machine
 
     session_name = str(data.get("session") or session_path.stem)
+   # session_name = session_path.stem
     monkey = str(data.get("monkey") or "")
 
     # Built-ins first. An unset one is *omitted* rather than mapped to "": a
@@ -892,15 +893,15 @@ def load_session_config(
     # collapsing to "/Monkey Athos" is a wrong path that fails much later, if at
     # all. Left in place it is caught below instead.
     builtin = {"session": session_name, "downloads": str(downloads_dir())}
-    if monkey:
-        builtin["monkey"] = monkey
-    for key, value in (
-        ("cache", profile.cache_dir),
-        ("data_root", profile.data_root),
-        ("output_root", profile.output_root),
-    ):
-        if value:
-            builtin[key] = str(value)
+    #if monkey:
+    #    builtin["monkey"] = monkey
+    #for key, value in (
+    #    ("cache", profile.cache_dir),
+    #    ("data_root", profile.data_root),
+    #    ("output_root", profile.output_root),
+    #):
+    #    if value:
+    #        builtin[key] = str(value)
 
     # Then the session's own roots, which may themselves use the built-ins --
     # `blackrock: "Z:/server/{monkey}"` is legal, though the usual form stops at
@@ -923,8 +924,8 @@ def load_session_config(
         stated = data.get(f"{system}_dir")
         if stated:
             system_dirs[system] = _as_path(_substitute(str(stated), mapping))
-        elif system in mapping and monkey:
-            system_dirs[system] = _as_path(mapping[system]) / monkey / session_name
+        #elif system in mapping and monkey:
+        #    system_dirs[system] = _as_path(mapping[system]) / monkey / session_name
         else:
             system_dirs[system] = None
         if system_dirs[system] is not None:
@@ -984,7 +985,7 @@ def load_session_config(
             if (data.get(system) or {}).get("kilosort")
         },
     )
-    _reject_colliding_system_dirs(config, session_path)
+   # _reject_colliding_system_dirs(config, session_path)
     return config
 
 

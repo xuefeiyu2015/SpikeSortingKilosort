@@ -657,7 +657,8 @@ def _repoint_params(final_dir: Path, binary: Path) -> None:
         if line.startswith("dat_path"):
             stated = line.partition("=")[2].strip().strip("'\"")
             if not (final_dir / stated).exists() and not Path(stated).exists():
-                line = f"dat_path = '{binary}'\n"
+                #line = f"dat_path = '{binary}'\n"
+                line = f"dat_path = '{binary.as_posix()}'\n"
                 changed = True
         out.append(line)
     if changed:
