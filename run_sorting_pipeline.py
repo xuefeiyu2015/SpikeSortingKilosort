@@ -79,25 +79,41 @@ def main() -> int:
     run = Runner(config, keep_going=args.keep_going)
     print()
 
-    # The whole pipeline: one sort per system the session declares.
-    for system in ss.SYSTEMS:
+    # The whole pipeline: one sort per stream the session declares. A stream is a
+    # system, except on Neuropixels, where a session may name several probes of
+    # one run -- each its own binary, its own clock and its own sort. per_probe()
+    # hands back an ordinary one-probe config for each, so nothing below (and
+    # nothing in the pipeline) has a probe argument.
+    for tag, probe_config in config.per_probe():
         run(
             ss.sort_with_kilosort,
-            config,
-            system,
+            probe_config,
+            "neuropixels",
             dry_run=args.dry_run,
-            system=system,
+            system="neuropixels",
+            label="neuropixels" if tag is None else f"neuropixels {tag}",
+            config=probe_config,
         )
+
+    # Once, whatever the probes: there is one Utah array, on one recording.
+    run(
+        ss.sort_with_kilosort,
+        config,
+        "blackrock",
+        dry_run=args.dry_run,
+        system="blackrock",
+    )
 
     code = run.finish("sorting pipeline")
     if code == 0 and not args.dry_run:
         print("\nNext, by hand:")
         print("    conda activate phy")
-        for system in ss.SYSTEMS:
-            if not getattr(config, f"sorts_{system}"):
+        for tag, probe_config in config.per_probe():
+            if not probe_config.sorts_neuropixels:
                 continue
-            sorted_dir = config.paths.sorted_for(system)
-            print(f"    phy template-gui {sorted_dir}/params.py")
+            print(f"    phy template-gui {probe_config.paths.sorted_np}/params.py")
+        if config.sorts_blackrock:
+            print(f"    phy template-gui {config.paths.sorted_br}/params.py")
         print("then:")
         print(f"    python run_exporting_pipeline.py --config {args.config}")
     return code

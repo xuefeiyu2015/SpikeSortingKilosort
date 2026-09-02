@@ -95,6 +95,7 @@ def test_the_tracked_configs_state_the_code_defaults_below_their_fences():
     for name, machine in (
         ("session_template_utah_probe.yaml", "windows_rig"),
         ("session_template_1probe.yaml", "windows_rig"),
+        ("session_template_2probes.yaml", "windows_rig"),
         ("session_template_utah_only.yaml", "windows_rig"),
         ("session_demo_1probe.yaml", "mac"),
     ):
@@ -133,11 +134,12 @@ def test_the_one_probe_template_differs_only_by_the_missing_array():
 
     # There is no array, so: nothing to sort, and no channel map to name.
     assert none.blackrock.spike_file is None
-    assert none.blackrock.probe_file is None and none.blackrock.cmp_file is None
+    assert none.blackrock.probe_file is None
     assert none.sorts_blackrock is False
-    # ...and the file does not say so: the missing spike_file is what says it, so
-    # adding one later starts sorting with nothing else to remember.
-    assert none.kilosort_on_blackrock is True
+    # The template says so outright. Unstated, the flag would follow the paths to
+    # the same answer -- but writing it down is what makes an explicit `true`
+    # with no spike_file a refusal rather than a silent skip.
+    assert none.kilosort_on_blackrock is False
 
     # Neuropixels is untouched, including its Kilosort block.
     assert none.neuropixels == one.neuropixels
@@ -145,7 +147,9 @@ def test_the_one_probe_template_differs_only_by_the_missing_array():
     assert "blackrock" not in none.kilosort_by_system   # no array, no settings for one
 
     # `session` is the config filename, so two files necessarily differ there.
-    stated = {"session", "blackrock", "kilosort_by_system"}
+    # kilosort_on_blackrock too: this session has no array, and says so, which is
+    # exactly the difference being pinned rather than drift.
+    stated = {"session", "blackrock", "kilosort_by_system", "kilosort_on_blackrock"}
     differing = [
         f
         for f in one.__dataclass_fields__
@@ -153,6 +157,53 @@ def test_the_one_probe_template_differs_only_by_the_missing_array():
     ]
     assert differing == [], differing
     assert cfg.replace(one.blackrock, spike_file=None, probe_file=None) == none.blackrock
+
+
+def test_the_two_probe_template_differs_only_by_the_second_binary():
+    # Same pinning as above, for the pair that is easiest to let drift: the
+    # 2-probe template is the 1-probe one with bin_file replaced by a bin_files
+    # list, so a threshold tuned in whichever file someone happened to open fails
+    # here rather than on the rig.
+    one, two = (
+        cfg.load_session_config(CONFIG_DIR / name, "windows_rig", CONFIG_DIR)
+        for name in ("session_template_1probe.yaml", "session_template_2probes.yaml")
+    )
+
+    assert one.probes == (0,) and two.probes == (0, 1)
+    assert one.neuropixels.bin_files is None   # one probe names a bare bin_file
+    assert two.neuropixels.bin_file is None    # ...and two name only the list
+
+    # The Blackrock half is untouched: sync pulses, no array, nothing to sort.
+    assert two.blackrock == one.blackrock
+    assert two.sorts_blackrock is False and two.has_data("blackrock")
+    # ...and, as in the 1-probe file, it says so outright.
+    assert two.kilosort_on_blackrock is False
+
+    # Each probe of the pair resolves to the 1-probe template's own session,
+    # apart from which binary it names -- that is what "two sessions in one
+    # file" has to mean for the pinning to be worth anything. Both binaries are
+    # written out in the file; neither is derived from the other.
+    for _, probe_config in two.per_probe():
+        assert probe_config.neuropixels.bin_file.name.startswith("Athos_2026_08_13_g0_t0.imec")
+        assert probe_config.paths.sorted_np.parent == probe_config.neuropixels_dir
+    imec0 = two.for_probe(0)
+    assert imec0.neuropixels_dir == one.neuropixels_dir      # the same probe folder
+    assert imec0.neuropixels.bin_file == one.neuropixels.bin_file
+    assert imec0.kilosort_for("neuropixels") == one.kilosort_for("neuropixels")
+
+    # `session` is the config filename, so two files necessarily differ there;
+    # neuropixels_dir is the gate folder here and the probe folder there.
+    stated = {"session", "neuropixels", "neuropixels_dir"}
+    differing = [
+        f
+        for f in one.__dataclass_fields__
+        if f not in stated and getattr(one, f) != getattr(two, f)
+    ]
+    assert differing == [], differing
+    # ...and inside the neuropixels block, only how the binaries are named.
+    assert cfg.replace(
+        two.neuropixels, bin_files=None, bin_file=one.neuropixels.bin_file
+    ) == one.neuropixels
 
 
 def test_the_utah_only_template_differs_only_by_the_missing_probe():
@@ -193,29 +244,214 @@ def test_the_utah_only_template_differs_only_by_the_missing_probe():
     assert differing == [], differing
 
 
-def test_two_probes_is_two_session_files_not_a_probes_list(tmp_path):
-    # A probe list cannot exist any more, because a session names one binary.
-    # Two probes of one run are two files, and what matters is that they cannot
-    # collide: every output path comes from neuropixels_dir alone, so pointing
-    # each at its own _imec<n> folder is what keeps the two sortings apart.
-    run = "Y:/npx/Tank_g0"
-    sessions = []
-    for probe in (0, 1):
-        path = tmp_path / f"probe{probe}.yaml"
-        path.write_text(
-            f'neuropixels_dir: "{run}/Tank_g0_imec{probe}"\n'
-            "neuropixels:\n"
-            f'  bin_file: "{{neuropixels_dir}}/Tank_g0_t0.imec{probe}.ap.bin"\n',
-            encoding="utf-8",
-        )
-        sessions.append(cfg.load_session_config(path, "windows_rig", CONFIG_DIR))
-    a, b = sessions
+_RUN = "Y:/npx/Tank_g0"
+_BINARIES = (
+    f'    - "{_RUN}/Tank_g0_imec0/Tank_g0_t0.imec0.ap.bin"\n'
+    f'    - "{_RUN}/Tank_g0_imec1/Tank_g0_t0.imec1.ap.bin"\n'
+)
 
-    assert a.neuropixels.bin_file != b.neuropixels.bin_file
-    assert a.paths.sorted_for("neuropixels") != b.paths.sorted_for("neuropixels")
-    # Each writes inside its own recording's folder, so nothing is shared.
-    assert a.paths.sorted_for("neuropixels").parent == a.neuropixels_dir
-    assert b.paths.sorted_for("neuropixels").parent == b.neuropixels_dir
+
+def _two_probe_session(tmp_path: Path, extra: str = "", binaries: str = _BINARIES):
+    """One session file naming both binaries of a two-probe run."""
+    path = tmp_path / "two.yaml"
+    path.write_text(
+        f'neuropixels_dir: "{_RUN}"\n'
+        "neuropixels:\n  bin_files:\n" + binaries + extra,
+        encoding="utf-8",
+    )
+    return cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
+
+
+def test_a_bin_files_list_projects_to_one_ordinary_config_per_probe(tmp_path):
+    # `bin_files:` is a way to write two sessions in one file, not a dimension
+    # the pipeline carries. for_probe hands back a config indistinguishable from
+    # a file naming that probe alone, and what matters is that the two cannot
+    # collide: every output path comes from neuropixels_dir, so each probe has to
+    # land in the folder its own binary sits in.
+    session = _two_probe_session(tmp_path)
+    assert session.probes == (0, 1)          # read off the two .imec<n> names
+
+    tags = [tag for tag, _ in session.per_probe()]
+    assert tags == ["imec0", "imec1"]
+    a, b = (config for _, config in session.per_probe())
+
+    # Each projection names the binary the session stated for it -- nothing is
+    # derived from the other probe's path.
+    assert a.neuropixels.bin_file.name == "Tank_g0_t0.imec0.ap.bin"
+    assert b.neuropixels.bin_file.name == "Tank_g0_t0.imec1.ap.bin"
+    assert {a.neuropixels.bin_file, b.neuropixels.bin_file} == set(
+        session.neuropixels.bin_files
+    )
+
+    # Each writes inside its own binary's folder -- including probe 0, whose
+    # folder is NOT the directory the session states.
+    for config in (a, b):
+        assert config.paths.sorted_np.parent == config.neuropixels_dir
+        assert config.neuropixels_dir == config.neuropixels.bin_file.parent
+        assert config.neuropixels_dir != session.neuropixels_dir
+    assert a.paths.sorted_np != b.paths.sorted_np
+
+
+def test_the_probe_number_comes_from_each_binarys_own_name(tmp_path):
+    # No parallel list of probe numbers to drift out of step with the paths --
+    # SpikeGLX puts it in the filename. Order in the file does not decide it.
+    session = _two_probe_session(
+        tmp_path,
+        binaries=(
+            f'    - "{_RUN}/Tank_g0_imec3/Tank_g0_t0.imec3.ap.bin"\n'
+            f'    - "{_RUN}/Tank_g0_imec1/Tank_g0_t0.imec1.ap.bin"\n'
+        ),
+    )
+
+    assert session.probes == (1, 3)
+    assert [tag for tag, _ in session.per_probe()] == ["imec1", "imec3"]
+    assert session.for_probe(3).neuropixels.bin_file.name.endswith("imec3.ap.bin")
+
+
+def test_a_binary_whose_name_carries_no_probe_falls_back_to_its_position(tmp_path):
+    # A hand-cut extract has no .imec<n>, and refusing it would make the list
+    # useless for exactly the recordings that are hardest to name.
+    session = _two_probe_session(
+        tmp_path,
+        binaries=f'    - "{_RUN}/left.bin"\n    - "{_RUN}/right.bin"\n',
+    )
+
+    assert session.probes == (0, 1)
+    assert session.for_probe(0).neuropixels.bin_file.name == "left.bin"
+    assert session.for_probe(1).neuropixels.bin_file.name == "right.bin"
+
+
+def test_each_probe_gets_its_own_time_map_under_the_blackrock_folder(tmp_path):
+    # Both probes are fitted onto the SAME Blackrock recording, so `aligned` is
+    # the one path a probe list can make collide -- one time_map.json, written
+    # twice, the second winning. Each probe has its own oscillator and SY word,
+    # so those are genuinely different maps.
+    path = tmp_path / "two.yaml"
+    path.write_text(
+        'blackrock_dir: "Y:/br"\n'
+        f'neuropixels_dir: "{_RUN}"\n'
+        "blackrock:\n  sync_file: '/b/y.ns5'\n"
+        "neuropixels:\n  bin_files:\n" + _BINARIES,
+        encoding="utf-8",
+    )
+    session = cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
+    a, b = (config for _, config in session.per_probe())
+
+    assert a.paths.aligned != b.paths.aligned
+    assert a.paths.aligned.name == "imec0" and b.paths.aligned.name == "imec1"
+    # Still under Blackrock, which is the reference timebase.
+    assert a.paths.aligned.parent == session.paths.sorted_br
+
+
+def test_a_session_naming_one_binary_projects_to_itself(tmp_path):
+    # The no-regression pin. Every session written before `bin_files:` existed
+    # must resolve to exactly the paths it always did -- no imec<n> level
+    # anywhere -- so the probe dimension costs an ordinary session nothing.
+    session = _flags(tmp_path, "neuropixels:\n  bin_file: '/a/run_g0_t0.imec0.ap.bin'\n")
+
+    assert session.neuropixels.bin_files is None
+    assert session.probes == (0,)                    # read off the binary's name
+    assert session.per_probe() == [(None, session.for_probe(0))]
+
+    only = session.for_probe(0)
+    assert only.probe_tag is None
+    assert only.neuropixels_dir == session.neuropixels_dir
+    assert only.neuropixels == session.neuropixels
+    assert only.paths == session.paths               # aligned included
+
+
+def test_a_probe_overrides_kilosort_settings_without_discarding_the_shared_ones(tmp_path):
+    # by_probe is merged one level deep, exactly like the per-system layer: a
+    # probe's bad_channels replaces the list above it, and everything else it
+    # does not mention still applies.
+    session = _two_probe_session(
+        tmp_path,
+        "  kilosort:\n"
+        "    nblocks: 1\n"
+        "    bad_channels: [7]\n"
+        "  by_probe:\n"
+        "    1:\n"
+        "      kilosort:\n"
+        "        bad_channels: [17, 203]\n",
+    )
+    a, b = (config for _, config in session.per_probe())
+
+    assert a.kilosort_for("neuropixels") == {"nblocks": 1, "bad_channels": [7]}
+    assert b.kilosort_for("neuropixels") == {"nblocks": 1, "bad_channels": [17, 203]}
+    # Replaced, not extended: keeping [7] would go on sorting a site the session
+    # named as dead on that probe.
+    assert 7 not in b.kilosort_for("neuropixels")["bad_channels"]
+
+
+def test_every_probes_binary_is_checked_before_the_run(tmp_path):
+    # Both are named, so both are checked -- a session covering two probes with
+    # one of them missing would otherwise pass the pre-flight and fail an hour
+    # in, on the second sort.
+    from conftest import spikeglx_run
+
+    binaries = spikeglx_run(tmp_path / "npx", probes=(0, 1))
+    path = _write_session(
+        tmp_path,
+        f"neuropixels_dir: '{binaries[0].parent.parent}'\n"
+        "neuropixels:\n  bin_files:\n"
+        f"    - '{binaries[0]}'\n    - '{binaries[1]}'\n",
+    )
+    session = cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
+    assert not [p for p in session.missing_inputs() if "bin_file" in p]
+
+    binaries[1].unlink()
+
+    problems = [p for p in session.missing_inputs() if "bin_file" in p]
+    assert len(problems) == 1
+    assert "(imec1)" in problems[0]        # says which probe, not just "a binary"
+    assert str(binaries[1]) in problems[0]
+
+
+def test_naming_both_bin_file_and_bin_files_raises(tmp_path):
+    # Two answers to which probe this session sorts, and nothing to say which
+    # wins -- so neither does.
+    with pytest.raises(ValueError, match="both bin_file and bin_files"):
+        _two_probe_session(tmp_path, "  bin_file: '/a/Tank_g0_t0.imec0.ap.bin'\n")
+
+
+def test_two_binaries_for_one_probe_raise(tmp_path):
+    # The probe comes from the name, so a copied line -- or two files from
+    # different runs of the same probe -- would collapse to one entry, and the
+    # session would quietly sort half of what it names.
+    with pytest.raises(ValueError, match="only 1 distinct probe"):
+        _two_probe_session(
+            tmp_path,
+            binaries=(
+                f'    - "{_RUN}/a/Tank_g0_t0.imec0.ap.bin"\n'
+                f'    - "{_RUN}/b/Other_g0_t0.imec0.ap.bin"\n'
+            ),
+        )
+
+
+def test_an_lf_file_cannot_be_named_alongside_several_probes(tmp_path):
+    # lf_file is a single key and each probe has its own LF band. Silently
+    # applying one probe's to both would export the wrong recording.
+    with pytest.raises(ValueError, match="lf_file names one LF band"):
+        _two_probe_session(tmp_path, "  lf_file: '/a/Tank_g0_t0.imec0.lf.bin'\n")
+
+
+def test_by_probe_refuses_a_probe_the_session_does_not_cover(tmp_path):
+    # Settings for a probe that never runs are settings nobody reads -- most
+    # likely a typo'd probe number, and silently ignoring it would sort the real
+    # probe with the wrong bad_channels.
+    with pytest.raises(ValueError, match=r"by_probe names probe\(s\) \[2\]"):
+        _two_probe_session(
+            tmp_path, "  by_probe:\n    2:\n      kilosort:\n        nblocks: 0\n"
+        )
+
+
+def test_by_probe_takes_kilosort_and_nothing_else(tmp_path):
+    # Geometry comes from each probe's own .meta and the paths are in bin_files,
+    # so anything else here would be read by nobody.
+    with pytest.raises(ValueError, match="unknown setting 'neuropixels.by_probe.1.probe_file'"):
+        _two_probe_session(
+            tmp_path, "  by_probe:\n    1:\n      probe_file: 'configs/probes/np1_default.json'\n"
+        )
 
 
 def test_output_paths_are_derived_from_each_systems_directory(tmp_path):
@@ -546,24 +782,25 @@ def test_each_system_can_name_its_own_probe_file(tmp_path):
     assert session.neuropixels.probe_file == cfg.REPO_ROOT / "configs/probes/np1_nhp_long.json"
 
 
-def test_a_utah_array_can_name_its_cmp_instead(tmp_path):
-    session = _flags(tmp_path, "blackrock:\n  cmp_file: '/arrays/athos_A.cmp'\n")
+def test_a_utah_array_names_its_cmp_in_the_same_key(tmp_path):
+    # One key per system whatever the format: a .cmp is named exactly where a
+    # .json would be, and setup_probe tells them apart by extension. cmp_file
+    # used to be a second key tried first.
+    session = _flags(tmp_path, "blackrock:\n  probe_file: '/arrays/athos_A.cmp'\n")
 
-    assert session.blackrock.cmp_file == Path("/arrays/athos_A.cmp")
-    assert session.blackrock.probe_file is None
+    assert session.blackrock.probe_file == Path("/arrays/athos_A.cmp")
 
 
 def test_probe_paths_expand_placeholders_like_any_other_path(tmp_path):
-    session = _flags(tmp_path, "blackrock:\n  cmp_file: '{blackrock_dir}/arrayA.cmp'\n")
+    session = _flags(tmp_path, "blackrock:\n  probe_file: '{blackrock_dir}/arrayA.cmp'\n")
 
-    assert str(session.blackrock.cmp_file) == str(tmp_path / "br" / "arrayA.cmp")
+    assert str(session.blackrock.probe_file) == str(tmp_path / "br" / "arrayA.cmp")
 
 
 def test_no_probe_named_is_the_default(tmp_path):
     session = _flags(tmp_path, "")
 
     assert session.blackrock.probe_file is None
-    assert session.blackrock.cmp_file is None
     assert session.neuropixels.probe_file is None
 
 
@@ -577,12 +814,78 @@ def test_a_named_probe_file_that_is_absent_is_reported(tmp_path):
     assert any("probe_file" in p for p in session.missing_inputs())
 
 
-def test_a_named_cmp_file_that_is_absent_is_reported(tmp_path):
+def test_a_named_cmp_that_is_absent_is_reported(tmp_path):
+    # Same check, and now the same key: the format does not change whether a
+    # named map has to be there.
     session = _flags(
-        tmp_path, "blackrock:\n  sync_file: '/b/y.ns5'\n  cmp_file: '/nope/array.cmp'\n"
+        tmp_path, "blackrock:\n  sync_file: '/b/y.ns5'\n  probe_file: '/nope/array.cmp'\n"
     )
 
-    assert any("cmp_file" in p for p in session.missing_inputs())
+    assert any("probe_file" in p for p in session.missing_inputs())
+
+
+def test_asking_to_sort_blackrock_with_nothing_to_sort_raises(tmp_path):
+    # The flag is a request, and a request that cannot be honoured must fail
+    # rather than turn into nothing. Skipping reads like a successful run to
+    # someone who meant to sort the array and mistyped the path -- they get no
+    # units and one [--] line, hours later.
+    path = _write_session(
+        tmp_path,
+        f"blackrock_dir: '{tmp_path}'\nkilosort_on_blackrock: true\n"
+        "blackrock:\n  sync_file: '/b/y.ns5'\n",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
+
+    message = str(excinfo.value)
+    assert "kilosort_on_blackrock is true" in message
+    assert "spike_file" in message
+    # Both ways out are named: the array's .ns6, or saying it is not being sorted.
+    assert "kilosort_on_blackrock: false" in message
+
+
+def test_an_unstated_kilosort_on_blackrock_follows_the_paths(tmp_path):
+    # Raising on the *default* would put a line saying "not doing this" in every
+    # sync-only session. Unstated, the flag resolves from whether there is
+    # anything to sort -- so only a session that writes `true` is held to it.
+    sync_only = _flags(tmp_path, "blackrock:\n  sync_file: '/b/y.ns5'\n")
+    with_array = _flags(
+        tmp_path, "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/x.ns6'\n"
+    )
+
+    assert sync_only.kilosort_on_blackrock is False
+    assert sync_only.sorts_blackrock is False
+    assert with_array.kilosort_on_blackrock is True
+    assert with_array.sorts_blackrock is True
+
+    # ...and stating false with an array present still turns the sort off, which
+    # is the "extract the pulses and the LFP, do not sort" case.
+    off = _flags(
+        tmp_path,
+        "kilosort_on_blackrock: false\n"
+        "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/x.ns6'\n",
+    )
+    assert off.sorts_blackrock is False and off.has_data("blackrock")
+
+
+def test_the_retired_cmp_file_key_names_probe_file(tmp_path):
+    # Session copies live on the rig, so a key that moved must say where it went.
+    # This one needs an explicit hint: cmp_file's nearest surviving neighbour is
+    # sync_file, and pointing a channel map at the pulse train is worse than no
+    # hint at all.
+    path = _write_session(
+        tmp_path,
+        f"blackrock_dir: '{tmp_path}'\n"
+        "blackrock:\n  sync_file: '/b/y.ns5'\n  cmp_file: '/b/array.cmp'\n",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
+
+    message = str(excinfo.value)
+    assert "blackrock.cmp_file" in message and "blackrock.probe_file" in message
+    assert "sync_file" not in message
 
 
 def test_a_probe_file_that_exists_is_not_a_problem(tmp_path):
@@ -870,14 +1173,16 @@ def test_a_system_replaces_a_shared_list_rather_than_extending_it(tmp_path):
         ("run_name", "neuropixels:\n  run_name: 'r'\n"),
         ("gate", "neuropixels:\n  gate: 0\n"),
         ("trigger", "neuropixels:\n  trigger: 0\n"),
-        ("probes", "neuropixels:\n  probes: [0, 1]\n"),
-        ("by_probe", "neuropixels:\n  by_probe:\n    1: {}\n"),
     ],
 )
 def test_the_removed_run_model_keys_raise_by_name(tmp_path, key, body):
     # These sit in session copies on the rig. Ignoring one would change what a run
     # does without a word -- and they are caught by simply not being settings any
     # more, so there is no list of dead keys to keep in step with the code.
+    #
+    # `probes:` and `by_probe:` are NOT in this list: they are settings again, and
+    # are what a two-probe run states. What stayed gone is the four keys that
+    # composed a path -- run_layout reads all four back off bin_file's own name.
     path = _write_session(
         tmp_path, f"neuropixels_dir: '{tmp_path}'\n" + body
     )
@@ -1104,7 +1409,9 @@ def test_a_flag_override_reaches_both_systems(tmp_path):
     [
         ("export_figure: false\n", "export_figure", "export_figures"),
         ("kilosort_on_neuropixel: false\n", "kilosort_on_neuropixel", "kilosort_on_neuropixels"),
-        ("neuropixels:\n  bin_files: '/a/x.bin'\n", "neuropixels.bin_files", "neuropixels.bin_file"),
+        # bin_file and bin_files are both real; a slip in either still lands.
+        ("neuropixels:\n  bin_flie: '/a/x.bin'\n", "neuropixels.bin_flie", "neuropixels.bin_file"),
+        ("neuropixels:\n  bin_fies: ['/a/x.bin']\n", "neuropixels.bin_fies", "neuropixels.bin_files"),
         (
             "neuropixels:\n  waveforms:\n    window_msec: 2.0\n",
             "neuropixels.waveforms.window_msec",

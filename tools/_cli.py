@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +55,16 @@ def build_parser(description: str) -> argparse.ArgumentParser:
         action="store_true",
         help="do not verify that input files exist before starting",
     )
+    parser.add_argument(
+        "--probe",
+        nargs="+",
+        type=int,
+        default=None,
+        metavar="N",
+        help="run only these probes of the run the session names (default: all "
+        "of neuropixels.probes). Selects a subset; it cannot add a probe the "
+        "session does not cover",
+    )
     return parser
 
 
@@ -89,6 +100,42 @@ def flag_overrides(args: argparse.Namespace) -> dict[str, object]:
     return overrides
 
 
+def _select_probes(config: SessionConfig, wanted: list[int] | None) -> SessionConfig:
+    """Narrow ``neuropixels.bin_files`` to the probes ``--probe`` asked for.
+
+    Deliberately not in :func:`flag_overrides`: every flag there replaces a
+    session key for one run, while this one runs a *subset* of what the session
+    already says. So it can only ever remove binaries -- naming a probe the
+    session does not cover is an error rather than a way to add it, since nothing
+    would then say where that probe's binary is.
+    """
+    if wanted is None:
+        return config
+
+    missing = sorted(set(wanted) - set(config.probes))
+    if missing:
+        raise SystemExit(
+            f"--probe {missing} : session '{config.session}' covers probes "
+            f"{list(config.probes)}. Name the missing binary in "
+            "neuropixels.bin_files to run it."
+        )
+    if config.neuropixels.bin_files is None:
+        # One binary, and it is one of the probes asked for. Narrowing would mean
+        # writing a bin_files list, which flips the session into the multi-probe
+        # output layout on the strength of a flag -- moving a plain one-probe
+        # session's outputs. So a request it already satisfies is a no-op.
+        return config
+
+    keep = config.neuropixels.binaries_by_probe()
+    return replace(
+        config,
+        neuropixels=replace(
+            config.neuropixels,
+            bin_files=tuple(keep[probe] for probe in sorted(set(wanted))),
+        ),
+    )
+
+
 def load(args: argparse.Namespace, require_inputs: bool = True) -> SessionConfig:
     """Load the session config, apply any flag overrides, create its output folders."""
     config = load_session_config(args.config, args.machine)
@@ -96,8 +143,10 @@ def load(args: argparse.Namespace, require_inputs: bool = True) -> SessionConfig
     overrides = flag_overrides(args)
     if overrides:
         config = with_overrides(config, **overrides)
+    config = _select_probes(config, getattr(args, "probe", None))
 
-    config.paths.mkdirs()
+    for _, probe_config in config.per_probe():
+        probe_config.paths.mkdirs()
     if require_inputs and not getattr(args, "skip_checks", False):
         config.require_inputs()
 
@@ -107,12 +156,17 @@ def load(args: argparse.Namespace, require_inputs: bool = True) -> SessionConfig
             "  overridden for this run: "
             + ", ".join(f"{key}={value}" for key, value in sorted(overrides.items()))
         )
-    # Each system writes beside its own recording, so there are up to two trees.
-    for system in ("blackrock", "neuropixels"):
-        directory = config.paths.dir_for(system)
+    # Each system writes beside its own recording, so there are up to two trees --
+    # and a multi-probe session has one Neuropixels tree per probe.
+    directory = config.paths.dir_for("blackrock")
+    if directory is not None:
+        print(f"  blackrock: {directory}")
+    for tag, probe_config in config.per_probe():
+        directory = probe_config.paths.dir_for("neuropixels")
         if directory is None:
             continue
-        print(f"  {system}: {directory}")
+        label = "neuropixels" if tag is None else f"neuropixels {tag}"
+        print(f"  {label}: {directory}")
     return config
 
 
@@ -132,14 +186,22 @@ class Runner:
         #: True when the last call raised, so a caller can skip what depended on it.
         self.last_failed = False
 
-    def __call__(self, verb, *args, system: str | None = None, **kwargs):
-        """Run one verb. Returns its value, or None if it was skipped or failed."""
+    def __call__(self, verb, *args, system: str | None = None, label: str | None = None,
+                 config: SessionConfig | None = None, **kwargs):
+        """Run one verb. Returns its value, or None if it was skipped or failed.
+
+        ``label`` names the stream in the printed line when that is not simply the
+        system -- one probe of a multi-probe run. ``config`` is the config to ask
+        for the skip reason, which for a per-probe stage is that probe's own
+        projection rather than the session as a whole.
+        """
         if self.stopped:
             return None
         self.last_failed = False
-        label = verb.__name__ + (f"({system})" if system else "")
+        shown = label or system
+        label = verb.__name__ + (f"({shown})" if shown else "")
 
-        why = skip_reason(self.config, verb, system)
+        why = skip_reason(config or self.config, verb, system)
         if why:
             print(f"[--] {label}\n       {why}")
             return None

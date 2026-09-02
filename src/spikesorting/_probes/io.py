@@ -5,13 +5,18 @@ than going through ``kilosort.io.save_probe``. That keeps probe construction --
 which is desk work, done once per array or per run -- possible on a laptop with
 no Kilosort, torch or GPU installed.
 
-Three formats are in play:
+Four formats are in play, and :func:`load_probe_file` picks between them by
+suffix -- which is why a session names a channel map with one key rather than one
+key per format:
 
 ``.json``  Kilosort4's native probe file. What ``run_kilosort`` loads.
 ``.mat``   the older Kilosort channel map (``NeuroPix1_default.mat`` and friends),
            read-only here.
+``.cmp``   a Blackrock array's own wiring map, read by ``_probes.utah``.
 ``.prb``   probeinterface's format, for the SpikeInterface route used by
-           Blackrock data.
+           Blackrock data. **Written here, not read** -- nothing in the pipeline
+           consumes one, and reading it would pull probeinterface into a path
+           that otherwise needs only NumPy.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ import numpy as np
 
 __all__ = [
     "save_probe_json",
+    "load_probe_file",
     "load_probe_json",
     "probe_from_mat",
     "save_probe_prb",
@@ -117,6 +123,41 @@ def load_probe_json(path: str | Path) -> dict:
         "kcoords": np.asarray(raw["kcoords"], dtype=np.float32),
         "n_chan": int(raw["n_chan"]),
     }
+
+
+def load_probe_file(path: str | Path) -> dict:
+    """Read a channel map from whichever format its suffix says it is.
+
+    A session names one ``probe_file`` per system and this decides how to read
+    it. There used to be a second key -- ``blackrock.cmp_file`` -- with the two
+    tried in order, which meant a session could name both with nothing in the
+    output to say which one was used. The file's own extension answers that
+    without a precedence rule.
+
+    ``.cmp`` is read as a Utah array's wiring map, with ``independent`` kcoords:
+    at 400 um pitch no spike reaches two electrodes. ``make_probe.py --grouped``
+    is how a deliberately grouped map is built, and it writes ``.json``.
+    """
+    path = Path(path)
+    suffix = path.suffix.lower()
+
+    if suffix == ".json":
+        return load_probe_json(path)
+    if suffix == ".mat":
+        return probe_from_mat(path)
+    if suffix == ".cmp":
+        # Imported here so io.py stays independent of utah.py, which is the only
+        # module that knows what a .cmp row means.
+        from .utah import probe_from_cmp
+
+        return probe_from_cmp(path, independent=True)
+
+    raise ValueError(
+        f"cannot read a channel map from '{path.name}': a probe_file must be "
+        ".json (built by tools/make_probe.py), .mat (an older Kilosort channel "
+        "map) or .cmp (a Blackrock array's own wiring map). "
+        ".prb is written by this repo but not read back."
+    )
 
 
 def probe_from_mat(path: str | Path) -> dict:

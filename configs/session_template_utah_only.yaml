@@ -42,7 +42,10 @@ blackrock:
   # ---------- edit for this session ----------
   spike_file: "{blackrock_dir}/HUB-Athos_001.ns6"   # Utah array spikes
   sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"    # the two sync channels
-  probe_file: "configs/probes/utah_athos_A.json"    # per array, not per session
+  # This array's channel map: its own .cmp, or a .json/.mat built from one.
+  # Read by extension, so there is one key whatever the format. Per array,
+  # not per session -- see "Probes".
+  probe_file: "configs/probes/utah_athos_A.json"
   kilosort:
     bad_channels: []     # a dead electrode goes here -- see "Bad channels"
     nblocks: 0           # no drift correction at 400 um -- see "Drift correction"
@@ -57,7 +60,6 @@ blackrock:
   stream_id: null        # pin one when a .nsX exposes several streams
   gap_tolerance_ms: 10   # absorb PTP timestamp glitches -- see "The NSP clock"
   allow_segments: false  # a larger jump is a paused recording: stop, do not guess
-  cmp_file: null         # the array's own .cmp, read when probe_file is null
   waveforms:             # the mean-waveform export -- see "Waveforms"
     window_ms: 2.0       # snippet width, centred on the spike sample
     max_spikes: 2000     # per unit, spread over the session; null = every spike
@@ -166,14 +168,17 @@ kilosort: {}
 #   result would be a blend of the two.
 #
 # Probes
-#   Blackrock: cmp_file (the array's own wiring map) is tried first, then
-#   probe_file (a JSON built once by tools/make_probe.py). With neither, sorting
-#   REFUSES to start: a grid in channel order would put units on the wrong
-#   electrodes, and its channel count would silently drop every electrode past it.
-#   Which array is in which monkey is a property of the session, which is why it
-#   is named here and not passed as a flag. If you truly want a grid, build one --
-#   make_probe.py utah with no --cmp -- and name it here, so the choice is written
-#   down rather than assumed.
+#   Blackrock: probe_file, and that is the whole rule. It takes the array's own
+#   .cmp wiring map, a .json built once by tools/make_probe.py, or an older
+#   Kilosort .mat -- the extension picks the reader, so the format is a property
+#   of the file rather than a second setting. (cmp_file used to be that second
+#   setting, tried first; a session naming both said nothing about which won.)
+#   With no probe_file, sorting REFUSES to start: a grid in channel order would
+#   put units on the wrong electrodes, and its channel count would silently drop
+#   every electrode past it. Which array is in which monkey is a property of the
+#   session, which is why it is named here and not passed as a flag. If you truly
+#   want a grid, build one -- make_probe.py utah with no --cmp -- and name it
+#   here, so the choice is written down rather than assumed.
 #
 #   Neuropixels: the .meta beside bin_file wins wherever it has ~snsGeomMap,
 #   because it records which sites were actually active for this recording --

@@ -1194,23 +1194,23 @@ def check_session(config: SessionConfig) -> list[Check]:
         )
 
     brk = config.blackrock
-    if config.sorts_blackrock and brk.probe_file is None and brk.cmp_file is None:
+    if config.sorts_blackrock and brk.probe_file is None:
         checks.append(
             Check(
                 name=f"session:{config.session}:probe",
                 status=MISSING,
                 detail=(
-                    "no blackrock.cmp_file or probe_file, so the Utah array "
+                    "no blackrock.probe_file, so the Utah array "
                     "cannot be sorted: a grid in channel order would attribute "
                     "units to the wrong electrodes, and its channel count would "
                     "silently drop every electrode past it"
                 ),
                 disables=("sort_blackrock",),
                 fix=(
-                    "set blackrock.cmp_file to the array's .cmp, or build a map "
-                    "once: python tools/make_probe.py utah --cmp array.cmp "
-                    "--out configs/probes/utah_<array>.json --plot, then set "
-                    "blackrock.probe_file to it"
+                    "set blackrock.probe_file to the array's own .cmp, or build "
+                    "a map once: python tools/make_probe.py utah --cmp array.cmp "
+                    "--out configs/probes/utah_<array>.json --plot, and name that "
+                    ".json in the same key -- the extension picks the reader"
                 ),
                 section=SECTION_SESSION,
             )

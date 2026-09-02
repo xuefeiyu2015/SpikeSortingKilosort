@@ -37,6 +37,7 @@ __all__ = [
     "raw_to_volts",
     "RunLayout",
     "run_layout",
+    "probe_number",
     "parse_geom_map",
     "parse_geom_header",
     "export_lfp",
@@ -293,6 +294,23 @@ def raw_to_volts(info: StreamInfo, raw: np.ndarray, gain: float = 1.0) -> np.nda
 _RUN_FILENAME = re.compile(
     r"^(?P<run>.+)_g(?P<gate>\d+)_t(?P<trigger>\w+)\.imec(?P<probe>\d+)\.(ap|lf)\.bin$"
 )
+
+
+#: The probe number in a SpikeGLX stream filename -- ``.imec<n>.`` anywhere in
+#: it. Looser than :data:`_RUN_FILENAME`, which needs the whole run.
+_PROBE_IN_NAME = re.compile(r"\.imec(\d+)\.")
+
+
+def probe_number(path: str | Path) -> int | None:
+    """The probe a binary belongs to, read off its name, or None if it says none.
+
+    A session naming several binaries needs each one's probe number to key its
+    settings and its outputs. SpikeGLX puts it in the filename, so it is read
+    from there rather than restated -- and a name that carries none (a hand-cut
+    extract) simply returns None, leaving the caller to fall back on position.
+    """
+    match = _PROBE_IN_NAME.search(Path(path).name)
+    return int(match.group(1)) if match else None
 
 
 @dataclass(frozen=True)

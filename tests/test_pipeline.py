@@ -16,6 +16,7 @@ import pytest
 
 import spikesorting as ss
 from spikesorting import _config as cfg
+from spikesorting import pipeline
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 
@@ -189,17 +190,48 @@ def test_neuropixels_with_neither_raises_and_names_the_fix(tmp_path):
     assert "probe_file" in str(excinfo.value)
 
 
-def test_a_utah_cmp_wins_over_a_probe_file(tmp_path):
-    # Same rule: the array's own wiring map beats a file built from another one.
-    probe = _probe_json(tmp_path / "probes" / "utah_A.json")
-    session = _session(
-        tmp_path, f"blackrock:\n  sync_file: '/b/y.ns5'\n  probe_file: '{probe}'\n"
-        f"  cmp_file: '/nope/missing.cmp'\n"
+def test_a_probe_file_is_read_by_its_extension(tmp_path):
+    # One key, whatever format the map is written in. There used to be two --
+    # cmp_file tried first, then probe_file -- so a session could name both with
+    # nothing in the output to say which one was used.
+    from spikesorting._probes.io import save_probe_json
+    from spikesorting._probes.utah import utah_grid_probe
+
+    grid = utah_grid_probe(16, n_cols=4)
+    as_json = save_probe_json(grid, tmp_path / "utah_A.json")
+    as_cmp = tmp_path / "utah_A.cmp"
+    as_cmp.write_text(
+        "//comment line\n"
+        + "".join(
+            f"{col}\t{row}\telec\t{col * 4 + row + 1}\tchan{col * 4 + row + 1}\n"
+            for col in range(4)
+            for row in range(4)
+        ),
+        encoding="utf-8",
     )
 
-    # cmp_file is tried first, so a missing one surfaces rather than being skipped.
-    with pytest.raises(Exception):
+    for named in (as_json, as_cmp):
+        session = _session(
+            tmp_path,
+            f"blackrock:\n  sync_file: '/b/y.ns5'\n  probe_file: '{named}'\n",
+        )
+        probe = ss.setup_probe(session, "blackrock")
+        assert probe["n_chan"] == 16, named.suffix
+
+
+def test_a_probe_file_in_a_format_nothing_reads_says_so(tmp_path):
+    # .prb is written by this repo and not read back, and the extension is the
+    # only thing that decides -- so the refusal has to name what it does take.
+    session = _session(
+        tmp_path, "blackrock:\n  sync_file: '/b/y.ns5'\n  probe_file: '/a/utah.prb'\n"
+    )
+
+    with pytest.raises(ValueError) as excinfo:
         ss.setup_probe(session, "blackrock")
+
+    message = str(excinfo.value)
+    for accepted in (".json", ".mat", ".cmp"):
+        assert accepted in message, message
 
 
 def test_each_probe_gets_the_geometry_from_its_own_meta(tmp_path):
@@ -262,7 +294,7 @@ def test_a_utah_array_with_no_map_at_all_refuses_to_sort(tmp_path):
         ss.setup_probe(_session(tmp_path), "blackrock")
 
     message = str(excinfo.value)
-    for pointer in ("cmp_file", "probe_file", "make_probe.py"):
+    for pointer in ("probe_file", ".cmp", "make_probe.py"):
         assert pointer in message, message
 
 
@@ -370,7 +402,10 @@ def test_blackrock_recording_only_the_sync_channels_is_not_sorted(tmp_path):
 
     assert session.has_data("blackrock") is True      # it recorded: pulses
     assert session.sorts_blackrock is False           # ...but nothing to sort
-    assert "no blackrock.spike_file" in ss.skip_reason(
+    # Unstated, kilosort_on_blackrock follows the paths, so a session like this
+    # needs no line saying what it is not doing.
+    assert session.kilosort_on_blackrock is False
+    assert "kilosort_on_blackrock is false" in ss.skip_reason(
         session, ss.sort_with_kilosort, "blackrock"
     )
     assert ss.sort_with_kilosort(session, "blackrock") is None
@@ -802,9 +837,9 @@ def test_the_session_cannot_set_what_the_pipeline_passes(tmp_path, monkeypatch):
 
 
 def test_two_probes_are_sorted_into_their_own_directories(tmp_path, monkeypatch):
-    # Two probes are two streams with two clocks, and now two session files.
-    # Each names its own binary and its own neuropixels_dir, so the second cannot
-    # land on top of the first.
+    # Two probes are two streams with two clocks. Written as two session files
+    # here: each names its own binary and its own neuropixels_dir, so the second
+    # cannot land on top of the first. The test below does the same with one file.
     seen: list[dict] = []
     _fake_kilosort(monkeypatch, seen)
     sessions = [
@@ -822,9 +857,94 @@ def test_two_probes_are_sorted_into_their_own_directories(tmp_path, monkeypatch)
     assert "imec0" in str(seen[0]["filename"]) and "imec1" in str(seen[1]["filename"])
 
 
+def test_one_session_file_sorts_both_probes_of_a_run(tmp_path, monkeypatch):
+    # The same two streams, from one `bin_files:` file. per_probe() hands
+    # sort_with_kilosort an ordinary one-probe config each time -- which is why
+    # nothing in the pipeline takes a probe -- and what has to hold is exactly
+    # what holds for two files: two binaries, two output folders, two caches.
+    seen: list[dict] = []
+    _fake_kilosort(monkeypatch, seen)
+    from conftest import spikeglx_run
+
+    binaries = spikeglx_run(tmp_path / "npx", probes=(0, 1), sites={0: 4, 1: 6})
+    gate_dir = binaries[0].parent.parent
+    session = _session(
+        tmp_path,
+        f"neuropixels:\n  bin_files:\n    - '{binaries[0]}'\n    - '{binaries[1]}'\n",
+        npx_dir=gate_dir,
+    )
+    session = cfg.with_overrides(
+        session,
+        machine=cfg.MachineProfile(name="test", cache_dir=tmp_path / "cache", device="cpu"),
+    )
+
+    results = [
+        ss.sort_with_kilosort(probe_config, "neuropixels")
+        for _, probe_config in session.per_probe()
+    ]
+
+    first, second = results
+    assert first.results_dir != second.results_dir
+    assert first.results_dir.parent == binaries[0].parent
+    assert second.results_dir.parent == binaries[1].parent
+    # Each read its own probe's binary -- and its own .meta, which is what makes
+    # the two channel maps differ (4 sites vs 6).
+    assert "imec0" in str(seen[0]["filename"]) and "imec1" in str(seen[1]["filename"])
+    assert len(seen[0]["probe"]["chanMap"]) != len(seen[1]["probe"]["chanMap"])
+
+
+def test_two_probes_of_one_session_do_not_share_a_cache_directory(tmp_path, monkeypatch):
+    # The cache tag is built from the session label, which is the same for every
+    # probe of one file. Without the probe in it both sorts would run in one work
+    # directory -- one temp.dat, one set of results, the second overwriting the
+    # first before either was published.
+    _fake_kilosort(monkeypatch, [])
+    from conftest import spikeglx_run
+
+    binaries = spikeglx_run(tmp_path / "npx", probes=(0, 1))
+    session = _session(
+        tmp_path,
+        f"neuropixels:\n  bin_files:\n    - '{binaries[0]}'\n    - '{binaries[1]}'\n",
+        npx_dir=binaries[0].parent.parent,
+    )
+    session = cfg.with_overrides(
+        session,
+        machine=cfg.MachineProfile(name="test", cache_dir=tmp_path / "cache", device="cpu"),
+    )
+
+    work_dirs = [
+        pipeline._work_dir(probe_config, "neuropixels")
+        for _, probe_config in session.per_probe()
+    ]
+
+    assert work_dirs[0] != work_dirs[1]
+    assert work_dirs[0].name.endswith("_imec0") and work_dirs[1].name.endswith("_imec1")
+
+
+def test_a_single_probe_session_keeps_its_untagged_cache_directory(tmp_path, monkeypatch):
+    # ...and a session that states no probe list gets exactly the work directory
+    # it always did, so the probe dimension costs an ordinary session nothing.
+    _fake_kilosort(monkeypatch, [])
+    session = _npx_session(tmp_path)
+    session = cfg.with_overrides(
+        session,
+        machine=cfg.MachineProfile(name="test", cache_dir=tmp_path / "cache", device="cpu"),
+    )
+
+    only = session.for_probe(0)
+    assert only.probe_tag is None
+    assert pipeline._work_dir(only, "neuropixels") == pipeline._work_dir(
+        session, "neuropixels"
+    )
+    assert pipeline._work_dir(session, "neuropixels").name == (
+        f"{session.session}_{cfg.stream_label('neuropixels')}"
+    )
+
+
 def test_a_probes_own_bad_channels_reach_the_sorter(tmp_path, monkeypatch):
-    # A dead site is a fact about one probe. It goes in that probe's own session
-    # file now, rather than in a by_probe: block inside a shared one.
+    # A dead site is a fact about one probe. It can go in that probe's own
+    # session file, or in a by_probe: block of a shared one -- the projection
+    # makes the two indistinguishable by the time the sorter is called.
     seen: list[dict] = []
     _fake_kilosort(monkeypatch, seen)
     plain = _npx_session(tmp_path, "  kilosort:\n    nblocks: 1\n", probe=0,
