@@ -35,9 +35,6 @@
 #
 # false = extract that system's LFP and sync pulses, but do not sort it.
 kilosort_on_neuropixels: true
-# false here because this session records no Utah array: Blackrock is present
-# to carry the sync pulses. The flag is a request, so turning it on without a
-# blackrock.spike_file to sort is refused at load rather than silently skipped.
 kilosort_on_blackrock: false
 
 export_lfp: false      # LF-band copy, ~7 GB/hour at 385 channels -- see "LFP"
@@ -61,8 +58,7 @@ blackrock:
   # ---------- edit for this session ----------
   spike_file: null   # no Utah array in this session -- sync only
   sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"    # the two sync channels
-  probe_file: null       # ...so no channel map is needed, or looked for.
-                         # An array's .cmp goes here too -- see "Probes".
+  probe_file: null       # ...so no channel map is needed, or looked for
   # ...and no kilosort: block either: those settings describe how to sort an
   # array that is not in this session.
 
@@ -249,17 +245,14 @@ kilosort: {}
 #   in the list raises.
 #
 # Probes
-#   Blackrock: probe_file, and that is the whole rule. It takes the array's own
-#   .cmp wiring map, a .json built once by tools/make_probe.py, or an older
-#   Kilosort .mat -- the extension picks the reader, so the format is a property
-#   of the file rather than a second setting. (cmp_file used to be that second
-#   setting, tried first; a session naming both said nothing about which won.)
-#   With no probe_file, sorting REFUSES to start: a grid in channel order would
-#   put units on the wrong electrodes, and its channel count would silently drop
-#   every electrode past it. Which array is in which monkey is a property of the
-#   session, which is why it is named here and not passed as a flag. If you truly
-#   want a grid, build one -- make_probe.py utah with no --cmp -- and name it
-#   here, so the choice is written down rather than assumed.
+#   Blackrock: cmp_file (the array's own wiring map) is tried first, then
+#   probe_file (a JSON built once by tools/make_probe.py). With neither, sorting
+#   REFUSES to start: a grid in channel order would put units on the wrong
+#   electrodes, and its channel count would silently drop every electrode past it.
+#   Which array is in which monkey is a property of the session, which is why it
+#   is named here and not passed as a flag. If you truly want a grid, build one --
+#   make_probe.py utah with no --cmp -- and name it here, so the choice is written
+#   down rather than assumed.
 #
 #   Neuropixels: the .meta beside bin_file wins wherever it has ~snsGeomMap,
 #   because it records which sites were actually active for this recording --

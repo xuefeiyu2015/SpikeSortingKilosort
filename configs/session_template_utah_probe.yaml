@@ -47,8 +47,7 @@ blackrock:
   spike_file: "{blackrock_dir}/HUB-Athos_001.ns6"   # Utah array spikes
   sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"    # the two sync channels
   # This array's channel map: its own .cmp, or a .json/.mat built from one.
-  # Read by extension, so there is one key whatever the format. Per array,
-  # not per session -- see "Probes".
+  # Read by extension, so there is one key whatever the format.
   probe_file: "configs/probes/utah_athos_A.json"
   kilosort:
     bad_channels: []     # a dead electrode goes here -- see "Bad channels"
