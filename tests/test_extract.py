@@ -45,8 +45,7 @@ def make_session(tmp_path, bin_file, _name="synthetic", n_chan=385, fs=30000, **
         encoding="utf-8",
     )
     lines = [
-        f"session: {_name}",
-        "output_dir: '{output_root}/" + _name + "'",
+        f"neuropixels_dir: '{tmp_path / 'out' / _name}'",
         "neuropixels:",
         f"  bin_file: '{bin_file}'",
         f"  n_chan_bin: {n_chan if n_chan is not None else 'null'}",

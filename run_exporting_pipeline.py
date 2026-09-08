@@ -55,6 +55,23 @@ STAGES = [
 ]
 
 
+def _log_pipeline_messages() -> None:
+    """Show this pipeline's own log lines, and only its own.
+
+    ``logging.basicConfig`` would configure the *root* logger, which turns on
+    INFO for every installed package too -- faiss announcing which build it
+    loaded, matplotlib announcing a backend -- all wearing this project's indent.
+    Everything here logs to one named logger (``pipeline.py``, ``_sync/``), so
+    that is the one to attach a handler to.
+    """
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("       %(message)s"))
+    log = logging.getLogger("spikesorting")
+    log.handlers[:] = [handler]
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+
 def main() -> int:
     parser = build_parser(__doc__)
     parser.add_argument(
@@ -97,7 +114,7 @@ def main() -> int:
     )
     parser.add_argument("--no-figures", action="store_true", help="skip figure generation")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="       %(message)s")
+    _log_pipeline_messages()
 
     # An LFP on the probe's own clock cannot be compared with anything else that
     # was recorded, so asking for it asks for the map that fixes that. Harmless
@@ -113,30 +130,50 @@ def main() -> int:
     run = Runner(config, keep_going=args.keep_going)
     print()
 
+    def per_probe_config():
+        """``(label, config)`` for each Neuropixels stream the session covers.
+
+        One entry unless the session names several probes of a run; each config
+        is an ordinary one-probe one, so the verbs below take no probe argument.
+        """
+        for tag, probe_config in config.per_probe():
+            label = "neuropixels" if tag is None else f"neuropixels {tag}"
+            yield label, probe_config
+
+    def per_stream(verb, *extra):
+        """Run a ``(config, system)`` verb on every stream.
+
+        Each probe of the run, then Blackrock **once**. Blackrock is one
+        recording however many probes there are, and re-reading a .ns5 per probe
+        would be minutes of share I/O for a byte-identical result.
+        """
+        for label, probe_config in per_probe_config():
+            run(verb, probe_config, "neuropixels", *extra,
+                system="neuropixels", label=label, config=probe_config)
+        run(verb, config, "blackrock", *extra, system="blackrock")
+
     # Extraction first: everything below reads the edge files it writes.
     for stage, verb in (("extract_sync", ss.extract_sync), ("lfp", ss.extract_lfp)):
-        if stage not in steps:
-            continue
-        for system in ss.SYSTEMS:
-            run(verb, config, system, system=system)
+        if stage in steps:
+            per_stream(verb)
 
     # Blackrock is the reference timebase, so it is what the other system is
-    # mapped *onto* rather than a system to remap.
+    # mapped *onto* rather than a system to remap. Each probe gets its own fit:
+    # separate oscillators, separate SY words, separate time_map.json.
     if "time_remapping" in steps:
-        for system in ss.SYSTEMS:
-            run(ss.time_remapping, config, system, system=system)
+        per_stream(ss.time_remapping)
 
     if "validate_remapping" in steps:
-        run(ss.validate_remapping, config, config.export_figures, system="neuropixels")
+        for label, probe_config in per_probe_config():
+            run(ss.validate_remapping, probe_config, probe_config.export_figures,
+                system="neuropixels", label=label, config=probe_config)
 
     if "export_results" in steps:
-        for system in ss.SYSTEMS:
-            run(ss.export_results, config, system, system=system)
+        per_stream(ss.export_results)
 
     # Last: the only stage here that re-reads the recording itself.
     if "waveforms" in steps:
-        for system in ss.SYSTEMS:
-            run(ss.export_waveforms, config, system, system=system)
+        per_stream(ss.export_waveforms)
 
     return run.finish("exporting pipeline")
 

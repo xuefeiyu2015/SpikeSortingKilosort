@@ -58,7 +58,7 @@ def test_overrides_reach_the_loaded_session_without_touching_the_file(tmp_path):
 
     session = tmp_path / "s.yaml"
     session.write_text(
-        f"session: s\nneuropixels_dir: '{tmp_path / 'np'}'\n"
+        f"neuropixels_dir: '{tmp_path / 'np'}'\n"
         "export_lfp: false\nneuropixels:\n  bin_file: '/a/x.bin'\n",
         encoding="utf-8",
     )

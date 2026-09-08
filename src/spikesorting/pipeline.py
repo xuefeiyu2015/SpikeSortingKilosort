@@ -41,6 +41,7 @@ a machine with none of them installed.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import shutil
@@ -121,11 +122,10 @@ def skip_reason(config: SessionConfig, verb: Any, system: str | None = None) -> 
 
     if name == "sort_with_kilosort" and system is not None:
         if not getattr(config, f"kilosort_on_{system}"):
+            # For Blackrock this is also how a sync-only session says it has no
+            # Utah array. The flag with no spike_file is refused at load, so
+            # there is no third answer here -- see _config._reject_sorting_nothing.
             return f"kilosort_on_{system} is false"
-        if system == "blackrock" and config.blackrock.spike_file is None:
-            # Blackrock recorded, but only the sync channels: a session whose
-            # spikes come from Neuropixels alone. There is no Utah array here.
-            return "no blackrock.spike_file, so there is no spike data to sort"
 
     if name == "extract_lfp":
         if system == "blackrock":
@@ -163,10 +163,17 @@ def setup_probe(config: SessionConfig, system: str) -> dict | None:
     ================================ =========================================
     Neuropixels                      Blackrock
     ================================ =========================================
-    1. the ``.meta`` beside bin_file  1. ``blackrock.cmp_file``
-    2. ``neuropixels.probe_file``     2. ``blackrock.probe_file``
-    3. raises: no honest default      3. raises: no honest default
+    1. the ``.meta`` beside bin_file  1. ``blackrock.probe_file``
+    2. ``neuropixels.probe_file``     2. raises: no honest default
+    3. raises: no honest default
     ================================ =========================================
+
+    **One key per system, whatever format the map is in.** ``probe_file`` is read
+    by its extension -- ``.cmp``, ``.json`` or ``.mat``, see
+    ``_probes.io.load_probe_file`` -- so naming a Utah array's own wiring map is
+    the same act as naming a built one. There used to be a second Blackrock key,
+    ``cmp_file``, tried first, which meant a session could name both with nothing
+    in the output to say which one was used.
 
     **Neither system invents a layout.** Kilosort has no probe library to fall
     back on -- it ships no probe files, and its own API
@@ -193,10 +200,10 @@ def setup_probe(config: SessionConfig, system: str) -> dict | None:
         if probe is not None:
             return probe
         if spec.probe_file is not None:
-            from ._probes.io import load_probe_json
+            from ._probes.io import load_probe_file
 
             log.info("no usable .meta; using neuropixels.probe_file %s", spec.probe_file)
-            return load_probe_json(spec.probe_file)
+            return load_probe_file(spec.probe_file)
         raise FileNotFoundError(
             "no channel map for neuropixels: this run has no .meta to build one "
             "from, and neuropixels.probe_file is not set. Build one once and name "
@@ -206,25 +213,22 @@ def setup_probe(config: SessionConfig, system: str) -> dict | None:
             "then set  neuropixels.probe_file: configs/probes/<name>.json"
         )
 
-    from ._probes.utah import probe_from_cmp
-
-    if spec.cmp_file is not None:
-        return probe_from_cmp(spec.cmp_file, independent=True)
     if spec.probe_file is not None:
-        from ._probes.io import load_probe_json
+        from ._probes.io import load_probe_file
 
-        return load_probe_json(spec.probe_file)
+        return load_probe_file(spec.probe_file)
     raise FileNotFoundError(
-        "no channel map for the Utah array: neither blackrock.cmp_file nor "
-        "blackrock.probe_file is set, and there is no honest default. A grid in "
-        "channel order attributes units to the wrong electrodes, and its channel "
-        "count silently drops every electrode past it. Name the array's own map:\n"
-        "    blackrock.cmp_file: <array>.cmp\n"
-        "or build one once and set blackrock.probe_file to it:\n"
+        "no channel map for the Utah array: blackrock.probe_file is not set, and "
+        "there is no honest default. A grid in channel order attributes units to "
+        "the wrong electrodes, and its channel count silently drops every "
+        "electrode past it. Name the array's own wiring map:\n"
+        "    blackrock.probe_file: <array>.cmp\n"
+        "or build one once and name that instead:\n"
         "    python tools/make_probe.py utah --cmp <array>.cmp "
         "--out configs/probes/utah_<array>.json --plot\n"
-        "A deliberate placeholder grid is that command without --cmp -- built, "
-        "written down and named, rather than assumed."
+        "Either way it is the same key -- .cmp, .json and .mat are told apart by "
+        "extension. A deliberate placeholder grid is that command without --cmp: "
+        "built, written down and named, rather than assumed."
     )
 
 
@@ -475,7 +479,7 @@ _RESERVED = {
     "data_dir": "neuropixels.bin_file names the binary outright",
     "file_object": "not used: both systems arrive as a binary",
     "results_dir": "derived from the session directory",
-    "probe": "the run's .meta, blackrock.cmp_file, or probe_file",
+    "probe": "the run's .meta, or <system>.probe_file",
     "probe_name": "probe_file -- Kilosort ships no probe library",
     "n_chan_bin": "read from the .meta, or neuropixels.n_chan_bin",
     "fs": "read from the .meta, or neuropixels.sample_rate",
@@ -585,7 +589,7 @@ def sort_with_kilosort(
         )
         if work_dir != final_dir:
             _publish(work_dir, final_dir)
-            _repoint_params(final_dir, binary.path)
+            _repoint_params(final_dir, binary)
     finally:
         if work_dir != final_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -615,7 +619,14 @@ def sort_with_kilosort(
 
 
 def _work_dir(config: SessionConfig, system: str) -> Path | None:
-    """Fast local scratch for this stream's sort, or None to sort in place."""
+    """Fast local scratch for this stream's sort, or None to sort in place.
+
+    Tagged with the probe when the session states a ``probes:`` list. The session
+    label is the same for every probe of one config file, so without the tag two
+    probes would share a work directory -- and therefore one ``temp.dat`` and one
+    set of results, the second sort landing on top of the first before either was
+    published.
+    """
     if config.cache_dir is None:
         log.warning(
             "machine '%s' has no cache_dir, so Kilosort writes straight to the "
@@ -623,7 +634,10 @@ def _work_dir(config: SessionConfig, system: str) -> Path | None:
             config.machine.name,
         )
         return None
-    return Path(config.cache_dir) / f"{config.session}_{stream_label(system)}"
+    name = f"{config.session}_{stream_label(system)}"
+    if system == "neuropixels" and config.probe_tag is not None:
+        name = f"{name}_{config.probe_tag}"
+    return Path(config.cache_dir) / name
 
 
 def _publish(work_dir: Path, final_dir: Path) -> None:
@@ -639,30 +653,80 @@ def _publish(work_dir: Path, final_dir: Path) -> None:
     )
 
 
-def _repoint_params(final_dir: Path, binary: Path) -> None:
-    """Make ``params.py``'s ``dat_path`` absolute, if it is not already.
+def _repoint_params(final_dir: Path, binary: Binary) -> None:
+    """Point ``params.py`` at a file that still exists, consistently.
 
-    Phy reads the raw traces through that line. Kilosort writes it relative to
-    the directory it sorted in, in some versions -- and that directory was the
-    cache, which is deleted -- so a path that does not resolve from where the
-    results now live is rewritten to the binary's own. A path that does resolve
-    is left exactly as Kilosort wrote it.
+    Phy reads the raw traces through ``dat_path``, and Kilosort writes that line
+    for the file *it* sorted in the cache -- either ``temp_wh.dat``, which
+    :func:`_publish` skips because it is the size of the recording, or a path
+    relative to a directory that has since been deleted. Either way it no longer
+    resolves from where the results now live, so it is repointed at the binary
+    the sorter actually read. A path that does resolve is left exactly as
+    Kilosort wrote it.
+
+    **Three lines move together, not one.** ``temp_wh.dat`` holds only the
+    probe's channels while the raw binary holds every channel in the file, and
+    ``n_channels_dat`` is the stride Phy walks the file with -- leave it behind
+    and every trace is silently sheared rather than erroring. ``hp_filtered``
+    goes with them: the raw file is not the filtered copy, so Phy applies its own
+    150 Hz pass for display.
+
+    Written with forward slashes, as Kilosort writes it
+    (``kilosort/io.py``: ``dat_path.resolve().as_posix()``). Phy *executes*
+    ``params.py``, so a Windows path in a single-quoted literal makes ``\\N`` a
+    named-unicode escape and the GUI dies on ``exec`` before it opens.
     """
     params = final_dir / "params.py"
     if not params.exists():
         return
+
     lines = params.read_text(encoding="utf-8").splitlines(keepends=True)
-    out, changed = [], False
+    stated = _stated_dat_path(lines)
+    if stated is not None and ((final_dir / stated).exists() or Path(stated).exists()):
+        return
+
+    replacements = {
+        "dat_path": f"dat_path = '{binary.path.as_posix()}'\n",
+        "n_channels_dat": f"n_channels_dat = {binary.n_chan_bin}\n",
+        "hp_filtered": "hp_filtered = False\n",
+    }
+    out = [replacements.pop(_assigned_name(line), line) for line in lines]
+    out.extend(replacements.values())   # keys this params.py did not carry
+    params.write_text("".join(out), encoding="utf-8")
+    log.info(
+        "params.py: dat_path repointed at %s (%d channels)",
+        binary.path,
+        binary.n_chan_bin,
+    )
+
+
+def _assigned_name(line: str) -> str:
+    """The name a ``params.py`` line assigns to, or ``""`` for anything else."""
+    name, sep, _ = line.partition("=")
+    return name.strip() if sep else ""
+
+
+def _stated_dat_path(lines: list[str]) -> str | None:
+    """The path ``params.py`` currently names, or None if it names none.
+
+    Kilosort writes this field two ways -- a bare string for ``temp_wh.dat``, a
+    *list* of the source files otherwise -- so the value is parsed rather than
+    unquoted. A value that will not parse is a Windows path whose backslashes
+    are unicode escapes: exactly the case being repaired, and one that must not
+    raise here.
+    """
     for line in lines:
-        if line.startswith("dat_path"):
-            stated = line.partition("=")[2].strip().strip("'\"")
-            if not (final_dir / stated).exists() and not Path(stated).exists():
-                line = f"dat_path = '{binary}'\n"
-                changed = True
-        out.append(line)
-    if changed:
-        params.write_text("".join(out), encoding="utf-8")
-        log.info("params.py: dat_path repointed at %s", binary)
+        if _assigned_name(line) != "dat_path":
+            continue
+        value = line.partition("=")[2].strip()
+        try:
+            parsed = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            return value.strip("'\"")
+        if isinstance(parsed, (list, tuple)):
+            return str(parsed[0]) if parsed else None
+        return None if parsed is None else str(parsed)
+    return None
 
 
 def _dry_run(
@@ -987,8 +1051,12 @@ def time_remapping(
     Blackrock is the reference timebase, so it is not an argument -- this maps
     onto it, never the reverse.
 
-    One map per probe, in ``aligned/imec<n>/``. Each probe has its own oscillator
-    and its own SY word, so one probe's fit says nothing about another's.
+    One map per probe. Each probe has its own oscillator and its own SY word, so
+    one probe's fit says nothing about another's -- which is why a session
+    covering several writes each into its own ``<blackrock_dir>/<sorter>/imec<n>/``
+    rather than one shared folder. Nothing here knows about that: it is handed a
+    config already projected onto one probe, and ``paths.aligned`` is where that
+    probe's map goes.
 
     Coarse offset from the 14 s coded bursts first: their onsets alone are
     periodic and ambiguous, so the full pulse trains are matched on the coded

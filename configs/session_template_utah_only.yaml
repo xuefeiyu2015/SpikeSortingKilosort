@@ -6,22 +6,19 @@
 #          --machine windows_rig
 # curation in phy
 #   conda activate phy
-#   cd {monkey}/{session}/kilosort4/     (the directory holding params.py)
+#   cd <blackrock_dir>/kilosort4/        (the directory holding params.py)
 #   phy template-gui params.py
 # after curation
 #  python run_exporting_pipeline.py --config configs/session_template_utah_only.yaml \
 #          --machine windows_rig
-# A new session means editing five values: monkey, session, the two Blackrock
-# filenames, and the SpikeGLX bin_file. Each block puts what changes first and
+# A new session means editing three values: the Blackrock directory and its two
+# filenames. Each block puts what changes first and
 # fences off what does not. Below a fence are the defaults -- change one only if
 # you know what it means. The notes at the end explain every choice made here.
 #
 # Data paths live in this file, never in the machine profile:
 # configs/machines/<machine>.yaml carries only facts about the box (scratch disk,
 # tool locations, device).
-# ---------- edit for this session ----------
-monkey: "Monkey Athos"
-session: "2026-08-13"
 
 # What to do with what was recorded. Which systems recorded is derived from
 # whether their blocks below declare paths; these say what to do with them, and
@@ -35,18 +32,20 @@ lfp_decimate: 1        # stride for it; 2 is safe, more aliases
 export_figures: true   # per-unit and overview PNGs at export time
 export_groups: ["good", "mua"]   # Phy cluster_group labels to export
 
-# Roots stop at the share; each system's directory is <root>/<monkey>/<session>.
-# Changes when the share moves, not per session. See "Paths" below.
-roots:
-  blackrock: "Z:/"
-
-blackrock_dir:   "{blackrock}/{monkey}/{session}"
+# ---------- edit for this session ----------
+# The Blackrock directory, written out in full: the raw recording and everything
+# derived from it. Nothing is composed -- what is written here is what lands on
+# disk. See "Paths" below.
+blackrock_dir: "Z:/Monkey Athos/2026-08-13"
 
 blackrock:
   # ---------- edit for this session ----------
   spike_file: "{blackrock_dir}/HUB-Athos_001.ns6"   # Utah array spikes
   sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"    # the two sync channels
-  probe_file: "configs/probes/utah_athos_A.json"    # per array, not per session
+  # This array's channel map: its own .cmp, or a .json/.mat built from one.
+  # Read by extension, so there is one key whatever the format. Per array,
+  # not per session -- see "Probes".
+  probe_file: "configs/probes/utah_athos_A.json"
   kilosort:
     bad_channels: []     # a dead electrode goes here -- see "Bad channels"
     nblocks: 0           # no drift correction at 400 um -- see "Drift correction"
@@ -61,7 +60,6 @@ blackrock:
   stream_id: null        # pin one when a .nsX exposes several streams
   gap_tolerance_ms: 10   # absorb PTP timestamp glitches -- see "The NSP clock"
   allow_segments: false  # a larger jump is a paused recording: stop, do not guess
-  cmp_file: null         # the array's own .cmp, read when probe_file is null
   waveforms:             # the mean-waveform export -- see "Waveforms"
     window_ms: 2.0       # snippet width, centred on the spike sample
     max_spikes: 2000     # per unit, spread over the session; null = every spike
@@ -86,18 +84,16 @@ kilosort: {}
 # ===========================================================================
 #
 # Paths
-#   {blackrock_dir} and {neuropixels_dir} come from roots + monkey + session, and
-#   are how the raw files are named. The two roots are separate because the
-#   systems are recorded by different machines and need not land on the same
-#   share -- point them at the same place when they do. {monkey}, {session},
-#   {cache} and {downloads} are always available and may be used inside a root.
-#
-#   A recording that predates this convention skips roots entirely and states
-#   blackrock_dir: / neuropixels_dir: outright.
+#   blackrock_dir is stated outright, and {blackrock_dir} refers back to it --
+#   that is how the raw files below are named. It is the only placeholder this
+#   session file has (a session with Neuropixels would also have
+#   {neuropixels_dir}); there is no subject, date or machine root composed into
+#   a path, so what is written here is what is opened.
 #
 #   A placeholder that names nothing raises on load rather than resolving to ""
-#   -- so a typo, or a {data_root} left from the old two-layer config, fails
-#   immediately instead of quietly producing "/Monkey Athos/...".
+#   -- so a typo, or a {monkey} left from an older config, fails immediately
+#   instead of quietly producing "/Monkey Athos/...". A key that is not a
+#   setting raises the same way, naming the closest real one.
 #
 # What runs
 #   This file is where every "should it?" is written down, so a run is
@@ -172,14 +168,17 @@ kilosort: {}
 #   result would be a blend of the two.
 #
 # Probes
-#   Blackrock: cmp_file (the array's own wiring map) is tried first, then
-#   probe_file (a JSON built once by tools/make_probe.py). With neither, sorting
-#   REFUSES to start: a grid in channel order would put units on the wrong
-#   electrodes, and its channel count would silently drop every electrode past it.
-#   Which array is in which monkey is a property of the session, which is why it
-#   is named here and not passed as a flag. If you truly want a grid, build one --
-#   make_probe.py utah with no --cmp -- and name it here, so the choice is written
-#   down rather than assumed.
+#   Blackrock: probe_file, and that is the whole rule. It takes the array's own
+#   .cmp wiring map, a .json built once by tools/make_probe.py, or an older
+#   Kilosort .mat -- the extension picks the reader, so the format is a property
+#   of the file rather than a second setting. (cmp_file used to be that second
+#   setting, tried first; a session naming both said nothing about which won.)
+#   With no probe_file, sorting REFUSES to start: a grid in channel order would
+#   put units on the wrong electrodes, and its channel count would silently drop
+#   every electrode past it. Which array is in which monkey is a property of the
+#   session, which is why it is named here and not passed as a flag. If you truly
+#   want a grid, build one -- make_probe.py utah with no --cmp -- and name it
+#   here, so the choice is written down rather than assumed.
 #
 #   Neuropixels: the .meta beside bin_file wins wherever it has ~snsGeomMap,
 #   because it records which sites were actually active for this recording --
