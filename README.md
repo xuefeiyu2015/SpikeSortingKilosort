@@ -14,9 +14,9 @@ run_sorting_pipeline.py             →           phy template-gui  →  run_exp
 |---|---|
 | a user with a session to sort, and you already know your sorting parameters | **[Step 1](#step-1--sort)**, then **[2](#step-2--curate-in-phy)** and **[3](#step-3--time-alignment-and-export)** |
 | not sure about bad channels / whitening / drift, and want to see the recording first | **[Step 0](#step-0--optional-look-at-the-recording-first)** |
-| installing this on a new computer | **[Step 4](#step-4--install-on-a-new-computer)** |
-| missing a channel map (`probe_file`) | **[Step 5](#step-5--probe-files-channel-maps)** |
-| staring at a `[--]` skipped or `[!!]` failed line | **[Step 6](#step-6--when-a-stage-skips-or-fails)** |
+| installing this on a new computer | **[Installation Step](#Installation step--install-on-a-new-computer)** |
+| missing a channel map (`probe_file`) | **[Extra 1](#Extra-1--probe-files-channel-maps)** |
+| staring at a `[--]` skipped or `[!!]` failed line | **[Extra 2](#Extra-2--when-a-stage-skips-or-fails)** |
 
 Three notebooks sit alongside the steps below, in `notebooks/`:
 
