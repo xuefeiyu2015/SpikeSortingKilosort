@@ -18,6 +18,20 @@ run_sorting_pipeline.py             →           phy template-gui  →  run_exp
 | missing a channel map (`probe_file`) | **[Step 5](#step-5--probe-files-channel-maps)** |
 | staring at a `[--]` skipped or `[!!]` failed line | **[Step 6](#step-6--when-a-stage-skips-or-fails)** |
 
+Three notebooks sit alongside the steps below, in `notebooks/`:
+
+- **`run_pipeline_stepbystep.ipynb`** — if you want to understand what each step
+  of the pipeline actually does, follow this one. Every cell calls a single verb,
+  in the same order the two runner scripts call them, and shows what it returns.
+  It is for reading and learning; for a real session use the scripts.
+- **`setup_demo_data.ipynb`** — downloads the official Kilosort4 demo recording
+  and its channel map, so you can run the whole pipeline start to finish without
+  any rig data. Used in [Step 4f](#4f-prove-it-works).
+- **`build_probe_config.ipynb`** — builds or inspects a channel map by hand.
+  **Not needed in most cases**: a Neuropixels map comes from the run's own
+  `.meta`, and a Utah array's comes from its `.cmp`. See
+  [Step 5](#step-5--probe-files-channel-maps).
+
 ---
 
 ## Step 0 — optional: look at the recording first
