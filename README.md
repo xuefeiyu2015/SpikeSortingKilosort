@@ -215,11 +215,16 @@ python run_exporting_pipeline.py --config session_Porthos_1probe.yaml --machine 
                        export/
                            figures/                     units.pdf (a row per unit), overview.png
                            sorting_summary_info.json    what ran, on what, from where
-                           <session>_sorted_spikes.mat  times, channel, unit, mean waveform
-                           <session>_waveforms.mat      per-spike snippets (when kept)
-                           <run>.lfp.mat                the LF band, on Blackrock time
-                           units.csv  spike_times.npy  spike_samples.npy
+                           <recording>.sorted_spikes.mat  times, channel, unit, mean waveform
+                           <recording>.waveforms.mat      per-spike snippets (when kept)
+                           <lf recording>.lfp.mat         the LF band, on Blackrock time
+                           units.csv                      one row per unit: label, rate, ISI, ...
 ```
+
+Each `.mat` is named after the recording it came from — `<run>_t0.imec0.ap` for a
+Neuropixels AP binary, the `.ns6` stem for Blackrock — so a file copied off the rig
+still says which recording it is. `export/` holds only what you copy away;
+Kilosort's own `.npy` arrays stay in `kilosort4/`.
 
 One folder per system, and that is the whole tree — handing an analysis a sorting
 means handing it a directory. The `.mat` products are MATLAB v7.3, readable by

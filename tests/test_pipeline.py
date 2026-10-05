@@ -446,18 +446,27 @@ def test_a_utah_export_lands_on_the_nsp_clock(tmp_path, kilosort_results):
         json.dumps(time_map.to_dict()), encoding="utf-8"
     )
 
+    import h5py
+
     out = ss.export_results(session, "blackrock")
 
     assert out["timebase"] == "nsp"
-    exported = np.load(sorted_dir / "export" / "spike_times.npy")
-    samples = np.load(sorted_dir / "export" / "spike_samples.npy")
+    # Named after the recording, not the session: HUB.ns6 -> HUB.sorted_spikes.mat
+    mat = out["paths"]["sorted_spikes"]
+    assert mat == sorted_dir / "export" / "HUB.sorted_spikes.mat"
+    with h5py.File(mat, "r") as handle:
+        exported = handle["sorted_spikes/TimeStamps"][()].ravel()
+        samples = handle["sorted_spikes/spike_sample"][()].ravel()
     assert exported.min() > t0                       # on the PTP clock, not near zero
     assert exported[0] == pytest.approx(t0 + samples[0] / rate, abs=1e-6)
     # ...and the sorter's own index survives beside it, so nothing is one-way.
-    assert samples.dtype == np.int64
     assert samples.size == exported.size
 
-    info = json.loads((sorted_dir / "export" / "export_info.json").read_text())
+    # Only what an analysis copies away: no .npy/.npz duplicates of Kilosort's.
+    names = {p.name for p in (sorted_dir / "export").iterdir() if p.is_file()}
+    assert names == {"HUB.sorted_spikes.mat", "units.csv", "sorting_summary_info.json"}
+
+    info = json.loads((sorted_dir / "export" / "sorting_summary_info.json").read_text())
     assert info["timebase"] == "nsp"
     assert info["nsp_time_map"]["measured_rate_hz"] == pytest.approx(rate, abs=1e-3)
     assert info["nsp_time_map"]["drift_ppm"] == pytest.approx(-4.5, abs=0.2)
@@ -502,6 +511,7 @@ def test_the_waveform_export_cuts_snippets_from_the_sorted_binary(tmp_path, kilo
     out = ss.export_waveforms(session, "blackrock")
 
     assert out["n_spikes"] > 0
+    assert out["path"].name == "HUB.waveforms.mat"      # named after HUB.ns6
     with h5py.File(out["path"], "r") as handle:
         wf = handle["waveforms"]
         width = int(round(2.0 * 30000.0 / 1000.0))     # 60 samples

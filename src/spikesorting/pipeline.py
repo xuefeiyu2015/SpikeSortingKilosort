@@ -431,6 +431,17 @@ def _input_path(config: SessionConfig, system: str) -> Path | None:
     return config.neuropixels.bin_file
 
 
+def _export_stem(config: SessionConfig, system: str) -> str:
+    """What the exported .mat files are named after: the recording they came from.
+
+    ``<run>_t0.imec0.ap`` for a Neuropixels AP binary, ``HUB-<x>_001`` for a
+    ``.ns6`` -- the same rule the LF band follows (``<lf stem>.lfp.mat``), so a
+    file copied away from its folder still says which recording it is.
+    """
+    path = _input_path(config, system)
+    return Path(path).stem if path is not None else config.session
+
+
 def _check_input_reachable(config: SessionConfig, system: str) -> None:
     """Fail fast, and loudly, when the recording's filesystem is not answering."""
     path = _input_path(config, system)
@@ -863,6 +874,8 @@ def _write_summary(
     timebase: str,
     unit_ids: np.ndarray,
     measured: dict | None,
+    curated: bool,
+    time_map: Any = None,
 ) -> Path:
     """The manifest that makes the bundle self-describing.
 
@@ -884,7 +897,10 @@ def _write_summary(
         "stream": stream_label(system),
         "sorter": config.sorter,
         "timebase": timebase,
+        "time_units": "seconds",
+        "curated": curated,
         "n_units_exported": int(np.asarray(unit_ids).size),
+        **({"nsp_time_map": time_map.to_dict()} if time_map is not None else {}),
         "waveforms": (
             {
                 "n_spikes": measured["n_spikes"],
@@ -1611,7 +1627,7 @@ def export_waveforms(
     )
 
     out_dir = results_dir / "export"
-    out_path = out_dir / f"{config.session}_waveforms.mat"
+    out_path = out_dir / f"{_export_stem(config, system)}.waveforms.mat"
     write_mat(
         out_path,
         {
@@ -1734,29 +1750,17 @@ def export_results(
         spike_times_s = {int(uid): seconds[phy.spike_clusters == uid] for uid in unit_ids}
     log.info("timebase: %s", timebase)
 
-    # One bundle per stream, so an analysis gets a folder rather than a tour of
-    # three trees. aligned/ stays where it is: the time map is cross-system.
+    # One folder per stream holding only what an analysis copies away: the .mat
+    # files, units.csv, the figures and the manifest. Kilosort's arrays stay in
+    # the sorting folder above, and the time map is cross-system, so neither is
+    # duplicated here.
     out_dir = config.paths.export_for(system)
-    paths = final.export_units(
-        out_dir,
-        phy,
-        unit_ids=unit_ids,
-        spike_times_s=spike_times_s,
-        timebase=timebase,
-        provenance={
-            "session": config.session,
-            "system": system,
-            "stream": stream_label(system),
-            "machine": config.machine.name,
-            **({"nsp_time_map": time_map.to_dict()} if time_map is not None else {}),
-        },
-    )
-    log.info("exported %d units -> %s", unit_ids.size, out_dir)
-
-    # The same spikes in the format the lab's online-spike code already reads,
-    # plus the measured waveform when the recording was reachable.
-    measured = export_waveforms(config, system)
     table = final.build_unit_table(phy, unit_ids, spike_times_s)
+    units_csv = final.export_unit_table(out_dir, table)
+
+    # The spikes in the format the lab's online-spike code already reads, plus
+    # the measured waveform when the recording was reachable.
+    measured = export_waveforms(config, system)
     mat_path = final.export_sorted_spikes_mat(
         out_dir,
         phy,
@@ -1770,10 +1774,13 @@ def export_results(
             "system": system,
             "stream": stream_label(system),
         },
-        filename=f"{config.session}_sorted_spikes.mat",
+        filename=f"{_export_stem(config, system)}.sorted_spikes.mat",
     )
-    log.info("wrote %s", mat_path.name)
-    _write_summary(config, system, out_dir, timebase, unit_ids, measured)
+    log.info("exported %d units -> %s", unit_ids.size, mat_path)
+    summary = _write_summary(
+        config, system, out_dir, timebase, unit_ids, measured, phy.curated, time_map
+    )
+    paths = {"units": units_csv, "sorted_spikes": mat_path, "summary": summary}
 
     if figures and unit_ids.size:
         figure_dir = config.paths.figures_for(system)

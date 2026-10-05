@@ -134,45 +134,44 @@ def test_aligned_times_do_not_destroy_time_windowed_metrics(kilosort_results):
     )
 
 
-def test_export_bundle_is_self_consistent(tmp_path, kilosort_results):
-    # Unit 1 marked noise, so the bundle is a strict subset of the sorting.
+def test_the_unit_table_holds_every_exported_unit(tmp_path, kilosort_results):
+    # Unit 1 marked noise, so the table is a strict subset of the sorting.
+    import pandas as pd
+
     (kilosort_results / "cluster_group.tsv").write_text(
         "cluster_id\tgroup\n1\tnoise\n", encoding="utf-8"
     )
     results = curated.load_phy_results(kilosort_results)
     unit_ids = curated.select_units(results)
-    paths = final.export_units(tmp_path / "out", results, unit_ids=unit_ids, timebase="sorter")
+    table = final.build_unit_table(results, unit_ids)
+    path = final.export_unit_table(tmp_path / "out", table)
 
-    assert all(p.exists() for p in paths.values())
-
-    times = np.load(paths["spike_times"])
-    clusters = np.load(paths["spike_clusters"])
-    assert times.size == clusters.size
-    assert np.all(np.diff(times) >= 0), "exported spike times must be sorted"
-    assert set(np.unique(clusters).tolist()) == {0, 2}
-
-    info = json.loads(paths["info"].read_text())
-    assert info["timebase"] == "sorter"
-    assert info["n_units"] == 2
-    assert info["n_spikes"] == times.size
-
-    waveforms = np.load(paths["mean_template_waveform"])
-    assert waveforms.shape == (2, 61)
-
-    with np.load(paths["isi_histograms"]) as bundle:
-        assert bundle["counts"].shape[0] == 2
-        assert bundle["unit_ids"].tolist() == [0, 2]
+    assert path.name == "units.csv"
+    written = pd.read_csv(path)
+    assert written["unit_id"].tolist() == [0, 2]
+    assert written["n_spikes"].tolist() == [500, 120]
+    assert {"label", "channel", "firing_rate_hz", "isi_fraction"} <= set(written.columns)
 
 
-def test_export_records_the_blackrock_timebase(tmp_path, kilosort_results):
+def test_the_sorted_spikes_mat_carries_the_times_it_was_given(tmp_path, kilosort_results):
+    # The .mat is the only copy of the spike times in the export folder, so the
+    # aligned seconds -- not the sorter's samples / fs -- must be what it holds.
+    import h5py
+
     results = curated.load_phy_results(kilosort_results)
     aligned = {int(u): results.times_for(u) + 5.0 for u in results.unit_ids}
-    paths = final.export_units(
-        tmp_path / "out", results, spike_times_s=aligned, timebase="blackrock"
+    table = final.build_unit_table(results, results.unit_ids, aligned)
+    path = final.export_sorted_spikes_mat(
+        tmp_path, results, results.unit_ids, aligned, "blackrock", table
     )
-    info = json.loads(paths["info"].read_text())
-    assert info["timebase"] == "blackrock"
-    assert np.load(paths["spike_times"]).min() >= 5.0
+    with h5py.File(path, "r") as handle:
+        s = handle["sorted_spikes"]
+        times = s["TimeStamps"][()].ravel()
+        samples = s["spike_sample"][()].ravel()
+        timebase = bytes(s["info/timebase"][()].ravel().astype(np.uint8)).decode()
+    assert timebase == "blackrock"
+    assert times.min() >= 5.0
+    assert times.size == samples.size == results.spike_samples.size
 
 
 def test_template_for_unit_uses_the_modal_template(kilosort_results):
