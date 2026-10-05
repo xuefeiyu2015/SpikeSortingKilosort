@@ -368,8 +368,8 @@ def test_export_results_reads_those_settings_rather_than_arguments(
         "neuropixels",
     )
     assert with_mua["n_units"] == 3
-    figures = sorted(p.name for p in session.paths.figures_for("neuropixels").glob("*.png"))
-    assert figures == ["overview.png", "unit_0000.png", "unit_0001.png", "unit_0002.png"]
+    figures = sorted(p.name for p in session.paths.figures_for("neuropixels").iterdir())
+    assert figures == ["overview.png", "units.pdf"]
 
 
 def test_a_system_that_is_not_sorted_needs_no_probe_and_no_recording(tmp_path):

@@ -243,5 +243,17 @@ def _describe(value) -> str:
             from spikesorting._probes.common import probe_summary
 
             value = probe_summary(value)
-        return ", ".join(f"{k}={v}" for k, v in value.items() if not k.startswith("_"))
+        # Scalars only: a verb's dict may carry the arrays it computed (the
+        # waveform export returns its SnippetResult) so a notebook gets them, and
+        # printing those verbatim floods the run log with numbers.
+        return ", ".join(
+            f"{k}={v}" for k, v in value.items()
+            if not k.startswith("_") and _is_scalar(v)
+        )
     return str(value)
+
+
+def _is_scalar(value) -> bool:
+    import numpy as np
+
+    return value is None or isinstance(value, (str, int, float, bool, Path, np.generic))

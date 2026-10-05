@@ -213,7 +213,7 @@ python run_exporting_pipeline.py --config session_Porthos_1probe.yaml --machine 
 <system>_dir/kilosort4/                 the sorting (Kilosort's own layout)
                                         edge files, nsp_time_map.json, time_map.json
                        export/
-                           figures/                     unit_0000.png, overview.png
+                           figures/                     units.pdf (a row per unit), overview.png
                            sorting_summary_info.json    what ran, on what, from where
                            <session>_sorted_spikes.mat  times, channel, unit, mean waveform
                            <session>_waveforms.mat      per-spike snippets (when kept)

@@ -18,6 +18,8 @@
                          were held out of the fit. Non-zero past tolerance, so it
                          can gate a batch job.
     export_results       aligned spike times, metrics, waveforms, figures.
+    waveforms            the measured waveforms alone. Already part of
+                         export_results, so it runs only when that does not.
 
 The alignment and export stages read the labels Phy writes, so run this once
 curation is done: ``cluster_group.tsv`` overrides Kilosort's own
@@ -171,8 +173,11 @@ def main() -> int:
     if "export_results" in steps:
         per_stream(ss.export_results)
 
-    # Last: the only stage here that re-reads the recording itself.
-    if "waveforms" in steps:
+    # Last: the only stage here that re-reads the recording itself. export_results
+    # already measures the waveforms (sorted_spikes.mat carries the mean), so a
+    # second pass over a 100 GB binary would rewrite byte-identical output; the
+    # step exists for re-measuring on its own, e.g. --steps waveforms.
+    if "waveforms" in steps and "export_results" not in steps:
         per_stream(ss.export_waveforms)
 
     return run.finish("exporting pipeline")
