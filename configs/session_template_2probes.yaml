@@ -40,7 +40,6 @@ kilosort_on_blackrock: false
 export_lfp: false      # LF-band copy, ~7 GB/hour at 385 channels -- see "LFP"
 lfp_decimate: 1        # stride for it; 2 is safe, more aliases
 export_figures: true   # per-unit and overview PNGs at export time
-export_groups: ["good", "mua"]   # Phy cluster_group labels to export
 
 # ---------- edit for this session ----------
 # Each system's own directory, written out in full: the raw recording and
@@ -160,8 +159,8 @@ kilosort: {}
 #     export_lfp             false -> no LF-band export (pipeline 2)
 #     export_figures         false -> export the numbers, draw nothing
 #
-#   Each has a flag that overrides it for one run (--export-lfp, --no-figures,
-#   --lfp-decimate, --groups, --system). The flag never replaces the key: a
+#   A few have a flag that overrides them for one run (--system on sorting;
+#   --export-lfp, --export-waveforms on exporting). The flag never replaces the key: a
 #   setting reachable only from a command line is one nobody can read back off
 #   the session six months later.
 #

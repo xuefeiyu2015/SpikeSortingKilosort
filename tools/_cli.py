@@ -50,30 +50,15 @@ def build_parser(description: str) -> argparse.ArgumentParser:
         default=default_machine(),
         help=f"machine profile in configs/machines/ (default: {default_machine()})",
     )
-    parser.add_argument(
-        "--skip-checks",
-        action="store_true",
-        help="do not verify that input files exist before starting",
-    )
-    parser.add_argument(
-        "--probe",
-        nargs="+",
-        type=int,
-        default=None,
-        metavar="N",
-        help="run only these probes of the run the session names (default: all "
-        "of neuropixels.probes). Selects a subset; it cannot add a probe the "
-        "session does not cover",
-    )
     return parser
+
 
 
 def flag_overrides(args: argparse.Namespace) -> dict[str, object]:
     """Session settings this run replaces, from the flags actually passed.
 
-    Every one of these is a session key first -- ``export_lfp``, ``lfp_decimate``,
-    ``export_groups``, ``export_figures``, ``waveforms.export_snippets``,
-    ``kilosort_on_<system>`` -- so a
+    Every one of these is a session key first -- ``export_lfp``,
+    ``waveforms.export_snippets``, ``kilosort_on_<system>`` -- so a
     setting is never reachable through the command line alone. A flag changes it
     for one run; the file keeps saying what the session actually wants.
     """
@@ -85,17 +70,10 @@ def flag_overrides(args: argparse.Namespace) -> dict[str, object]:
             overrides[f"kilosort_on_{name}"] = name == system
     if getattr(args, "export_lfp", False):
         overrides["export_lfp"] = True
-    if getattr(args, "lfp_decimate", None) is not None:
-        overrides["export_lfp"] = True     # asking for a stride is asking for the export
-        overrides["lfp_decimate"] = int(args.lfp_decimate)
-    if getattr(args, "groups", None) is not None:
-        overrides["export_groups"] = tuple(args.groups)
     if getattr(args, "export_waveforms", False):
         # Nested: the waveform settings are per system, and a flag applies to
         # this run rather than to one system's band. with_overrides fans it out.
         overrides["waveforms"] = {"export_snippets": True}
-    if getattr(args, "no_figures", False):
-        overrides["export_figures"] = False
 
     return overrides
 
@@ -147,7 +125,7 @@ def load(args: argparse.Namespace, require_inputs: bool = True) -> SessionConfig
 
     for _, probe_config in config.per_probe():
         probe_config.paths.mkdirs()
-    if require_inputs and not getattr(args, "skip_checks", False):
+    if require_inputs:
         config.require_inputs()
 
     print(f"session '{config.session}' on machine '{config.machine.name}'")
@@ -178,9 +156,8 @@ class Runner:
     usable from a notebook -- a cell shows the recording, not a status wrapper.
     """
 
-    def __init__(self, config: SessionConfig, keep_going: bool = False):
+    def __init__(self, config: SessionConfig):
         self.config = config
-        self.keep_going = keep_going
         self.failures = 0
         self.stopped = False
         #: True when the last call raised, so a caller can skip what depended on it.
@@ -212,8 +189,7 @@ class Runner:
             self.failures += 1
             self.last_failed = True
             print(f"[!!] {label}\n       {type(error).__name__}: {error}")
-            if not self.keep_going:
-                self.stopped = True
+            self.stopped = True
             return None
 
         if value is None:

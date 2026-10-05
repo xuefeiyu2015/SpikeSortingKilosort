@@ -141,7 +141,7 @@ def plot_unit_summary(unit: dict[str, Any], fig: Any = None) -> Any:
     axes[1, 1].set_title("amplitude stability")
 
     fig.suptitle(
-        f"unit {unit.get('unit_id')} | {unit.get('label', 'unsorted')} | "
+        f"unit {unit.get('unit_id')} | {_unit_class(unit) or 'no label'} | "
         f"channel {unit.get('channel')} | {unit.get('n_spikes', '?')} spikes"
     )
     fig.tight_layout()
@@ -150,6 +150,14 @@ def plot_unit_summary(unit: dict[str, Any], fig: Any = None) -> Any:
 
 #: The columns of a unit page, left to right, and each one's heading.
 UNIT_PANELS = ("mean waveform", "ISI", "firing rate", "amplitude stability")
+
+
+def _unit_class(unit: dict[str, Any]) -> str:
+    """``SU (good)`` / ``MU (mua)``, the label alone, or ``""`` when unlabelled."""
+    label, unit_class = unit.get("label") or "", unit.get("unit_class") or ""
+    if unit_class and label:
+        return f"{unit_class} ({label})"
+    return unit_class or label
 
 
 def _unit_header(unit: dict[str, Any]) -> str:
@@ -163,7 +171,7 @@ def _unit_header(unit: dict[str, Any]) -> str:
 
     parts = [
         f"unit {unit.get('unit_id')}",
-        f"{unit.get('unit_class', '?')} ({unit.get('label', 'unsorted')})",
+        *([_unit_class(unit)] if _unit_class(unit) else []),
         f"ch {unit.get('channel')}",
         f"{unit.get('n_spikes', 0):,} spikes",
     ]

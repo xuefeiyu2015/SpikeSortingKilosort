@@ -70,7 +70,7 @@ class PhyResults:
     #: Template index per spike. After a Phy merge a cluster spans several
     #: templates, so cluster id and template id are not interchangeable.
     spike_templates: np.ndarray | None = None
-    #: cluster id -> "good" / "mua" / "noise" / "unsorted"
+    #: cluster id -> "good" / "mua" / "noise"; a cluster nobody labelled is absent
     labels: dict[int, str] = field(default_factory=dict)
     #: True when a human curated this folder in Phy.
     curated: bool = False
@@ -163,16 +163,17 @@ def load_phy_results(results_dir: str | Path, fs: float | None = None) -> PhyRes
     )
 
 
-def select_units(results: PhyResults, groups: tuple[str, ...] = ("good",)) -> np.ndarray:
-    """Unit ids whose label is in ``groups``.
+def select_units(results: PhyResults) -> np.ndarray:
+    """Unit ids of every cluster not labelled ``noise``.
 
-    With no labels at all, returns every unit rather than nothing -- an uncurated
-    folder should still export.
+    ``noise`` is the one label that means "not a neuron"; everything else is
+    kept, including a cluster with no label at all -- one a Phy merge or split
+    created and nobody labelled.
     """
-    if not results.labels:
-        return results.unit_ids
-    wanted = {g.lower() for g in groups}
     return np.array(
-        [uid for uid in results.unit_ids if results.labels.get(int(uid), "").lower() in wanted],
+        [
+            uid for uid in results.unit_ids
+            if results.labels.get(int(uid), "").lower() != "noise"
+        ],
         dtype=results.unit_ids.dtype,
     )

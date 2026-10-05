@@ -617,8 +617,6 @@ class SessionConfig:
     lfp_decimate: int = 1
     #: Whether the export stage draws per-unit and overview figures.
     export_figures: bool = True
-    #: Which Phy ``cluster_group`` labels the export stage keeps.
-    export_groups: tuple[str, ...] = ("good", "mua")
     #: Period of the fine-alignment square wave, in seconds. TPrime -syncperiod.
     sync_period_s: float = 1.0
     #: Nominal interval of the coarse coded burst, in seconds.
@@ -994,7 +992,6 @@ _SESSION_KEYS = frozenset({
     "export_lfp",
     "lfp_decimate",
     "export_figures",
-    "export_groups",
     "sync_period_s",
     "burst_interval_s",
     "alignment_tolerance_s",
@@ -1022,6 +1019,13 @@ _BY_PROBE_KEYS = frozenset({"kilosort"})
 #: map at the pulse train. Keep this to the cases where the guess is actively
 #: misleading; a key with no good neighbour needs no entry.
 _RENAMED = {"cmp_file": "probe_file"}
+
+#: Keys removed outright, with what replaced them. Same reason as ``_RENAMED``:
+#: ``export_groups`` is closest to ``export_figures``, an unrelated switch.
+_RETIRED = {
+    "export_groups": "the export now keeps every cluster not labelled noise in "
+    "Phy, so there is nothing to choose -- delete the line",
+}
 
 
 def _reject_unknown_keys(data: dict[str, Any], path: Path) -> None:
@@ -1073,6 +1077,8 @@ def _reject_unknown_keys(data: dict[str, Any], path: Path) -> None:
                     "which takes the channel map in any format it is written in "
                     "-- .cmp, .json or .mat, read by its extension."
                 )
+            if key in _RETIRED:
+                raise ValueError(f"{path}: '{prefix}{key}' is retired: {_RETIRED[key]}")
             close = get_close_matches(key, sorted(known), n=1, cutoff=0.7)
             hint = f"\n  did you mean: {prefix}{close[0]}?" if close else ""
             raise ValueError(f"{path}: unknown setting '{prefix}{key}'{hint}")
@@ -1163,9 +1169,6 @@ def load_session_config(
         export_lfp=bool(data.get("export_lfp", False)),
         lfp_decimate=int(data.get("lfp_decimate", 1)),
         export_figures=bool(data.get("export_figures", True)),
-        export_groups=tuple(
-            str(group) for group in (data.get("export_groups") or ("good", "mua"))
-        ),
         sync_period_s=float(data.get("sync_period_s", 1.0)),
         burst_interval_s=float(data.get("burst_interval_s", 14.0)),
         alignment_tolerance_s=float(data.get("alignment_tolerance_s", 1e-3)),

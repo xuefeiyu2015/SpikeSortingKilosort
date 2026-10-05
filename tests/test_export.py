@@ -42,17 +42,27 @@ def test_curated_labels_override_kilosort_labels(kilosort_results):
     assert results.labels[2] == "good"  # untouched, falls back to KSLabel
 
 
-def test_select_units_filters_by_label(kilosort_results):
+def test_select_units_keeps_good_and_mua(kilosort_results):
     results = curated.load_phy_results(kilosort_results)
-    assert curated.select_units(results, ("good",)).tolist() == [0, 2]
-    assert curated.select_units(results, ("good", "mua")).tolist() == [0, 1, 2]
-    assert curated.select_units(results, ("noise",)).tolist() == []
+    assert curated.select_units(results).tolist() == [0, 1, 2]
+
+
+def test_select_units_drops_only_noise(kilosort_results):
+    # Phy merged 0 and 1 into a new cluster 2 and nobody labelled it; 0 is noise.
+    (kilosort_results / "cluster_KSLabel.tsv").write_text(
+        "cluster_id\tKSLabel\n0\tgood\n1\tmua\n", encoding="utf-8"
+    )
+    (kilosort_results / "cluster_group.tsv").write_text(
+        "cluster_id\tgroup\n0\tnoise\n", encoding="utf-8"
+    )
+    results = curated.load_phy_results(kilosort_results)
+    assert curated.select_units(results).tolist() == [1, 2]
 
 
 def test_select_units_without_labels_returns_everything(kilosort_results):
     (kilosort_results / "cluster_KSLabel.tsv").unlink()
     results = curated.load_phy_results(kilosort_results)
-    assert curated.select_units(results, ("good",)).tolist() == [0, 1, 2]
+    assert curated.select_units(results).tolist() == [0, 1, 2]
 
 
 def test_times_are_converted_from_samples_to_seconds(kilosort_results):
@@ -125,8 +135,12 @@ def test_aligned_times_do_not_destroy_time_windowed_metrics(kilosort_results):
 
 
 def test_export_bundle_is_self_consistent(tmp_path, kilosort_results):
+    # Unit 1 marked noise, so the bundle is a strict subset of the sorting.
+    (kilosort_results / "cluster_group.tsv").write_text(
+        "cluster_id\tgroup\n1\tnoise\n", encoding="utf-8"
+    )
     results = curated.load_phy_results(kilosort_results)
-    unit_ids = curated.select_units(results, ("good",))
+    unit_ids = curated.select_units(results)
     paths = final.export_units(tmp_path / "out", results, unit_ids=unit_ids, timebase="sorter")
 
     assert all(p.exists() for p in paths.values())
@@ -241,3 +255,12 @@ def test_the_sorted_spikes_mat_omits_waveforms_when_none_were_measured(tmp_path,
         s = handle["sorted_spikes"]
         assert "TimeStamps" in s and "Unit" in s
         assert "Waveforms" not in s and "MeanWaveform" not in s
+
+
+def test_an_unlabelled_unit_header_names_no_class():
+    from spikesorting._plots.summary import _unit_header
+
+    assert "SU (good)" in _unit_header({"unit_id": 3, "label": "good", "unit_class": "SU"})
+    header = _unit_header({"unit_id": 7, "label": "", "unit_class": "", "channel": 4})
+    assert header.startswith("unit 7  |  ch 4")
+    assert "unsorted" not in header and "()" not in header

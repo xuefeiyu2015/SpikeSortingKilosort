@@ -775,7 +775,7 @@ def _waveform_fields(measured: dict | None) -> dict | None:
 
 
 #: Phy's curation labels as single vs multi unit, for the figure headers.
-_UNIT_CLASS = {"good": "SU", "mua": "MU", "noise": "noise"}
+_UNIT_CLASS = {"good": "SU", "mua": "MU"}
 
 
 def _unit_page_data(
@@ -816,11 +816,11 @@ def _unit_page_data(
         centers, rate = metrics.compute_firing_rate(
             times, duration, bin_s=max(1.0, duration / 100), start_s=start
         )
-        label = phy.labels.get(unit_id, "unsorted")
+        label = phy.labels.get(unit_id, "")
         unit = {
             "unit_id": unit_id,
             "label": label,
-            "unit_class": _UNIT_CLASS.get(label, "unsorted"),
+            "unit_class": _UNIT_CLASS.get(label, ""),
             "channel": channel,
             "n_spikes": int(times.size),
             "isi_counts": isi_counts,
@@ -1541,7 +1541,7 @@ def export_waveforms(
         return None
 
     phy = load_phy_results(results_dir)
-    unit_ids = select_units(phy, tuple(config.export_groups))
+    unit_ids = select_units(phy)
     channel_for_unit = {
         int(u): best_channel(phy, int(u))
         for u in unit_ids
@@ -1693,8 +1693,8 @@ def export_results(
 ) -> dict | None:
     """Export metrics, figures and the final bundle for a sorted folder.
 
-    Which unit labels to keep and whether to draw figures are the session's
-    ``export_groups`` and ``export_figures``.
+    Every cluster not labelled ``noise`` in Phy is exported; whether to draw
+    figures is the session's ``export_figures``.
 
     Uses aligned spike times when ``time_remapping`` has written them, and
     records which timebase it used. Reads Phy's ``cluster_group.tsv`` where it
@@ -1713,7 +1713,6 @@ def export_results(
     if not config.has_data(system):
         return None
 
-    groups = tuple(config.export_groups)
     figures = config.export_figures
 
     results_dir = config.paths.sorted_for(system)
@@ -1722,11 +1721,11 @@ def export_results(
         return None
 
     phy = load_phy_results(results_dir)
-    unit_ids = select_units(phy, groups)
+    unit_ids = select_units(phy)
     log.info(
-        "%d units total, %d selected (%s; groups=%s)",
+        "%d units total, %d exported (%s; all but noise)",
         phy.unit_ids.size, unit_ids.size,
-        "curated" if phy.curated else "not curated in Phy", groups,
+        "curated" if phy.curated else "not curated in Phy",
     )
 
     seconds, timebase, time_map = _resolve_spike_seconds(config, system, phy)

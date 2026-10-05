@@ -132,7 +132,7 @@ Three rules worth knowing before you edit:
 
 Two probes of one run are two `bin_files:` entries, with an optional `by_probe:`
 block for per-probe `kilosort:` settings. Each probe gets its own sort, its own
-clock fit and its own output folder; `--probe 1` runs one of them.
+clock fit and its own output folder; `run_sorting_pipeline.py --probe 1` sorts one of them.
 
 Drift correction is off for the Utah array (`blackrock.kilosort.nblocks: 0`):
 Kilosort corrects drift by interpolating between neighbouring contacts, and at
@@ -391,12 +391,15 @@ python -m pytest tests/ -k "offset or drift" -q
 | Sync extraction | CatGT + NumPy | NumPy fallback | NumPy fallback |
 | Tests, alignment, export | yes | yes | yes |
 
-The stages are independent, so any subset runs on any machine — which is what
-lets the GPU half go to a cluster while the CatGT/TPrime half stays on the rig:
+The stages are independent — sorting reads no edge files, extraction needs no
+sorter — which is what lets the GPU half go to a cluster while the CatGT/TPrime
+half stays on the rig. The exporting driver always runs every stage; one that
+has nothing to do yet says so and is skipped, so running it before sorting
+extracts the pulses and leaves the export for later:
 
 ```bash
-# rig: CatGT and TPrime both live here
-python run_exporting_pipeline.py --config <s>.yaml --machine windows_rig --steps extract_sync
+# rig: CatGT and TPrime both live here; export_results finds no sorting yet
+python run_exporting_pipeline.py --config <s>.yaml --machine windows_rig
 # cluster: the GPU work, and the only stage that needs it
 python run_sorting_pipeline.py   --config <s>.yaml --machine hpc
 # rig: reads the .txt edge files plus spike_times.npy
@@ -453,7 +456,7 @@ and the indented line under it is the reason. Common ones:
 
 | the reason line | what it means |
 |---|---|
-| `export_lfp is false` | turn it on in the session, or `--lfp-decimate 2` for one run |
+| `export_lfp is false` | turn it on in the session, or `--export-lfp` for one run |
 | `no blackrock paths declared in the session` | that system has no block, so it did not record |
 | `kilosort_on_blackrock is false` | the session says keep the recording, do not sort it |
 | `blackrock is the reference timebase; nothing to map it onto` | expected — Blackrock is what everything else is mapped onto |

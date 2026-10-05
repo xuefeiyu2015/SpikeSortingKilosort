@@ -147,7 +147,7 @@ def build_unit_table(
 
         row: dict[str, Any] = {
             "unit_id": unit_id,
-            "label": results.labels.get(unit_id, "unsorted"),
+            "label": results.labels.get(unit_id, ""),
             "channel": channel,
             "template_id": template_for_unit(results, unit_id),
             "first_spike_s": float(times[0]) if times.size else float("nan"),
@@ -350,7 +350,7 @@ def export_sorted_spikes_mat(
             dtype=np.float64,
         ),
         "Unit_No": unit_ids.astype(np.float64),
-        "Label": " | ".join(str(results.labels.get(int(u), "unsorted")) for u in unit_ids),
+        "Label": " | ".join(str(results.labels.get(int(u), "")) for u in unit_ids),
         "n_spikes": np.array([int((results.spike_clusters == int(u)).sum()) for u in unit_ids],
                              dtype=np.float64),
         "samplingrate": float(results.fs),
