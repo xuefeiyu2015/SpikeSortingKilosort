@@ -19,8 +19,8 @@ The one thing paths cannot say is whether to sort:
 This is the half that needs a GPU, and the only half that does -- which is what
 lets it go to a cluster while the rest stays on the rig.
 
-Exits non-zero if any stage fails. Stages that are skipped are reported and do
-not fail the run.
+Stops at the first stage that fails and exits non-zero. Stages that are
+skipped are reported and do not fail the run.
 """
 
 from __future__ import annotations
@@ -57,15 +57,20 @@ def _log_pipeline_messages() -> None:
 def main() -> int:
     parser = build_parser(__doc__)
     parser.add_argument(
+        "--probe",
+        nargs="+",
+        type=int,
+        default=None,
+        metavar="N",
+        help="run only these probes of the run the session names (default: all "
+        "of neuropixels.probes). Selects a subset; it cannot add a probe the "
+        "session does not cover",
+    )
+    parser.add_argument(
         "--system",
         choices=list(ss.SYSTEMS),
         default=None,
         help="sort one system this run, whatever kilosort_on_* says in the session",
-    )
-    parser.add_argument(
-        "--keep-going",
-        action="store_true",
-        help="continue after a failing stage instead of stopping",
     )
     parser.add_argument(
         "--dry-run",
@@ -76,7 +81,7 @@ def main() -> int:
     _log_pipeline_messages()
 
     config = load(args)
-    run = Runner(config, keep_going=args.keep_going)
+    run = Runner(config)
     print()
 
     # The whole pipeline: one sort per stream the session declares. A stream is a

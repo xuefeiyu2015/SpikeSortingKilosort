@@ -19,11 +19,20 @@
                          can gate a batch job.
     export_results       aligned spike times, metrics, waveforms, figures.
 
-The alignment and export stages read the labels Phy writes, so run this once
-curation is done: ``cluster_group.tsv`` overrides Kilosort's own
-``cluster_KSLabel.tsv``. Running it before curating is not an error -- you get
-Kilosort's labels instead -- but it is rarely what you want. ``--steps
-extract_sync`` is the part that can be run straight after the recording.
+Every stage runs, in that order, on every stream the session names. A stage
+with nothing to do yet reports why and the run carries on -- so running this
+straight after the recording, before sorting, extracts the pulses and the LFP
+and puts the LFP on Blackrock time, and ``export_results`` simply finds no
+sorting. Run it again once curation is done.
+
+The export reads the labels Phy writes: ``cluster_group.tsv`` overrides
+Kilosort's own ``cluster_KSLabel.tsv``, and every cluster not labelled noise is
+exported.
+
+Two flags, each overriding a session key for this run only:
+
+    --export-lfp         export_lfp: true
+    --export-waveforms   waveforms.export_snippets: true
 
 **Needs no GPU and no sorter** -- only the recordings' edge channels and the
 sorted output. It does use CatGT/TPrime where the machine has them, so this is
@@ -42,17 +51,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 from _cli import Runner, build_parser, load  # noqa: E402
 
 import spikesorting as ss  # noqa: E402
-
-STAGES = [
-    # Extraction first: everything below reads what it writes.
-    "extract_sync",
-    "lfp",
-    "time_remapping",
-    "validate_remapping",
-    "export_results",
-    # Last, because it is the one stage here that re-reads the recording.
-    "waveforms",
-]
 
 
 def _log_pipeline_messages() -> None:
@@ -74,60 +72,23 @@ def _log_pipeline_messages() -> None:
 
 def main() -> int:
     parser = build_parser(__doc__)
-    parser.add_argument(
-        "--steps",
-        nargs="+",
-        default=STAGES,
-        choices=STAGES,
-        help="stages to run (default: all)",
-    )
-    parser.add_argument(
-        "--keep-going",
-        action="store_true",
-        help="continue after a failing stage instead of stopping",
-    )
-    # The four below override session keys for one run; the session file is where
-    # each of them lives. See _cli.flag_overrides.
+    # Both override a session key for one run; the session file is where each
+    # lives. See _cli.flag_overrides.
     parser.add_argument(
         "--export-lfp",
         action="store_true",
         help="export the LF band this run, whatever export_lfp says in the session",
     )
     parser.add_argument(
-        "--lfp-decimate",
-        type=int,
-        default=None,
-        help="override the session's lfp_decimate (and export the LF band). The LF "
-        "band is hardware-limited to ~500 Hz at 2500 Hz sampling, so 2 is safe; "
-        "higher aliases (no anti-alias filter)",
-    )
-    parser.add_argument(
-        "--groups",
-        nargs="+",
-        default=None,
-        help="override the session's export_groups (Phy cluster_group labels)",
-    )
-    parser.add_argument(
         "--export-waveforms",
         action="store_true",
         help="keep a snippet per spike this run, whatever the session says",
     )
-    parser.add_argument("--no-figures", action="store_true", help="skip figure generation")
     args = parser.parse_args()
     _log_pipeline_messages()
 
-    # An LFP on the probe's own clock cannot be compared with anything else that
-    # was recorded, so asking for it asks for the map that fixes that. Harmless
-    # when it cannot run: with one system declared, or with no edge files yet,
-    # time_remapping reports why and the LFP stays on stream time.
-    steps = list(args.steps)
-    if "lfp" in steps and "time_remapping" not in steps:
-        steps.append("time_remapping")
-        print("note: --steps lfp also runs time_remapping, which puts the LFP on "
-              "Blackrock time; without it the export is on the probe's own clock")
-
     config = load(args, require_inputs=False)
-    run = Runner(config, keep_going=args.keep_going)
+    run = Runner(config)
     print()
 
     def per_probe_config():
@@ -153,27 +114,22 @@ def main() -> int:
         run(verb, config, "blackrock", *extra, system="blackrock")
 
     # Extraction first: everything below reads the edge files it writes.
-    for stage, verb in (("extract_sync", ss.extract_sync), ("lfp", ss.extract_lfp)):
-        if stage in steps:
-            per_stream(verb)
+    per_stream(ss.extract_sync)
+    per_stream(ss.extract_lfp)
 
     # Blackrock is the reference timebase, so it is what the other system is
     # mapped *onto* rather than a system to remap. Each probe gets its own fit:
-    # separate oscillators, separate SY words, separate time_map.json.
-    if "time_remapping" in steps:
-        per_stream(ss.time_remapping)
+    # separate oscillators, separate SY words, separate time_map.json. This is
+    # also what stamps the Blackrock axis into the LFP extracted above.
+    per_stream(ss.time_remapping)
 
-    if "validate_remapping" in steps:
-        for label, probe_config in per_probe_config():
-            run(ss.validate_remapping, probe_config, probe_config.export_figures,
-                system="neuropixels", label=label, config=probe_config)
+    for label, probe_config in per_probe_config():
+        run(ss.validate_remapping, probe_config, probe_config.export_figures,
+            system="neuropixels", label=label, config=probe_config)
 
-    if "export_results" in steps:
-        per_stream(ss.export_results)
-
-    # Last: the only stage here that re-reads the recording itself.
-    if "waveforms" in steps:
-        per_stream(ss.export_waveforms)
+    # Measures the waveforms too (sorted_spikes.mat carries the mean), so there
+    # is no separate waveform pass over the binary.
+    per_stream(ss.export_results)
 
     return run.finish("exporting pipeline")
 

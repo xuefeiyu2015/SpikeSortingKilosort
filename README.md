@@ -132,7 +132,7 @@ Three rules worth knowing before you edit:
 
 Two probes of one run are two `bin_files:` entries, with an optional `by_probe:`
 block for per-probe `kilosort:` settings. Each probe gets its own sort, its own
-clock fit and its own output folder; `--probe 1` runs one of them.
+clock fit and its own output folder; `run_sorting_pipeline.py --probe 1` sorts one of them.
 
 Drift correction is off for the Utah array (`blackrock.kilosort.nblocks: 0`):
 Kilosort corrects drift by interpolating between neighbouring contacts, and at
@@ -213,13 +213,18 @@ python run_exporting_pipeline.py --config session_Porthos_1probe.yaml --machine 
 <system>_dir/kilosort4/                 the sorting (Kilosort's own layout)
                                         edge files, nsp_time_map.json, time_map.json
                        export/
-                           figures/                     unit_0000.png, overview.png
+                           figures/                     units.pdf (a row per unit), overview.png
                            sorting_summary_info.json    what ran, on what, from where
-                           <session>_sorted_spikes.mat  times, channel, unit, mean waveform
-                           <session>_waveforms.mat      per-spike snippets (when kept)
-                           <run>.lfp.mat                the LF band, on Blackrock time
-                           units.csv  spike_times.npy  spike_samples.npy
+                           <recording>.sorted_spikes.mat  times, channel, unit, mean waveform
+                           <recording>.waveforms.mat      per-spike snippets (when kept)
+                           <lf recording>.lfp.mat         the LF band, on Blackrock time
+                           units.csv                      one row per unit: label, rate, ISI, ...
 ```
+
+Each `.mat` is named after the recording it came from — `<run>_t0.imec0.ap` for a
+Neuropixels AP binary, the `.ns6` stem for Blackrock — so a file copied off the rig
+still says which recording it is. `export/` holds only what you copy away;
+Kilosort's own `.npy` arrays stay in `kilosort4/`.
 
 One folder per system, and that is the whole tree — handing an analysis a sorting
 means handing it a directory. The `.mat` products are MATLAB v7.3, readable by
@@ -391,12 +396,15 @@ python -m pytest tests/ -k "offset or drift" -q
 | Sync extraction | CatGT + NumPy | NumPy fallback | NumPy fallback |
 | Tests, alignment, export | yes | yes | yes |
 
-The stages are independent, so any subset runs on any machine — which is what
-lets the GPU half go to a cluster while the CatGT/TPrime half stays on the rig:
+The stages are independent — sorting reads no edge files, extraction needs no
+sorter — which is what lets the GPU half go to a cluster while the CatGT/TPrime
+half stays on the rig. The exporting driver always runs every stage; one that
+has nothing to do yet says so and is skipped, so running it before sorting
+extracts the pulses and leaves the export for later:
 
 ```bash
-# rig: CatGT and TPrime both live here
-python run_exporting_pipeline.py --config <s>.yaml --machine windows_rig --steps extract_sync
+# rig: CatGT and TPrime both live here; export_results finds no sorting yet
+python run_exporting_pipeline.py --config <s>.yaml --machine windows_rig
 # cluster: the GPU work, and the only stage that needs it
 python run_sorting_pipeline.py   --config <s>.yaml --machine hpc
 # rig: reads the .txt edge files plus spike_times.npy
@@ -453,7 +461,7 @@ and the indented line under it is the reason. Common ones:
 
 | the reason line | what it means |
 |---|---|
-| `export_lfp is false` | turn it on in the session, or `--lfp-decimate 2` for one run |
+| `export_lfp is false` | turn it on in the session, or `--export-lfp` for one run |
 | `no blackrock paths declared in the session` | that system has no block, so it did not record |
 | `kilosort_on_blackrock is false` | the session says keep the recording, do not sort it |
 | `blackrock is the reference timebase; nothing to map it onto` | expected — Blackrock is what everything else is mapped onto |

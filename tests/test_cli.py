@@ -19,9 +19,7 @@ def _args(**kwargs) -> argparse.Namespace:
     defaults = {
         "system": None,
         "export_lfp": False,
-        "lfp_decimate": None,
-        "groups": None,
-        "no_figures": False,
+        "export_waveforms": False,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -33,14 +31,9 @@ def test_no_flags_means_the_session_decides_everything():
 
 def test_each_flag_names_the_session_key_it_replaces():
     assert flag_overrides(_args(export_lfp=True)) == {"export_lfp": True}
-    assert flag_overrides(_args(groups=["good"])) == {"export_groups": ("good",)}
-    assert flag_overrides(_args(no_figures=True)) == {"export_figures": False}
-
-
-def test_asking_for_a_stride_asks_for_the_export():
-    # --lfp-decimate 2 with export_lfp still false would otherwise set the stride
-    # for an export that does not happen, and report nothing.
-    assert flag_overrides(_args(lfp_decimate=2)) == {"export_lfp": True, "lfp_decimate": 2}
+    assert flag_overrides(_args(export_waveforms=True)) == {
+        "waveforms": {"export_snippets": True}
+    }
 
 
 def test_one_system_this_run_is_expressed_as_the_session_keys():
@@ -62,13 +55,12 @@ def test_overrides_reach_the_loaded_session_without_touching_the_file(tmp_path):
         "export_lfp: false\nneuropixels:\n  bin_file: '/a/x.bin'\n",
         encoding="utf-8",
     )
-    common = {"config": str(session), "machine": "mac", "probe": None, "skip_checks": True}
+    common = {"config": str(session), "machine": "mac", "probe": None}
 
     assert load(_args(**common), require_inputs=False).export_lfp is False
 
-    overridden = load(_args(**common, lfp_decimate=2), require_inputs=False)
+    overridden = load(_args(**common, export_lfp=True), require_inputs=False)
     assert overridden.export_lfp is True
-    assert overridden.lfp_decimate == 2
 
     # ...and the session file still says what the session wants.
     assert "export_lfp: false" in session.read_text(encoding="utf-8")

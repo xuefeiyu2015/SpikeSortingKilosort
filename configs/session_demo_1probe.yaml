@@ -21,7 +21,6 @@
 kilosort_on_neuropixels: true
 export_lfp: false
 export_figures: true
-export_groups: ["good", "mua"]
 
 # Where the demo recording lives. Stated outright, like any other session --
 # nothing is composed. notebooks/setup_demo_data.ipynb downloads to whatever this

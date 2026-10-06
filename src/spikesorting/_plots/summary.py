@@ -17,6 +17,8 @@ __all__ = [
     "plot_firing_rate",
     "plot_amplitudes",
     "plot_unit_summary",
+    "plot_unit_page",
+    "save_unit_pages",
     "plot_alignment_residuals",
     "plot_sorting_overview",
     "save_figure",
@@ -139,11 +141,125 @@ def plot_unit_summary(unit: dict[str, Any], fig: Any = None) -> Any:
     axes[1, 1].set_title("amplitude stability")
 
     fig.suptitle(
-        f"unit {unit.get('unit_id')} | {unit.get('label', 'unsorted')} | "
+        f"unit {unit.get('unit_id')} | {_unit_class(unit) or 'no label'} | "
         f"channel {unit.get('channel')} | {unit.get('n_spikes', '?')} spikes"
     )
     fig.tight_layout()
     return fig
+
+
+#: The columns of a unit page, left to right, and each one's heading.
+UNIT_PANELS = ("mean waveform", "ISI", "firing rate", "amplitude stability")
+
+
+def _unit_class(unit: dict[str, Any]) -> str:
+    """``SU (good)`` / ``MU (mua)``, the label alone, or ``""`` when unlabelled."""
+    label, unit_class = unit.get("label") or "", unit.get("unit_class") or ""
+    if unit_class and label:
+        return f"{unit_class} ({label})"
+    return unit_class or label
+
+
+def _unit_header(unit: dict[str, Any]) -> str:
+    """One line naming the unit and its headline numbers, for above its row."""
+
+    def number(key: str, fmt: str, scale: float = 1.0) -> str | None:
+        value = unit.get(key)
+        if value is None or not np.isfinite(value):
+            return None
+        return format(value * scale, fmt)
+
+    parts = [
+        f"unit {unit.get('unit_id')}",
+        *([_unit_class(unit)] if _unit_class(unit) else []),
+        f"ch {unit.get('channel')}",
+        f"{unit.get('n_spikes', 0):,} spikes",
+    ]
+    for key, fmt, scale, template in (
+        ("firing_rate_hz", ".2f", 1.0, "{} Hz"),
+        ("isi_fraction", ".2f", 100.0, "ISI viol {}%"),
+        ("presence_ratio", ".2f", 1.0, "presence {}"),
+        ("amp_cv", ".2f", 1.0, "amp CV {}"),
+        ("peak_to_trough_ms", ".2f", 1.0, "p-t {} ms"),
+    ):
+        text = number(key, fmt, scale)
+        if text is not None:
+            parts.append(template.format(text))
+    return "  |  ".join(parts)
+
+
+def plot_unit_page(units: list[dict[str, Any]], rows: int, fig: Any = None) -> Any:
+    """One page of units: a row per unit, a column per panel in ``UNIT_PANELS``.
+
+    Each ``unit`` is the dict :func:`plot_unit_summary` takes, plus the header
+    fields read by ``_unit_header`` (``unit_class``, ``firing_rate_hz``,
+    ``isi_fraction``, ...) and optional ``waveform_units`` for the y label.
+    ``rows`` fixes the grid, so a short last page keeps the same row height.
+    """
+    import matplotlib.pyplot as plt
+
+    if fig is None:
+        fig = plt.figure(figsize=(8.5, 11))
+    grid = fig.add_gridspec(rows, len(UNIT_PANELS), hspace=0.95, wspace=0.42,
+                            left=0.07, right=0.98, top=0.95, bottom=0.06)
+
+    for row, unit in enumerate(units):
+        axes = [fig.add_subplot(grid[row, col]) for col in range(len(UNIT_PANELS))]
+
+        if unit.get("waveform") is not None and np.size(unit["waveform"]):
+            plot_mean_waveform(
+                unit["waveform"], unit.get("waveform_t_ms"), unit.get("waveform_sem"),
+                ax=axes[0],
+            )
+            axes[0].set_ylabel(unit.get("waveform_units", "amplitude"))
+        if unit.get("isi_counts") is not None:
+            plot_isi_histogram(unit["isi_counts"], unit["isi_edges_ms"], ax=axes[1])
+        if unit.get("rate_centers_s") is not None:
+            plot_firing_rate(unit["rate_centers_s"], unit["rate_hz"], ax=axes[2])
+        if unit.get("amplitudes") is not None and np.size(unit["amplitudes"]):
+            plot_amplitudes(unit["amp_times_s"], unit["amplitudes"], ax=axes[3])
+
+        for ax, title in zip(axes, UNIT_PANELS):
+            ax.set_title(title, fontsize=7, pad=2)
+            ax.tick_params(labelsize=6)
+            ax.xaxis.label.set_size(6)
+            ax.yaxis.label.set_size(6)
+
+        # The header spans the row: centred over the four panels, just above them.
+        left, right = axes[0].get_position().x0, axes[-1].get_position().x1
+        top = axes[0].get_position().y1
+        fig.text((left + right) / 2, top + 0.022, _unit_header(unit),
+                 ha="center", va="bottom", fontsize=7.5, fontweight="bold")
+    return fig
+
+
+def save_unit_pages(
+    units: list[dict[str, Any]],
+    path: str | Path,
+    rows_per_page: int = 6,
+    title: str | None = None,
+) -> Path:
+    """Every unit in one multi-page PDF, ``rows_per_page`` units to a page.
+
+    Pages are rendered and closed one at a time, so a few hundred units never
+    hold more than one figure in memory.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n_pages = max(1, int(np.ceil(len(units) / rows_per_page)))
+    with PdfPages(path) as pdf:
+        for page in range(n_pages):
+            chunk = units[page * rows_per_page : (page + 1) * rows_per_page]
+            fig = plot_unit_page(chunk, rows_per_page)
+            footer = f"page {page + 1} / {n_pages}"
+            fig.text(0.98, 0.01, f"{title}  |  {footer}" if title else footer,
+                     ha="right", va="bottom", fontsize=6, color="0.4")
+            pdf.savefig(fig)
+            plt.close(fig)
+    return path
 
 
 def plot_alignment_residuals(

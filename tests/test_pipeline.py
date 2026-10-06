@@ -333,43 +333,48 @@ def test_the_lfp_export_is_the_sessions_call_not_a_flags(tmp_path):
 
 
 def test_the_export_settings_come_from_the_session(tmp_path):
-    # Same rule for what export_results keeps and draws: session keys, so a run
-    # from a bare --config exports what the session says it exports.
-    default = _session(tmp_path)
-    assert default.export_groups == ("good", "mua")
-    assert default.export_figures is True
+    # Same rule for what export_results draws: a session key, so a run from a
+    # bare --config exports what the session says it exports.
+    assert _session(tmp_path).export_figures is True
+    assert _session(tmp_path, "export_figures: false\n").export_figures is False
 
-    stated = _session(
-        tmp_path, "export_groups: [good]\nexport_figures: false\n"
-    )
-    assert stated.export_groups == ("good",)
-    assert stated.export_figures is False
+
+def test_the_retired_export_groups_key_says_to_delete_it(tmp_path):
+    # Its fuzzy neighbour is export_figures, an unrelated switch, so the hint
+    # has to be explicit rather than "did you mean".
+    with pytest.raises(ValueError) as error:
+        _session(tmp_path, "export_groups: [good, mua]\n")
+    message = str(error.value)
+    assert "export_groups" in message and "noise" in message
+    assert "export_figures" not in message
 
 
 def test_export_results_reads_those_settings_rather_than_arguments(
     tmp_path, kilosort_results
 ):
-    # The end of the chain: the keys above have to reach the export itself, which
+    # The end of the chain: the key above has to reach the export itself, which
     # the driver now calls with the config alone. The fixture's three units are
-    # labelled good / mua / good, so the selection is visible in the count.
+    # labelled good / mua / good; marking one noise in Phy is what drops it.
     import shutil
 
-    session = _session(tmp_path, "export_groups: [good]\nexport_figures: false\n")
+    session = _session(tmp_path, "export_figures: false\n")
     sorted_dir = session.paths.sorted_for("neuropixels")
     sorted_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(kilosort_results, sorted_dir, dirs_exist_ok=True)
 
-    good_only = ss.export_results(session, "neuropixels")
-    assert good_only["n_units"] == 2                       # units 0 and 2
+    everything = ss.export_results(session, "neuropixels")
+    assert everything["n_units"] == 3                      # good and mua alike
     assert not list(session.paths.figures_for("neuropixels").glob("*.png"))
 
-    with_mua = ss.export_results(
-        cfg.with_overrides(session, export_groups=("good", "mua"), export_figures=True),
-        "neuropixels",
+    (sorted_dir / "cluster_group.tsv").write_text(
+        "cluster_id\tgroup\n1\tnoise\n", encoding="utf-8"
     )
-    assert with_mua["n_units"] == 3
-    figures = sorted(p.name for p in session.paths.figures_for("neuropixels").glob("*.png"))
-    assert figures == ["overview.png", "unit_0000.png", "unit_0001.png", "unit_0002.png"]
+    with_noise = ss.export_results(
+        cfg.with_overrides(session, export_figures=True), "neuropixels"
+    )
+    assert with_noise["n_units"] == 2
+    figures = sorted(p.name for p in session.paths.figures_for("neuropixels").iterdir())
+    assert figures == ["overview.png", "units.pdf"]
 
 
 def test_a_system_that_is_not_sorted_needs_no_probe_and_no_recording(tmp_path):
@@ -441,18 +446,27 @@ def test_a_utah_export_lands_on_the_nsp_clock(tmp_path, kilosort_results):
         json.dumps(time_map.to_dict()), encoding="utf-8"
     )
 
+    import h5py
+
     out = ss.export_results(session, "blackrock")
 
     assert out["timebase"] == "nsp"
-    exported = np.load(sorted_dir / "export" / "spike_times.npy")
-    samples = np.load(sorted_dir / "export" / "spike_samples.npy")
+    # Named after the recording, not the session: HUB.ns6 -> HUB.sorted_spikes.mat
+    mat = out["paths"]["sorted_spikes"]
+    assert mat == sorted_dir / "export" / "HUB.sorted_spikes.mat"
+    with h5py.File(mat, "r") as handle:
+        exported = handle["sorted_spikes/TimeStamps"][()].ravel()
+        samples = handle["sorted_spikes/spike_sample"][()].ravel()
     assert exported.min() > t0                       # on the PTP clock, not near zero
     assert exported[0] == pytest.approx(t0 + samples[0] / rate, abs=1e-6)
     # ...and the sorter's own index survives beside it, so nothing is one-way.
-    assert samples.dtype == np.int64
     assert samples.size == exported.size
 
-    info = json.loads((sorted_dir / "export" / "export_info.json").read_text())
+    # Only what an analysis copies away: no .npy/.npz duplicates of Kilosort's.
+    names = {p.name for p in (sorted_dir / "export").iterdir() if p.is_file()}
+    assert names == {"HUB.sorted_spikes.mat", "units.csv", "sorting_summary_info.json"}
+
+    info = json.loads((sorted_dir / "export" / "sorting_summary_info.json").read_text())
     assert info["timebase"] == "nsp"
     assert info["nsp_time_map"]["measured_rate_hz"] == pytest.approx(rate, abs=1e-3)
     assert info["nsp_time_map"]["drift_ppm"] == pytest.approx(-4.5, abs=0.2)
@@ -497,6 +511,7 @@ def test_the_waveform_export_cuts_snippets_from_the_sorted_binary(tmp_path, kilo
     out = ss.export_waveforms(session, "blackrock")
 
     assert out["n_spikes"] > 0
+    assert out["path"].name == "HUB.waveforms.mat"      # named after HUB.ns6
     with h5py.File(out["path"], "r") as handle:
         wf = handle["waveforms"]
         width = int(round(2.0 * 30000.0 / 1000.0))     # 60 samples

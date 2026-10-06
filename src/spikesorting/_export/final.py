@@ -1,17 +1,15 @@
 """Final export: aligned spike times plus per-unit information (step 10).
 
-Writes a self-describing bundle so downstream analysis never has to know how the
-sorting was produced:
+Writes what an analysis copies away, beside the sorting it came from:
 
-===================== =========================================================
-``units.csv``         one row per unit: channel, counts, rate, ISI, waveform shape
-``spike_times.npy``   flat spike times in seconds, Blackrock timebase if aligned
-``spike_clusters.npy`` matching unit id per spike
-``mean_template_waveform.npy`` ``(n_units, n_timepoints)`` on each unit's
-  best channel -- Kilosort's *template*, in whitened units, not a raw average
-``isi_histograms.npz`` per-unit ISI counts and shared bin edges
-``export_info.json``   timebase, alignment status, provenance
-===================== =========================================================
+==================================== ============================================
+``units.csv``                        one row per unit: label, channel, counts,
+                                     rate, ISI, presence, amplitude, waveform shape
+``<recording>.sorted_spikes.mat``    every spike: time, channel, unit, sample
+                                     index, plus the measured mean waveforms
+==================================== ============================================
+
+Kilosort's own arrays stay in the sorting folder above; nothing here copies them.
 
 Computation only -- figures are produced separately by
 :mod:`spikesorting._plots.summary` from these same arrays.
@@ -19,7 +17,6 @@ Computation only -- figures are produced separately by
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -33,8 +30,7 @@ __all__ = [
     "export_sorted_spikes_mat",
     "template_for_unit",
     "build_unit_table",
-    "build_isi_histograms",
-    "export_units",
+    "export_unit_table",
 ]
 
 
@@ -147,7 +143,7 @@ def build_unit_table(
 
         row: dict[str, Any] = {
             "unit_id": unit_id,
-            "label": results.labels.get(unit_id, "unsorted"),
+            "label": results.labels.get(unit_id, ""),
             "channel": channel,
             "template_id": template_for_unit(results, unit_id),
             "first_spike_s": float(times[0]) if times.size else float("nan"),
@@ -169,119 +165,13 @@ def build_unit_table(
     return pd.DataFrame(rows)
 
 
-def build_isi_histograms(
-    results: PhyResults,
-    unit_ids: np.ndarray,
-    spike_times_s: dict[int, np.ndarray] | None = None,
-    bin_ms: float = 1.0,
-    max_ms: float = 100.0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """``(counts_per_unit, bin_edges_ms)`` with one row per unit."""
-    edges = np.arange(0.0, max_ms + bin_ms, bin_ms)
-    counts = np.zeros((len(unit_ids), edges.size - 1), dtype=np.int64)
-    for i, unit_id in enumerate(unit_ids):
-        unit_id = int(unit_id)
-        times = (
-            spike_times_s[unit_id]
-            if spike_times_s is not None and unit_id in spike_times_s
-            else results.times_for(unit_id)
-        )
-        isi = metrics.compute_isi(times)
-        counts[i], _ = metrics.compute_isi_histogram(isi, bin_ms, max_ms)
-    return counts, edges
-
-
-def export_units(
-    out_dir: str | Path,
-    results: PhyResults,
-    unit_ids: np.ndarray | None = None,
-    spike_times_s: dict[int, np.ndarray] | None = None,
-    timebase: str = "sorter",
-    duration_s: float | None = None,
-    provenance: dict[str, Any] | None = None,
-) -> dict[str, Path]:
-    """Write the export bundle. Returns the paths written.
-
-    ``timebase`` is recorded verbatim in ``export_info.json`` -- "blackrock" once
-    alignment has been applied, "sorter" when it has not. Downstream code should
-    check it rather than assume.
-    """
+def export_unit_table(out_dir: str | Path, table: pd.DataFrame) -> Path:
+    """Write ``units.csv`` -- the table :func:`build_unit_table` returns."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    unit_ids = results.unit_ids if unit_ids is None else np.asarray(unit_ids)
-    table = build_unit_table(results, unit_ids, spike_times_s, duration_s)
-    counts, edges = build_isi_histograms(results, unit_ids, spike_times_s)
-
-    flat_times: list[np.ndarray] = []
-    flat_samples: list[np.ndarray] = []
-    flat_clusters: list[np.ndarray] = []
-    waveforms: list[np.ndarray] = []
-    for unit_id in unit_ids:
-        unit_id = int(unit_id)
-        times = (
-            spike_times_s[unit_id]
-            if spike_times_s is not None and unit_id in spike_times_s
-            else results.times_for(unit_id)
-        )
-        flat_times.append(np.asarray(times, dtype=np.float64))
-        # The sorter's own index, kept beside the seconds: it is what Phy shows,
-        # what a re-run reproduces, and the only way back to the raw binary once
-        # the times have been mapped onto another clock.
-        flat_samples.append(
-            np.asarray(results.spike_samples[results.spike_clusters == unit_id], dtype=np.int64)
-        )
-        flat_clusters.append(np.full(times.size, unit_id, dtype=np.int64))
-        waveform, _ = mean_template_waveform(results, unit_id)
-        waveforms.append(waveform)
-
-    times_array = np.concatenate(flat_times) if flat_times else np.empty(0)
-    samples_array = (
-        np.concatenate(flat_samples) if flat_samples else np.empty(0, dtype=np.int64)
-    )
-    clusters_array = np.concatenate(flat_clusters) if flat_clusters else np.empty(0, dtype=np.int64)
-    order = np.argsort(times_array, kind="stable")
-
-    width = max((w.size for w in waveforms), default=0)
-    waveform_array = np.full((len(waveforms), width), np.nan)
-    for i, waveform in enumerate(waveforms):
-        waveform_array[i, : waveform.size] = waveform
-
-    paths = {
-        "units": out_dir / "units.csv",
-        "spike_times": out_dir / "spike_times.npy",
-        "spike_samples": out_dir / "spike_samples.npy",
-        "spike_clusters": out_dir / "spike_clusters.npy",
-        "mean_template_waveform": out_dir / "mean_template_waveform.npy",
-        "isi_histograms": out_dir / "isi_histograms.npz",
-        "info": out_dir / "export_info.json",
-    }
-
-    table.to_csv(paths["units"], index=False)
-    np.save(paths["spike_times"], times_array[order])
-    np.save(paths["spike_samples"], samples_array[order])
-    np.save(paths["spike_clusters"], clusters_array[order])
-    np.save(paths["mean_template_waveform"], waveform_array)
-    np.savez(
-        paths["isi_histograms"], counts=counts, bin_edges_ms=edges, unit_ids=np.asarray(unit_ids)
-    )
-
-    info = {
-        "timebase": timebase,
-        "time_units": "seconds",
-        "n_units": int(len(unit_ids)),
-        "n_spikes": int(times_array.size),
-        "fs": results.fs,
-        "curated": results.curated,
-        "results_dir": str(results.results_dir),
-        "waveform_source": "kilosort templates (not raw-trace averages)",
-    }
-    if provenance:
-        info.update(provenance)
-    with open(paths["info"], "w", encoding="utf-8") as handle:
-        json.dump(info, handle, indent=2, default=str)
-
-    return paths
+    path = out_dir / "units.csv"
+    table.to_csv(path, index=False)
+    return path
 
 
 def export_sorted_spikes_mat(
@@ -350,7 +240,7 @@ def export_sorted_spikes_mat(
             dtype=np.float64,
         ),
         "Unit_No": unit_ids.astype(np.float64),
-        "Label": " | ".join(str(results.labels.get(int(u), "unsorted")) for u in unit_ids),
+        "Label": " | ".join(str(results.labels.get(int(u), "")) for u in unit_ids),
         "n_spikes": np.array([int((results.spike_clusters == int(u)).sum()) for u in unit_ids],
                              dtype=np.float64),
         "samplingrate": float(results.fs),

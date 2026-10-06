@@ -431,6 +431,17 @@ def _input_path(config: SessionConfig, system: str) -> Path | None:
     return config.neuropixels.bin_file
 
 
+def _export_stem(config: SessionConfig, system: str) -> str:
+    """What the exported .mat files are named after: the recording they came from.
+
+    ``<run>_t0.imec0.ap`` for a Neuropixels AP binary, ``HUB-<x>_001`` for a
+    ``.ns6`` -- the same rule the LF band follows (``<lf stem>.lfp.mat``), so a
+    file copied away from its folder still says which recording it is.
+    """
+    path = _input_path(config, system)
+    return Path(path).stem if path is not None else config.session
+
+
 def _check_input_reachable(config: SessionConfig, system: str) -> None:
     """Fail fast, and loudly, when the recording's filesystem is not answering."""
     path = _input_path(config, system)
@@ -774,6 +785,88 @@ def _waveform_fields(measured: dict | None) -> dict | None:
     }
 
 
+#: Phy's curation labels as single vs multi unit, for the figure headers.
+_UNIT_CLASS = {"good": "SU", "mua": "MU"}
+
+
+def _unit_page_data(
+    phy,
+    unit_ids: np.ndarray,
+    spike_times_s: dict[int, np.ndarray] | None,
+    table,
+    measured: dict | None,
+) -> list[dict[str, Any]]:
+    """What ``plots.save_unit_pages`` draws, one dict per unit, ordered by channel.
+
+    The waveform is the *measured* mean (+/- SEM) from :func:`export_waveforms`
+    where it ran, in uV or ADC as it says; otherwise Kilosort's template on the
+    peak channel, in whitened units -- the shape is right, the scale is not.
+    """
+    from ._export import final, metrics
+
+    rows = table.set_index("unit_id")
+    mean = std = None
+    if measured is not None:
+        result = measured["result"]
+        column = {int(u): i for i, u in enumerate(result.unit_ids)}
+        mean, std, counts = result.mean, result.std, result.n_per_unit
+        t_measured = (
+            (np.arange(mean.shape[0]) - measured["samples_before"])
+            / measured["fs"] * 1000.0
+        )
+
+    # On the NSP or Blackrock axis the recording starts nowhere near zero, so
+    # the rate is binned over the window the times actually span.
+    start, duration = final.recording_window(phy, unit_ids, spike_times_s)
+    units = []
+    for unit_id in unit_ids:
+        unit_id = int(unit_id)
+        times = spike_times_s[unit_id] if spike_times_s is not None else phy.times_for(unit_id)
+        template, channel = final.mean_template_waveform(phy, unit_id)
+        isi_counts, isi_edges = metrics.compute_isi_histogram(metrics.compute_isi(times))
+        centers, rate = metrics.compute_firing_rate(
+            times, duration, bin_s=max(1.0, duration / 100), start_s=start
+        )
+        label = phy.labels.get(unit_id, "")
+        unit = {
+            "unit_id": unit_id,
+            "label": label,
+            "unit_class": _UNIT_CLASS.get(label, ""),
+            "channel": channel,
+            "n_spikes": int(times.size),
+            "isi_counts": isi_counts,
+            "isi_edges_ms": isi_edges,
+            "rate_centers_s": centers,
+            "rate_hz": rate,
+            "amp_times_s": times,
+            "amplitudes": phy.amplitudes_for(unit_id),
+        }
+        if unit_id in rows.index:
+            row = rows.loc[unit_id]
+            for key in ("firing_rate_hz", "isi_fraction", "presence_ratio", "amp_cv",
+                        "peak_to_trough_ms"):
+                if key in row:
+                    unit[key] = float(row[key])
+
+        if mean is not None and unit_id in column and counts[column[unit_id]] > 0:
+            i = column[unit_id]
+            unit["waveform"] = mean[:, i]
+            unit["waveform_sem"] = std[:, i] / np.sqrt(counts[i])
+            unit["waveform_t_ms"] = t_measured
+            unit["waveform_units"] = measured.get("mean_units", "ADC")
+        else:
+            unit["waveform"] = template
+            unit["waveform_t_ms"] = (
+                np.arange(template.size) / phy.fs * 1000.0 if template.size else None
+            )
+            unit["waveform_units"] = "template (a.u.)"
+        units.append(unit)
+
+    units.sort(key=lambda u: (u["channel"] if u["channel"] is not None else np.inf,
+                              u["unit_id"]))
+    return units
+
+
 def _write_summary(
     config: SessionConfig,
     system: str,
@@ -781,6 +874,8 @@ def _write_summary(
     timebase: str,
     unit_ids: np.ndarray,
     measured: dict | None,
+    curated: bool,
+    time_map: Any = None,
 ) -> Path:
     """The manifest that makes the bundle self-describing.
 
@@ -802,7 +897,10 @@ def _write_summary(
         "stream": stream_label(system),
         "sorter": config.sorter,
         "timebase": timebase,
+        "time_units": "seconds",
+        "curated": curated,
         "n_units_exported": int(np.asarray(unit_ids).size),
+        **({"nsp_time_map": time_map.to_dict()} if time_map is not None else {}),
         "waveforms": (
             {
                 "n_spikes": measured["n_spikes"],
@@ -1459,7 +1557,7 @@ def export_waveforms(
         return None
 
     phy = load_phy_results(results_dir)
-    unit_ids = select_units(phy, tuple(config.export_groups))
+    unit_ids = select_units(phy)
     channel_for_unit = {
         int(u): best_channel(phy, int(u))
         for u in unit_ids
@@ -1529,7 +1627,7 @@ def export_waveforms(
     )
 
     out_dir = results_dir / "export"
-    out_path = out_dir / f"{config.session}_waveforms.mat"
+    out_path = out_dir / f"{_export_stem(config, system)}.waveforms.mat"
     write_mat(
         out_path,
         {
@@ -1591,6 +1689,8 @@ def export_waveforms(
         "snippets_kept": bool(wf.export_snippets),
         "mean_units": mean_units,
         "window_ms": float(wf.window_ms),
+        "samples_before": int(before),
+        "fs": fs,
         "highpass_hz": wf.highpass_hz,
         "timebase": timebase,
         "result": result,
@@ -1605,28 +1705,30 @@ def export_waveforms(
 def export_results(
     config: SessionConfig,
     system: str = "neuropixels",
-    max_unit_figures: int = 40,
+    max_unit_figures: int | None = None,
 ) -> dict | None:
     """Export metrics, figures and the final bundle for a sorted folder.
 
-    Which unit labels to keep and whether to draw figures are the session's
-    ``export_groups`` and ``export_figures``.
+    Every cluster not labelled ``noise`` in Phy is exported; whether to draw
+    figures is the session's ``export_figures``.
 
     Uses aligned spike times when ``time_remapping`` has written them, and
     records which timebase it used. Reads Phy's ``cluster_group.tsv`` where it
     exists, so curated labels override Kilosort's own.
 
+    Unit figures go into one ``figures/units.pdf``, a row per unit, ordered by
+    channel; ``max_unit_figures`` caps how many, and ``None`` draws them all.
+
     Returns ``None`` when that system has no sorting output.
     """
     _check(system)
-    from ._export import final, metrics
+    from ._export import final
     from ._export.curated import load_phy_results, select_units
     from ._plots import summary as plots
 
     if not config.has_data(system):
         return None
 
-    groups = tuple(config.export_groups)
     figures = config.export_figures
 
     results_dir = config.paths.sorted_for(system)
@@ -1635,11 +1737,11 @@ def export_results(
         return None
 
     phy = load_phy_results(results_dir)
-    unit_ids = select_units(phy, groups)
+    unit_ids = select_units(phy)
     log.info(
-        "%d units total, %d selected (%s; groups=%s)",
+        "%d units total, %d exported (%s; all but noise)",
         phy.unit_ids.size, unit_ids.size,
-        "curated" if phy.curated else "not curated in Phy", groups,
+        "curated" if phy.curated else "not curated in Phy",
     )
 
     seconds, timebase, time_map = _resolve_spike_seconds(config, system, phy)
@@ -1648,29 +1750,17 @@ def export_results(
         spike_times_s = {int(uid): seconds[phy.spike_clusters == uid] for uid in unit_ids}
     log.info("timebase: %s", timebase)
 
-    # One bundle per stream, so an analysis gets a folder rather than a tour of
-    # three trees. aligned/ stays where it is: the time map is cross-system.
+    # One folder per stream holding only what an analysis copies away: the .mat
+    # files, units.csv, the figures and the manifest. Kilosort's arrays stay in
+    # the sorting folder above, and the time map is cross-system, so neither is
+    # duplicated here.
     out_dir = config.paths.export_for(system)
-    paths = final.export_units(
-        out_dir,
-        phy,
-        unit_ids=unit_ids,
-        spike_times_s=spike_times_s,
-        timebase=timebase,
-        provenance={
-            "session": config.session,
-            "system": system,
-            "stream": stream_label(system),
-            "machine": config.machine.name,
-            **({"nsp_time_map": time_map.to_dict()} if time_map is not None else {}),
-        },
-    )
-    log.info("exported %d units -> %s", unit_ids.size, out_dir)
-
-    # The same spikes in the format the lab's online-spike code already reads,
-    # plus the measured waveform when the recording was reachable.
-    measured = export_waveforms(config, system)
     table = final.build_unit_table(phy, unit_ids, spike_times_s)
+    units_csv = final.export_unit_table(out_dir, table)
+
+    # The spikes in the format the lab's online-spike code already reads, plus
+    # the measured waveform when the recording was reachable.
+    measured = export_waveforms(config, system)
     mat_path = final.export_sorted_spikes_mat(
         out_dir,
         phy,
@@ -1684,43 +1774,25 @@ def export_results(
             "system": system,
             "stream": stream_label(system),
         },
-        filename=f"{config.session}_sorted_spikes.mat",
+        filename=f"{_export_stem(config, system)}.sorted_spikes.mat",
     )
-    log.info("wrote %s", mat_path.name)
-    _write_summary(config, system, out_dir, timebase, unit_ids, measured)
+    log.info("exported %d units -> %s", unit_ids.size, mat_path)
+    summary = _write_summary(
+        config, system, out_dir, timebase, unit_ids, measured, phy.curated, time_map
+    )
+    paths = {"units": units_csv, "sorted_spikes": mat_path, "summary": summary}
 
     if figures and unit_ids.size:
         figure_dir = config.paths.figures_for(system)
-        duration = phy.duration_s
-        for unit_id in unit_ids[:max_unit_figures]:
-            unit_id = int(unit_id)
-            times = spike_times_s[unit_id] if spike_times_s is not None else phy.times_for(unit_id)
-            waveform, channel = final.mean_template_waveform(phy, unit_id)
-            isi_counts, isi_edges = metrics.compute_isi_histogram(metrics.compute_isi(times))
-            centers, rate = metrics.compute_firing_rate(
-                times, duration, bin_s=max(1.0, duration / 100)
-            )
-            figure = plots.plot_unit_summary(
-                {
-                    "unit_id": unit_id,
-                    "label": phy.labels.get(unit_id, "unsorted"),
-                    "channel": channel,
-                    "n_spikes": int(times.size),
-                    "waveform": waveform,
-                    "waveform_t_ms": (
-                        np.arange(waveform.size) / phy.fs * 1000.0 if waveform.size else None
-                    ),
-                    "isi_counts": isi_counts,
-                    "isi_edges_ms": isi_edges,
-                    "rate_centers_s": centers,
-                    "rate_hz": rate,
-                    "amp_times_s": times,
-                    "amplitudes": phy.amplitudes_for(unit_id),
-                }
-            )
-            plots.save_figure(figure, figure_dir / f"unit_{unit_id:04d}.png")
+        units = _unit_page_data(phy, unit_ids, spike_times_s, table, measured)
+        if max_unit_figures is not None:
+            units = units[:max_unit_figures]
+        plots.save_unit_pages(
+            units,
+            figure_dir / "units.pdf",
+            title=f"{config.session} | {stream_label(system)} | {timebase} timebase",
+        )
 
-        table = final.build_unit_table(phy, unit_ids, spike_times_s)
         overview = plots.plot_sorting_overview(
             table["firing_rate_hz"].to_numpy(),
             amplitudes=table["amp_median"].to_numpy() if "amp_median" in table else None,
@@ -1729,12 +1801,11 @@ def export_results(
             ),
         )
         plots.save_figure(overview, figure_dir / "overview.png")
-        drawn = min(unit_ids.size, max_unit_figures)
-        log.info("wrote %d unit figures + overview -> %s", drawn, figure_dir)
-        if unit_ids.size > max_unit_figures:
+        log.info("wrote units.pdf (%d units) + overview -> %s", len(units), figure_dir)
+        if len(units) < unit_ids.size:
             log.warning(
-                "only the first %d of %d units were plotted (--max-unit-figures to change)",
-                max_unit_figures, unit_ids.size,
+                "only the first %d of %d units were plotted (max_unit_figures)",
+                len(units), unit_ids.size,
             )
 
     return {"paths": paths, "timebase": timebase, "n_units": int(unit_ids.size)}
