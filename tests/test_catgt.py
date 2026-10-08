@@ -65,6 +65,24 @@ def test_build_extract_args_contains_no_binary_rewriting_flags():
         assert forbidden not in joined
 
 
+@pytest.mark.parametrize(
+    "folders, flag", [("probe", "-prb_fld"), ("none", "-no_run_fld"), ("run", None)]
+)
+def test_build_extract_args_tells_catgt_where_the_files_are(folders, flag):
+    # CatGT never takes a file path; without the right hint it looks in a folder
+    # that does not exist and exits non-zero with nothing on stdout.
+    specs = [catgt.digital_spec(catgt.JS_AP, 0, -1, 6, 500)]
+    args = catgt.build_extract_args("D:/data", "run", specs, folders=folders)
+    hints = [a for a in args if a in ("-prb_fld", "-no_run_fld")]
+    assert hints == ([flag] if flag else [])
+
+
+def test_build_extract_args_rejects_an_unknown_folder_layout():
+    specs = [catgt.digital_spec(catgt.JS_AP, 0, -1, 6, 500)]
+    with pytest.raises(ValueError):
+        catgt.build_extract_args("D:/data", "run", specs, folders="flat")
+
+
 def test_build_extract_args_rejects_an_empty_extractor_list():
     with pytest.raises(ValueError):
         catgt.build_extract_args("D:/data", "run", [])

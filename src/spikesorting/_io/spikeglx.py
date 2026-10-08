@@ -324,21 +324,29 @@ class RunLayout:
 
         <dir>/<run>_g<gate>/<run>_g<gate>_imec<probe>/<run>_g<gate>_t<trig>.imec<probe>.ap.bin
 
-    so nothing has to be restated in the session file. A binary that does not
+    so nothing has to be restated in the session file. The two folder levels are
+    optional -- SpikeGLX writes the probe folder only when asked, and a copied
+    run often loses both -- so :attr:`folders` records which are present and
+    CatGT is told with ``-prb_fld`` / ``-no_run_fld``. A binary that does not
     follow the convention -- the Kilosort demo file, a hand-made extract -- has no
     layout, :func:`run_layout` returns ``None``, and the callers degrade to what
     the binary alone supports.
     """
 
-    #: CatGT's ``-dir``: the directory *containing* the gate folder.
+    #: CatGT's ``-dir``: the directory *containing* the gate folder, or the one
+    #: holding the binary itself when there is no gate folder.
     directory: Path
     run_name: str
     gate: int
     #: ``0`` for raw SpikeGLX output, ``"cat"`` for CatGT's own.
     trigger: int | str
     probe: int
-    #: The ``<run>_g<gate>`` folder itself, which holds any ``.obx``.
+    #: The ``<run>_g<gate>`` folder itself, which holds any ``.obx`` -- or the
+    #: binary's own folder when there is no gate folder.
     gate_dir: Path
+    #: ``"probe"`` (gate folder + ``_imec<n>`` folder), ``"run"`` (gate folder
+    #: only) or ``"none"`` (loose files): which CatGT folder hint applies.
+    folders: str = "run"
 
     def sibling(self, suffix: str) -> Path | None:
         """The matching ``lf``/``ap`` binary for this run, if it is on disk.
@@ -368,10 +376,10 @@ class RunLayout:
 def run_layout(bin_path: str | Path) -> RunLayout | None:
     """Recover the SpikeGLX run around ``bin_path``, or None if it is not one.
 
-    Read off the *filename*, not the directory tree, so it works whether or not
-    the per-probe subfolder is present and whether or not the file has been moved
-    -- the ``-dir`` it reports is simply wrong in the latter case, and CatGT says
-    so rather than silently extracting the wrong run.
+    The run is read off the *filename*; the folders around it only decide
+    :attr:`RunLayout.folders`. A binary moved out of its run folder is therefore
+    still a run -- CatGT reads it with ``-no_run_fld`` -- rather than one whose
+    ``-dir`` points a level too high.
     """
     bin_path = Path(bin_path)
     match = _RUN_FILENAME.match(bin_path.name)
@@ -380,24 +388,32 @@ def run_layout(bin_path: str | Path) -> RunLayout | None:
 
     run_name = match["run"]
     gate = int(match["gate"])
+    probe = int(match["probe"])
     trigger: int | str = match["trigger"]
     if isinstance(trigger, str) and trigger.isdigit():
         trigger = int(trigger)
 
-    # The gate folder is whichever ancestor is named <run>_g<gate>. Directly the
-    # parent when SpikeGLX wrote no per-probe subfolder, its parent when it did.
     gate_name = f"{run_name}_g{gate}"
-    gate_dir = bin_path.parent
-    if gate_dir.name != gate_name and gate_dir.parent.name == gate_name:
-        gate_dir = gate_dir.parent
+    parent = bin_path.parent
+    if parent.name == f"{gate_name}_imec{probe}" and parent.parent.name == gate_name:
+        gate_dir, folders = parent.parent, "probe"
+    elif parent.name == gate_name:
+        gate_dir, folders = parent, "run"
+    else:
+        # Loose files: CatGT's -no_run_fld reads them straight from -dir.
+        return RunLayout(
+            directory=parent, run_name=run_name, gate=gate, trigger=trigger,
+            probe=probe, gate_dir=parent, folders="none",
+        )
 
     return RunLayout(
         directory=gate_dir.parent,
         run_name=run_name,
         gate=gate,
         trigger=trigger,
-        probe=int(match["probe"]),
+        probe=probe,
         gate_dir=gate_dir,
+        folders=folders,
     )
 
 
