@@ -278,6 +278,7 @@ def test_run_layout_recovers_catgt_arguments_from_the_binarys_own_name(tmp_path)
     layout = spikeglx.run_layout(ap)
 
     assert layout.directory == tmp_path        # CatGT -dir is *above* the gate folder
+    assert layout.folders == "probe"           # -> -prb_fld
     assert layout.run_name == "run"
     assert (layout.gate, layout.trigger, layout.probe) == (0, 0, 0)
     assert layout.sibling("lf").name == "run_g0_t0.imec0.lf.bin"
@@ -299,6 +300,25 @@ def test_run_layout_reads_the_last_gate_trigger_pair_not_the_first(tmp_path):
     assert layout.run_name == name
     assert (layout.gate, layout.trigger) == (0, 0)
     assert layout.gate_dir == gate             # no probe subfolder in this run
+    assert layout.folders == "run"
+
+
+def test_run_layout_reads_a_binary_moved_out_of_its_run_folder(tmp_path):
+    # Copied loose into an arbitrary folder: -dir must be that folder, with
+    # -no_run_fld, not the folder above it -- which made CatGT exit 42.
+    name = "Tank_20210819_t1120_d9000_L12_map"
+    loose = tmp_path / "speedtest_file"
+    loose.mkdir()
+    ap = loose / f"{name}_g0_t0.imec0.ap.bin"
+    ap.write_bytes(b"")
+    (loose / f"{name}_g0_t0.imec0.lf.bin").write_bytes(b"")
+
+    layout = spikeglx.run_layout(ap)
+
+    assert layout.directory == loose
+    assert layout.folders == "none"
+    assert layout.run_name == name
+    assert layout.sibling("lf").parent == loose
 
 
 def test_run_layout_handles_catgt_output(tmp_path):

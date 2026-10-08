@@ -152,6 +152,10 @@ def catgt_script(catgt_dir: str | Path) -> Path:
     raise FileNotFoundError(f"no runit.bat or runit.sh in {catgt_dir}")
 
 
+#: RunLayout.folders -> the CatGT flag that tells it where the files are.
+_FOLDER_HINTS = {"probe": "-prb_fld", "run": "", "none": "-no_run_fld"}
+
+
 def build_extract_args(
     run_dir: str | Path,
     run_name: str,
@@ -160,11 +164,17 @@ def build_extract_args(
     trigger: int | str = 0,
     probes: tuple[int, ...] = (0,),
     dest: str | Path | None = None,
+    folders: str = "run",
 ) -> list[str]:
     """Assemble the CatGT argument list for an extraction-only pass.
 
     Deliberately contains no filter, ``-save`` or ``-startsecs`` flag: any of them
     would make CatGT rewrite the binary.
+
+    ``folders`` is :attr:`RunLayout.folders`. CatGT never takes a file path; it
+    rebuilds one from ``-dir``/``-run``/``-g``/``-t`` plus a folder hint --
+    ``-prb_fld`` for ``<run>_g0/<run>_g0_imec0/``, ``-no_run_fld`` for files
+    sitting directly in ``-dir``, nothing for a run folder alone.
     """
     if not specs:
         raise ValueError("no extractors requested")
@@ -175,6 +185,11 @@ def build_extract_args(
         f"-g={gate}",
         f"-t={trigger}",
     ]
+    hint = _FOLDER_HINTS.get(folders, KeyError)
+    if hint is KeyError:
+        raise ValueError(f"folders must be one of {sorted(_FOLDER_HINTS)}, got {folders!r}")
+    if hint:
+        args.append(hint)
 
     # One stream flag per distinct stream type touched by the extractors.
     for flag in dict.fromkeys(spec.stream_flag for spec in specs):

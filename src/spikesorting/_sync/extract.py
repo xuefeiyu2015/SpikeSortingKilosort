@@ -238,6 +238,7 @@ def _run_catgt_extraction(
         trigger=layout.trigger,
         probes=(layout.probe,),
         dest=config.paths.sync_for("neuropixels") / "catgt",
+        folders=layout.folders,
     )
     report.catgt_commands.append("runit " + " ".join(args))
 
