@@ -533,6 +533,61 @@ def test_the_waveform_export_cuts_snippets_from_the_sorted_binary(tmp_path, kilo
         assert np.isnan(wf["uv_per_digit"][()]).all()
 
 
+def test_a_neuropixels_mean_is_in_microvolts_from_the_meta_beside_the_binary(
+    tmp_path, kilosort_results
+):
+    # The gain is in the .meta beside the binary the sorter read, so the mean
+    # can be scaled to microvolts -- per channel, since NP 1.0 sets it that way.
+    import shutil
+
+    import h5py
+
+    from spikesorting._io.spikeglx import meta_path_for
+
+    n_chan = 9                                         # 8 neural + the SY word
+    run = tmp_path / "np" / "r_g0" / "r_g0_imec0"
+    run.mkdir(parents=True)
+    binary = run / "r_g0_t0.imec0.ap.bin"
+    session = _session(tmp_path, f"neuropixels:\n  bin_file: '{binary}'\n",
+                       npx_dir=run)
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    shutil.copytree(kilosort_results, sorted_dir, dirs_exist_ok=True)
+
+    spikes = np.load(sorted_dir / "spike_times.npy")
+    clusters = np.load(sorted_dir / "spike_clusters.npy")
+    peak_channel = {0: 2, 1: 5, 2: 7}
+    samples = np.zeros((int(spikes.max()) + 5000, n_chan), dtype=np.int16)
+    for s, c in zip(spikes, clusters):
+        samples[int(s), peak_channel[int(c)]] = -100
+    binary.write_bytes(samples.tobytes())
+    # channel 7 recorded at gain 1000, the rest at 500.
+    gains = [500] * 7 + [1000]
+    meta_path_for(binary).write_text(
+        f"nSavedChans={n_chan}\nimSampRate=30000\ntypeThis=imec\n"
+        "acqApLfSy=8,8,1\nsnsApLfSy=8,0,1\nsnsSaveChanSubset=all\n"
+        "imAiRangeMax=0.6\nimMaxInt=512\nimDatPrb_type=0\n"
+        "~imroTbl=(0,8)" + "".join(f"({i} 0 0 {g} 250 1)" for i, g in enumerate(gains)) + "\n",
+        encoding="utf-8",
+    )
+    (sorted_dir / "run_info.json").write_text(
+        json.dumps({"binary": str(binary), "settings": {"n_chan_bin": n_chan, "fs": 30000.0}}),
+        encoding="utf-8",
+    )
+
+    out = ss.export_waveforms(session, "neuropixels")
+
+    with h5py.File(out["path"], "r") as handle:
+        wf = handle["waveforms"]
+        assert bytes(wf["mean_units"][()].ravel().astype(np.uint8)).decode() == "uV"
+        troughs = wf["mean"][()].min(axis=1)
+        unit_channel = dict(zip(wf["mean_unit_id"][()].ravel(), wf["channel"][()].ravel()))
+    by_unit = dict(zip(sorted(unit_channel), troughs))
+    # -100 counts at 2.34375 uV/count; channel 7 (unit 2) at half that.
+    assert by_unit[0.0] == pytest.approx(-234.375)
+    assert by_unit[1.0] == pytest.approx(-234.375)
+    assert by_unit[2.0] == pytest.approx(-117.1875)
+
+
 def test_the_mean_is_measured_even_when_the_snippets_are_not_kept(
     tmp_path, kilosort_results
 ):

@@ -391,3 +391,119 @@ def test_export_lfp_rejects_bad_decimation(tmp_path):
     path = write_stream(tmp_path, name="run_g0_t0.imec0.lf.bin", n_chan=2, n_samples=100)
     with pytest.raises(ValueError):
         spikeglx.export_lfp(path, tmp_path / "lfp", decimate=0)
+
+
+# ---------------------------------------------------------------------------
+# Gain: microvolts per ADC count, from the meta
+# ---------------------------------------------------------------------------
+
+
+def _np1_meta(ap_gains, lf_gain=250, saved="all", sns="{n},0,1", probe_type=0, extra=""):
+    """An NP 1.0 meta whose ~imroTbl gives each channel its own AP gain."""
+    n = len(ap_gains)
+    entries = "".join(f"({i} 0 0 {g} {lf_gain} 1)" for i, g in enumerate(ap_gains))
+    n_saved = n + 1 if saved == "all" else None
+    lines = {
+        "imDatPrb_type": str(probe_type),
+        "acqApLfSy": f"{n},{n},1",
+        "snsApLfSy": sns.format(n=n),
+        "snsSaveChanSubset": saved,
+        "imAiRangeMax": "0.6",
+        "imMaxInt": "512",
+        "~imroTbl": f"({probe_type},{n})" + entries,
+    }
+    if n_saved is not None:
+        lines["nSavedChans"] = str(n_saved)
+    lines.update(dict(kv.split("=", 1) for kv in extra.split("\n") if kv))
+    return lines
+
+
+def test_np1_gain_is_read_per_channel_from_the_imro_table():
+    # NP 1.0 sets the AP gain per channel, so a single default would be wrong
+    # for any channel someone changed. 0.6 V / 512 / 500 = 2.34375 uV.
+    scale, source = spikeglx.uv_per_digit(_np1_meta([500, 500, 1000]))
+
+    assert scale[:3] == pytest.approx([2.34375, 2.34375, 1.171875])
+    assert np.isnan(scale[3])                  # the SY word has no gain
+    assert "imroTbl" in source
+
+
+def test_the_nhp_long_probe_reads_the_same_table():
+    scale, _ = spikeglx.uv_per_digit(_np1_meta([500, 500], probe_type=1030))
+    assert scale[:2] == pytest.approx([2.34375, 2.34375])
+
+
+def test_an_lf_binary_gets_the_lf_gain_not_the_ap_one():
+    # In an .lf.bin saved as "all", row 0 is LF channel 0 -- scaling it with AP
+    # channel 0's gain would be off by the AP/LF gain ratio.
+    meta = _np1_meta([500, 500], lf_gain=250, sns="0,{n},1")
+    scale, _ = spikeglx.uv_per_digit(meta)
+    assert scale[:2] == pytest.approx([4.6875, 4.6875])
+
+
+def test_a_saved_subset_maps_each_row_to_its_own_channel():
+    # Rows of a subset recording are not channels 0..n-1: row 1 here is
+    # acquired channel 2, which is the one at gain 1000.
+    meta = _np1_meta([500, 500, 1000], saved="0,2,6", sns="2,0,1")
+    meta["nSavedChans"] = "3"
+    scale, _ = spikeglx.uv_per_digit(meta)
+    assert scale[:2] == pytest.approx([2.34375, 1.171875])
+    assert np.isnan(scale[2])
+
+
+def test_np2_gain_is_fixed_and_uses_its_own_range():
+    meta = {
+        "imDatPrb_type": "21", "acqApLfSy": "2,0,1", "snsApLfSy": "2,0,1",
+        "nSavedChans": "3", "imAiRangeMax": "0.5", "imMaxInt": "8192",
+        "~imroTbl": "(21,2)(0 1 0 0)(1 1 0 1)",
+    }
+    scale, _ = spikeglx.uv_per_digit(meta)
+    assert scale[:2] == pytest.approx([0.5 / 8192 / 80 * 1e6] * 2)
+
+
+def test_newer_metas_state_the_gain_outright():
+    meta = {
+        "imDatPrb_type": "2014", "acqApLfSy": "2,0,1", "snsApLfSy": "2,0,1",
+        "nSavedChans": "3", "imAiRangeMax": "0.62", "imMaxInt": "8192",
+        "imChan0apGain": "100",
+    }
+    scale, source = spikeglx.uv_per_digit(meta)
+    assert scale[:2] == pytest.approx([0.62 / 8192 / 100 * 1e6] * 2)
+    assert "imChan0apGain" in source
+
+
+def test_an_old_meta_without_imMaxInt_uses_spikeglxs_own_default():
+    meta = _np1_meta([500])
+    del meta["imMaxInt"]
+    assert spikeglx.uv_per_digit(meta)[0][0] == pytest.approx(2.34375)
+
+
+def test_a_probe_type_nobody_knows_is_nan_not_a_unit_gain():
+    # SpikeGLX's reader falls back to gain 1 here, which would report counts as
+    # microvolts off by a factor of hundreds and look perfectly plausible.
+    meta = {
+        "imDatPrb_type": "9999", "acqApLfSy": "2,0,1", "snsApLfSy": "2,0,1",
+        "nSavedChans": "3", "imAiRangeMax": "0.6", "imMaxInt": "512",
+        "~imroTbl": "(9999,2)(0 0)(1 0)",
+    }
+    scale, source = spikeglx.uv_per_digit(meta)
+    assert np.isnan(scale).all()
+    assert "unknown" in source
+
+
+def test_export_lfp_carries_the_lf_gain_when_the_meta_states_it(tmp_path):
+    import h5py
+
+    path = write_stream(tmp_path, name="run_g0_t0.imec0.lf.bin", n_chan=3, n_samples=100)
+    meta = _np1_meta([500, 500], lf_gain=250, sns="0,{n},1")
+    meta.update({"imSampRate": "2500", "typeThis": "imec", "fileSizeBytes": "0"})
+    spikeglx.meta_path_for(path).write_text(
+        "".join(f"{k}={v}\n" for k, v in meta.items()), encoding="utf-8"
+    )
+
+    out = spikeglx.export_lfp(path, tmp_path / "lfp")
+
+    with h5py.File(out, "r") as handle:
+        uv = handle["lfp/uv_per_digit"][()].ravel()
+    assert uv[:2] == pytest.approx([4.6875, 4.6875])
+    assert np.isnan(uv[2])
