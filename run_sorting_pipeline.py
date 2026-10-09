@@ -1,8 +1,11 @@
 #!/usr/bin/env python
 """Pipeline part 1 of 2: sorting, and nothing else.
 
-    python run_sorting_pipeline.py --config configs/Athos_2026_08_13.yaml \
-           --machine windows_rig
+    conda activate kilosort4
+    python run_sorting_pipeline.py --config Athos_2026_08_13
+
+``--config`` takes the session's name, looked up in ``configs/`` (a path works
+too), and ``--machine`` defaults to the platform, so on the rig that is all.
 
 One stage per stream: resolve the channel map, then hand it and the recording's
 binary to Kilosort4's own ``run_kilosort``. Nothing here reads a sync pulse or
@@ -32,7 +35,7 @@ from pathlib import Path
 # The shared CLI helpers live in tools/; _cli adds src/ itself.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 
-from _cli import Runner, build_parser, load  # noqa: E402
+from _cli import Runner, build_parser, load, shell_arg  # noqa: E402
 
 import spikesorting as ss  # noqa: E402
 
@@ -116,11 +119,12 @@ def main() -> int:
         for tag, probe_config in config.per_probe():
             if not probe_config.sorts_neuropixels:
                 continue
-            print(f"    phy template-gui {probe_config.paths.sorted_np}/params.py")
+            print(f"    phy template-gui {shell_arg(probe_config.paths.sorted_np / 'params.py')}")
         if config.sorts_blackrock:
-            print(f"    phy template-gui {config.paths.sorted_br}/params.py")
-        print("then:")
-        print(f"    python run_exporting_pipeline.py --config {args.config}")
+            print(f"    phy template-gui {shell_arg(config.paths.sorted_br / 'params.py')}")
+        print("then, back in the sorting env (the waveform export needs Kilosort):")
+        print("    conda activate kilosort4")
+        print(f"    python run_exporting_pipeline.py --config {shell_arg(args.config)}")
     return code
 
 

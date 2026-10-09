@@ -76,8 +76,8 @@ keys it answers:
 Two cheaper checks in the same spirit, neither of which needs a GPU:
 
 ```bash
-python tools/check_env.py --config configs/<session>.yaml   # env + inputs present
-python run_sorting_pipeline.py --config configs/<session>.yaml --dry-run
+python tools/check_env.py --config <session>               # env + inputs present
+python run_sorting_pipeline.py --config <session> --dry-run
 ```
 
 `--dry-run` resolves the channel map, names the binary and prints the exact
@@ -143,13 +143,18 @@ signal instead of moving it.
 
 ```bash
 conda activate kilosort4
-python run_sorting_pipeline.py --config configs/session_Porthos_1probe.yaml --machine windows_rig
+python run_sorting_pipeline.py --config session_Porthos_1probe
 ```
+
+`--config` takes the session's name: a name that is not a file in the current
+directory is looked up in `configs/`, and `.yaml` is optional — so the file stays
+in `configs/` and you never type the folder. `--machine` is not needed on the
+rig: it defaults to the platform (win32 → `windows_rig`).
 
 | flag | what it does |
 |---|---|
-| `--config` | the session YAML (a path, or a name resolved inside `configs/`) |
-| `--machine` | profile in `configs/machines/`; defaults to the platform |
+| `--config` | the session: a name looked up in `configs/` (`session_x`), or a path |
+| `--machine` | profile in `configs/machines/`; defaults to the platform, so omit it on the rig |
 | `--dry-run` | report the map, binary and settings; sort nothing |
 Don't use dry-run if you want to start real sorting.
 
@@ -182,9 +187,12 @@ phy template-gui <neuropixels_dir>/kilosort4/params.py
 For example, in the above case, it's 
 ```bash
 conda activate phy
-cd  Z:/Monkey Porthis/2026-08-13/Porthos_2026_08_13_g0/Porthos_2026_08_13_g0_imec0/kilosort4/
-phy template-gui params.py
+phy template-gui "Z:/Monkey Porthos/2026-08-13/Porthos_2026_08_13_g0/Porthos_2026_08_13_g0_imec0/kilosort4/params.py"
 ```
+
+Keep the double quotes whenever the path has a space (`Monkey Porthos`) —
+without them the shell splits it into two arguments. The command Step 1 prints
+is already quoted, so you can paste it as it is.
 
 
 Phy writes `cluster_group.tsv`, whose labels override Kilosort's own
@@ -192,8 +200,13 @@ Phy writes `cluster_group.tsv`, whose labels override Kilosort's own
 
 ## Step 3 — Time alignment and export
 
+Back in the **sorting** env — the waveform export reads the recording through
+Kilosort's own preprocessing, so it needs Kilosort, which the `phy` env does not
+have:
+
 ```bash
-python run_exporting_pipeline.py --config session_Porthos_1probe.yaml --machine windows_rig
+conda activate kilosort4
+python run_exporting_pipeline.py --config session_Porthos_1probe
 ```
 
 | stage | what it does |
@@ -203,7 +216,7 @@ python run_exporting_pipeline.py --config session_Porthos_1probe.yaml --machine 
 | `time_remapping` | coarse offset from the bursts, fine fit on the 1 Hz train, onto Blackrock time |
 | `validate_remapping` | the same map checked against the **held-out** burst onsets; exits non-zero past `alignment_tolerance_s` (1 ms), so it can gate a batch job |
 | `export_results` | aligned spike times, metrics, figures |
-| `waveforms` | a mean waveform per unit, measured from the binary the sorter read |
+| `waveforms` | a mean waveform per unit, in µV and centred on the spike, cut through Kilosort's own preprocessing from the binary it sorted (needs the `kilosort4` env) |
 
 
 
@@ -314,8 +327,10 @@ Off the rig — laptop, HPC, anything without a GPU — leave both extras off:
 pip install --no-build-isolation -e .
 ```
 
-That covers every stage except sorting: config, sync extraction, alignment,
-export, the tests. It needs no conda env at all, and no Kilosort.
+That covers config, sync extraction, alignment and the tests, with no conda env
+and no Kilosort. Sorting and the waveform export need Kilosort — the export reads
+the recording through Kilosort's own preprocessing — so run both drivers from the
+`kilosort4` env.
 
 `--no-build-isolation` keeps pip from building in a throwaway env that would
 re-resolve numpy and torch behind your back.
@@ -355,7 +370,7 @@ conda_envs:
 ```bash
 python tools/check_env.py                             # this machine
 python tools/check_env.py --machine windows_rig       # another machine's profile
-python tools/check_env.py --config configs/<s>.yaml   # also checks the inputs
+python tools/check_env.py --config <s>               # also checks the inputs
 ```
 
 It reports every gap with the stages that gap disables and the exact command that
@@ -371,8 +386,9 @@ no rig data needed. Run `notebooks/setup_demo_data.ipynb` once (~1 GB recording
 plus a channel map), then:
 
 ```bash
-python run_sorting_pipeline.py   --config configs/session_demo_1probe.yaml
-python run_exporting_pipeline.py --config configs/session_demo_1probe.yaml
+conda activate kilosort4
+python run_sorting_pipeline.py   --config session_demo_1probe
+python run_exporting_pipeline.py --config session_demo_1probe
 ```
 
 `configs/session_demo_1probe.yaml` is an ordinary session config. Nothing in the
@@ -394,7 +410,8 @@ python -m pytest tests/ -k "offset or drift" -q
 | Sorting (CUDA) | yes | yes | no |
 | CatGT / TPrime | yes | not assumed | no |
 | Sync extraction | CatGT + NumPy | NumPy fallback | NumPy fallback |
-| Tests, alignment, export | yes | yes | yes |
+| Tests, alignment | yes | yes | yes |
+| Export (needs Kilosort, for the waveforms) | yes | yes | in a `kilosort4` env |
 
 The stages are independent — sorting reads no edge files, extraction needs no
 sorter — which is what lets the GPU half go to a cluster while the CatGT/TPrime
@@ -404,11 +421,11 @@ extracts the pulses and leaves the export for later:
 
 ```bash
 # rig: CatGT and TPrime both live here; export_results finds no sorting yet
-python run_exporting_pipeline.py --config <s>.yaml --machine windows_rig
-# cluster: the GPU work, and the only stage that needs it
-python run_sorting_pipeline.py   --config <s>.yaml --machine hpc
-# rig: reads the .txt edge files plus spike_times.npy
-python run_exporting_pipeline.py --config <s>.yaml --machine windows_rig
+python run_exporting_pipeline.py --config <s>
+# cluster: the GPU work (Linux defaults to --machine hpc)
+python run_sorting_pipeline.py   --config <s>
+# rig, kilosort4 env: reads the .txt edge files plus spike_times.npy
+python run_exporting_pipeline.py --config <s>
 ```
 
 ---

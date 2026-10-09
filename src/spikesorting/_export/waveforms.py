@@ -1,10 +1,14 @@
-"""Per-spike waveform snippets, cut from the binary the sorter read.
+"""Per-spike waveform snippets, cut from the signal Kilosort sorted.
 
 Kilosort saves templates and per-spike amplitudes, but no snippets: the shape in
-``templates.npy`` is what it *fitted*, in whitened units, and it is not an
-average of anything. Everything here is measured from the raw samples instead, so
-a mean waveform comes out with a real amplitude -- the analogue of the
+``templates.npy`` is what it *fitted*, in whitened units. The snippets here are
+the recording as Kilosort's own reader preprocesses it -- the blocks arrive
+already through it (see ``pipeline._kilosort_blocks``) -- scaled to microvolts,
+so a mean waveform comes out with a real amplitude: the analogue of the
 ``_spikes_waveform.mat`` product Blackrock fills from the ``.nev``.
+
+Nothing here filters or imports Kilosort: this layer cuts, scales and averages
+whatever blocks it is handed, which is what keeps it testable without a sorter.
 
 **One sequential pass, never a seek per spike.** A million spikes is a million
 scattered reads into a file that may be 100 GB on a share, which is the failure
@@ -24,7 +28,6 @@ __all__ = [
     "plan_snippets",
     "accumulate",
     "SnippetResult",
-    "highpass",
     "snippet_regions",
 ]
 
@@ -65,7 +68,7 @@ class SnippetPlan:
 class SnippetResult:
     """Snippets plus the running mean and standard deviation per unit."""
 
-    snippets: np.ndarray                 # (width, n_spikes) int16
+    snippets: np.ndarray                 # (width, n_spikes) float32, uV or ADC
     unit_ids: np.ndarray                 # (n_units,)
     mean: np.ndarray                     # (width, n_units) float32
     std: np.ndarray                      # (width, n_units) float32
@@ -169,39 +172,26 @@ def plan_snippets(
     )
 
 
-def highpass(
-    samples: np.ndarray, fs: float, cutoff: float, order: int
-) -> np.ndarray:
-    """Zero-phase Butterworth high-pass along the sample axis. Pure.
-
-    **Zero-phase matters here specifically.** A causal filter delays the signal,
-    which would slide every waveform relative to the spike sample it is supposed
-    to be centred on -- a shift nothing downstream could detect. ``sosfiltfilt``
-    runs the filter forwards and backwards, so the delay cancels exactly.
-
-    ``samples`` is ``(n, n_chan)``; the filter runs down ``axis=0``.
-    """
-    from scipy.signal import butter, sosfiltfilt
-
-    nyquist = 0.5 * float(fs)
-    if not 0.0 < cutoff < nyquist:
-        raise ValueError(f"cutoff {cutoff} Hz is not below Nyquist ({nyquist} Hz)")
-    sos = butter(int(order), cutoff / nyquist, btype="highpass", output="sos")
-    return sosfiltfilt(sos, np.asarray(samples, dtype=np.float64), axis=0)
-
-
-def snippet_regions(plan: SnippetPlan, pad: int) -> list[tuple[int, int]]:
+def snippet_regions(
+    plan: SnippetPlan, pad: int, max_samples: int | None = None
+) -> list[tuple[int, int]]:
     """Merged ``(start, stop)`` sample ranges covering every snippet, plus ``pad``.
 
     The pad is signal read only to be **thrown away**: a filter applied to a bare
     2 ms window rings at both edges, and those edges are the snippet. Reading a
     few extra milliseconds either side and discarding them after filtering is
-    what makes the kept samples free of the transient. Phy and Kilosort both skip
-    this and filter the bare window.
+    what makes the kept samples free of the transient. Kilosort's own
+    ``mean_waveform`` skips this and filters the bare window.
 
     Overlapping ranges are merged, so a burst of spikes costs one read rather
     than one read each. Returned in increasing order, which is the access pattern
     a memmap over a network share needs.
+
+    ``max_samples`` splits a merged range longer than that into pieces that
+    overlap by a whole padded snippet, so every snippet still lies wholly inside
+    one piece after its pad is trimmed. Without it, measuring every spike merges
+    the whole recording into one range -- one block the size of the file.
+    :func:`accumulate` cuts a spike once, so the overlap counts nothing twice.
     """
     if plan.n_spikes == 0:
         return []
@@ -213,71 +203,77 @@ def snippet_regions(plan: SnippetPlan, pad: int) -> list[tuple[int, int]]:
             merged[-1] = (merged[-1][0], max(merged[-1][1], stop))
         else:
             merged.append((start, stop))
-    return merged
+    if max_samples is None:
+        return merged
+
+    overlap = plan.width + 2 * int(pad)
+    if max_samples <= overlap:
+        raise ValueError(
+            f"max_samples {max_samples} must exceed one padded snippet ({overlap})"
+        )
+    pieces: list[tuple[int, int]] = []
+    for start, stop in merged:
+        while stop - start > max_samples:
+            pieces.append((start, start + max_samples))
+            start += max_samples - overlap
+        pieces.append((start, stop))
+    return pieces
 
 
 def accumulate(
     plan: SnippetPlan,
     blocks: Iterator[tuple[int, np.ndarray]],
     uv_per_digit: float | np.ndarray = 1.0,
-    highpass_hz: float | None = None,
-    fs: float | None = None,
-    highpass_order: int = 3,
     pad: int = 0,
 ) -> SnippetResult:
     """Cut every snippet from ``blocks`` and build the per-unit mean. Pure.
 
     ``blocks`` yields ``(start_sample, samples)`` with ``samples`` shaped
-    ``(n, n_chan)`` -- the same contract :func:`spikesorting._io.spikeglx.
-    iter_channel` uses, so a memmap, a file reader or a synthetic array all work
-    and the tests need no recording.
+    ``(n, n_chan)``, already preprocessed, columns in binary-row order -- so a
+    Kilosort reader, a memmap or a synthetic array all work and the tests need
+    no recording and no sorter.
 
-    The mean and standard deviation are accumulated in microvolts as the pass
-    goes, from sums rather than by keeping the snippets around a second time.
+    Snippets, mean and standard deviation are all in microvolts (each spike
+    scaled by the gain of the channel it was cut on), so the mean is exactly the
+    mean of the snippets that are exported beside it.
 
-    With ``highpass_hz`` set, each block is filtered *once* on arrival and then
-    ``pad`` samples are dropped from each end, so every snippet cut from what is
-    left sits well inside the filtered signal rather than in its transient. Pair
-    it with the ranges :func:`snippet_regions` produces for the same ``pad`` and
-    the arithmetic lines up: a region begins ``pad`` before the first snippet it
-    holds, so trimming it leaves that snippet at the block's own edge.
+    ``pad`` samples are dropped from each end of every block before cutting: the
+    block was filtered whole, and its ends are where the filter's transient is.
+    Pair it with the ranges :func:`snippet_regions` produces for the same ``pad``
+    and the arithmetic lines up. A spike already cut from an earlier block is not
+    cut again, which is what lets overlapping pieces cover a long range.
     """
     width = plan.width
     unit_ids = np.unique(plan.unit_id) if plan.n_spikes else np.empty(0, dtype=np.int64)
     index_of = {int(u): i for i, u in enumerate(unit_ids)}
 
-    snippets = np.zeros((width, plan.n_spikes), dtype=np.int16)
+    snippets = np.zeros((width, plan.n_spikes), dtype=np.float32)
     total = np.zeros((width, unit_ids.size), dtype=np.float64)
     total_sq = np.zeros((width, unit_ids.size), dtype=np.float64)
     counts = np.zeros(unit_ids.size, dtype=np.int64)
     filled = np.zeros(plan.n_spikes, dtype=bool)
 
-    if highpass_hz is not None and not fs:
-        raise ValueError("highpass_hz needs fs to convert the cutoff")
-
     scale = np.asarray(uv_per_digit, dtype=np.float64)
     for start, block in blocks:
-        if highpass_hz is not None:
-            block = highpass(block, fs, highpass_hz, highpass_order)
-            if pad:
-                # Everything the filter's transient touched leaves here.
-                block = block[pad : block.shape[0] - pad]
-                start = start + pad
+        if pad:
+            # Everything the filter's transient touched leaves here.
+            block = block[pad : block.shape[0] - pad]
+            start = start + pad
         stop = start + block.shape[0]
         # Spikes whose whole window lies inside this block. The plan is sorted,
         # so this is a pair of binary searches rather than a scan.
         first = int(np.searchsorted(plan.sample, start + plan.before, side="left"))
         last = int(np.searchsorted(plan.sample, stop - plan.after, side="right"))
         for i in range(first, last):
+            if filled[i]:
+                continue                      # cut from the piece before
             begin = plan.sample[i] - plan.before - start
             cut = block[begin : begin + width, plan.channel[i]]
-            # int16 keeps the snippet array the size the export promises; the
-            # mean below uses the unrounded values, so rounding costs it nothing.
-            snippets[:, i] = np.rint(cut) if cut.dtype.kind == "f" else cut
             filled[i] = True
             unit = index_of[int(plan.unit_id[i])]
             gain = float(scale[plan.channel[i]]) if scale.ndim else float(scale)
             in_uv = cut.astype(np.float64) * gain
+            snippets[:, i] = in_uv
             total[:, unit] += in_uv
             total_sq[:, unit] += in_uv**2
             counts[unit] += 1
@@ -291,8 +287,9 @@ def accumulate(
     missing = int((~filled).sum())
     if missing:
         notes.append(
-            f"{missing} spike(s) were not covered by the blocks supplied and are "
-            "zero in the output"
+            f"{missing} spike(s) were not covered by the blocks supplied (or their "
+            "block was blanked as an artifact) and are zero in the snippets, "
+            "outside the mean"
         )
 
     with np.errstate(invalid="ignore", divide="ignore"):

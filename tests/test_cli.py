@@ -64,3 +64,20 @@ def test_overrides_reach_the_loaded_session_without_touching_the_file(tmp_path):
 
     # ...and the session file still says what the session wants.
     assert "export_lfp: false" in session.read_text(encoding="utf-8")
+
+
+def test_a_printed_path_survives_being_pasted_into_a_shell():
+    # The shares are named like "Z:/Monkey Athos/..."; unquoted, the space splits
+    # the phy command's one argument into two. Checked with a POSIX shell's own
+    # splitting -- cmd and PowerShell read double quotes the same way.
+    import shlex
+    from pathlib import Path
+
+    from _cli import shell_arg
+
+    path = Path("Z:/Monkey Athos/2026-08-13/kilosort4/params.py")
+    assert shlex.split(f"phy template-gui {shell_arg(path)}") == [
+        "phy", "template-gui", str(path),
+    ]
+    # ...and a path with nothing to protect is printed as it was typed.
+    assert shell_arg("session_x") == "session_x"

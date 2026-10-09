@@ -252,9 +252,10 @@ def export_sorted_spikes_mat(
         info.update({k: v for k, v in provenance.items() if isinstance(v, (str, float, int))})
 
     if waveforms is not None:
-        # Measured from the raw samples, so unlike the Kilosort template these
-        # carry an amplitude. The mean is always here; the snippets only when the
-        # session asked to keep them.
+        # Cut through Kilosort's own preprocessing and scaled to microvolts, so
+        # unlike the Kilosort template these carry an amplitude, and the mean is
+        # exactly the mean of the snippets. The mean is always here; the
+        # snippets only when the session asked to keep them.
         product["MeanWaveform"] = np.asarray(waveforms["mean"], dtype=np.float32).T
         product["StdWaveform"] = np.asarray(waveforms["std"], dtype=np.float32).T
         product["MeanWaveformUnit"] = str(waveforms.get("units", "ADC"))
@@ -264,10 +265,12 @@ def export_sorted_spikes_mat(
         if snippets is not None:
             # Given as (nSamp, nSpikes), which is the HDF5 shape; MATLAB reverses
             # it and reads nSpikes x nSamp -- the online container's orientation.
-            snippets = np.asarray(snippets)
+            # Single precision, in MeanWaveformUnit: they are preprocessed and
+            # scaled, so int16 counts would be both lossy and the wrong unit.
+            snippets = np.asarray(snippets, dtype=np.float32)
             product["Waveforms"] = Chunked(
                 shape=snippets.shape,
-                dtype=np.int16,
+                dtype=np.float32,
                 fill=lambda dataset, s=snippets: dataset.__setitem__(slice(None), s),
                 chunks=None,
                 compression="gzip",

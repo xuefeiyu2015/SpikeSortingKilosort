@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Pipeline part 2 of 2: everything that is not sorting.
 
-    python run_exporting_pipeline.py --config configs/Athos_2026_08_13.yaml \
-           --machine windows_rig
+    conda activate kilosort4
+    python run_exporting_pipeline.py --config Athos_2026_08_13
 
     extract_sync         the 1 Hz train and the 14 s coded burst, from each
                          stream, to its own sync/. CatGT where the machine has
@@ -34,9 +34,11 @@ Two flags, each overriding a session key for this run only:
     --export-lfp         export_lfp: true
     --export-waveforms   waveforms.export_snippets: true
 
-**Needs no GPU and no sorter** -- only the recordings' edge channels and the
-sorted output. It does use CatGT/TPrime where the machine has them, so this is
-the half that wants to run on the rig even when sorting went to a cluster.
+**Needs no GPU, but does need Kilosort installed**: the waveform export reads
+the recording through Kilosort's own preprocessing, so run this from the
+``kilosort4`` env, not the ``phy`` one curation used. It does use CatGT/TPrime
+where the machine has them, so this is the half that wants to run on the rig
+even when sorting went to a cluster.
 """
 
 from __future__ import annotations

@@ -42,6 +42,23 @@ def test_curated_labels_override_kilosort_labels(kilosort_results):
     assert results.labels[2] == "good"  # untouched, falls back to KSLabel
 
 
+def test_kilosorts_own_copy_of_cluster_group_is_not_a_curation(kilosort_results):
+    # A fresh Kilosort4 sort copies cluster_KSLabel.tsv to cluster_group.tsv,
+    # header and all, so the file exists with a KSLabel column and no `group`.
+    # That used to raise KeyError: 'group' on every export before Phy had saved,
+    # and must not be read as a curation either. Written byte for byte as
+    # Kilosort writes it on Windows, \r\n included.
+    ks_label = b"cluster_id\tKSLabel\r\n0\tmua\r\n1\tgood\r\n2\tgood\r\n"
+    (kilosort_results / "cluster_KSLabel.tsv").write_bytes(ks_label)
+    (kilosort_results / "cluster_group.tsv").write_bytes(ks_label)
+
+    results = curated.load_phy_results(kilosort_results)
+
+    assert results.curated is False
+    assert results.labels == {0: "mua", 1: "good", 2: "good"}
+    assert curated.select_units(results).tolist() == [0, 1, 2]
+
+
 def test_select_units_keeps_good_and_mua(kilosort_results):
     results = curated.load_phy_results(kilosort_results)
     assert curated.select_units(results).tolist() == [0, 1, 2]
@@ -192,7 +209,8 @@ def test_the_sorted_spikes_mat_mirrors_the_online_spike_container(tmp_path, kilo
     ``loader.py:1399-1423`` builds its online container as TimeStamps (seconds on
     the NSP clock), Channel, Unit and a ``(nSpikes, nSamp)`` int16 Waveforms. A
     sorted product that matches segments into trials with the same code, so these
-    are pinned rather than left to drift.
+    are pinned rather than left to drift. Only the snippets' type differs: they
+    are single-precision microvolts here, not the .nev's int16 counts.
     """
     import h5py
     import numpy as np
@@ -212,7 +230,7 @@ def test_the_sorted_spikes_mat_mirrors_the_online_spike_container(tmp_path, kilo
         "units": "microVolts",
         "window_ms": 2.0,
         # (nSamp, nSpikes) -- the HDF5 shape, which MATLAB reverses
-        "snippets": np.zeros((width, n_spikes), dtype=np.int16),
+        "snippets": np.zeros((width, n_spikes), dtype=np.float32),
     }
 
     path = export_sorted_spikes_mat(
@@ -227,7 +245,9 @@ def test_the_sorted_spikes_mat_mirrors_the_online_spike_container(tmp_path, kilo
         assert s["Channel"].shape == (n_spikes, 1)
         assert s["Unit"].shape == (n_spikes, 1)
         assert s["Waveforms"].shape == (width, n_spikes)   # MATLAB nSpikes x nSamp
-        assert s["Waveforms"].dtype == np.int16
+        # single-precision microvolts, not int16 counts: the snippets are
+        # Kilosort-preprocessed and scaled, so counts would be lossy and wrong
+        assert s["Waveforms"].dtype == np.float32
         assert s["MeanWaveform"].shape == (width, n_units)  # MATLAB nUnits x nSamp
         assert s["TimeRes"][()].ravel()[0] == phy.fs
         assert s["info"].attrs["MATLAB_class"] == b"struct"

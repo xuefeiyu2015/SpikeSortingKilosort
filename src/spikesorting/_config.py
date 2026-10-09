@@ -232,24 +232,14 @@ class MachineProfile:
 
 @dataclass(frozen=True)
 class WaveformSpec:
-    """How the waveform export cuts and filters snippets, for one system.
+    """How the waveform export cuts snippets, for one system.
 
     Every number the export uses lives here, so a session file is the whole
-    record of how a mean waveform was produced. It is a *per-system* block
-    because the one setting that matters most -- whether to high-pass -- depends
-    on which band the recording holds, and that differs by system and by rig.
-
-    **The high-pass is not optional cleanup; it is what makes the mean comparable
-    to anything else.** Kilosort sorts what its own 300 Hz pass produces and Phy
-    displays a 150 Hz-filtered trace, so a mean cut from a *broadband* recording
-    is neither. Blackrock ``.ns6`` is the broadband 30 kHz group, so it defaults
-    to 300 Hz. A Neuropixels AP binary arrives already high-passed on the probe,
-    so it defaults to ``None`` -- filtering it again would only cascade a second
-    rolloff onto the first.
-
-    Neither default is physics: NP 1.0's AP filter is a programmable imro bit and
-    a Blackrock sampling group's band is set in Central. Both are therefore
-    settable, which is the point of the block.
+    record of how a mean waveform was produced. It is a per-system block so the
+    two systems can be measured differently, but there is no filter setting in
+    it: snippets are read through Kilosort's own preprocessing -- its
+    ``highpass_cutoff`` and ``do_CAR``, from the ``kilosort:`` block -- so the
+    mean is cut from the signal Kilosort sorted, on either system.
     """
 
     #: Snippet width in milliseconds, centred on the spike sample.
@@ -258,16 +248,12 @@ class WaveformSpec:
     #: than over the spike list -- see ``_export.waveforms.plan_snippets``. None
     #: measures every spike, which is the only way to get an every-spike mean.
     max_spikes: int | None = 2000
-    #: Zero-phase Butterworth high-pass applied before cutting. None disables it.
-    highpass_hz: float | None = 300.0
-    #: Order of that filter.
-    highpass_order: int = 3
-    #: Extra signal read either side of a snippet and discarded after filtering,
-    #: so the kept samples carry no filter transient. Phy and Kilosort both skip
-    #: this and filter the bare window instead.
+    #: Extra signal read either side of a snippet and discarded after Kilosort's
+    #: filter has run, so the kept samples carry no filter transient. Kilosort's
+    #: own ``mean_waveform`` skips this and filters the bare window.
     filter_pad_ms: float = 10.0
     #: Whether the per-spike snippets are *kept*. The recording is read either
-    #: way -- the mean needs it -- so this only decides ~120 MB per million.
+    #: way -- the mean needs it -- so this only decides ~240 MB per million.
     export_snippets: bool = False
 
     @classmethod
@@ -279,19 +265,13 @@ class WaveformSpec:
         """
         data = data or {}
         max_spikes = data.get("max_spikes", default.max_spikes)
-        highpass = data.get("highpass_hz", default.highpass_hz)
         return cls(
             window_ms=float(data.get("window_ms", default.window_ms)),
             max_spikes=int(max_spikes) if max_spikes is not None else None,
-            highpass_hz=float(highpass) if highpass is not None else None,
-            highpass_order=int(data.get("highpass_order", default.highpass_order)),
             filter_pad_ms=float(data.get("filter_pad_ms", default.filter_pad_ms)),
             export_snippets=bool(data.get("export_snippets", default.export_snippets)),
         )
 
-
-#: The Neuropixels starting point: the AP band is high-passed on the probe.
-_NPX_WAVEFORMS = WaveformSpec(highpass_hz=None)
 
 
 @dataclass(frozen=True)
@@ -420,7 +400,7 @@ class NeuropixelsSpec:
     by_probe: dict[int, dict[str, Any]] = field(default_factory=dict)
     #: How the waveform export cuts and filters this system's snippets. The AP
     #: band arrives high-passed from the probe, so the default does not filter.
-    waveforms: WaveformSpec = field(default_factory=lambda: _NPX_WAVEFORMS)
+    waveforms: WaveformSpec = field(default_factory=WaveformSpec)
 
     def binaries_by_probe(self) -> dict[int, Path]:
         """``{probe: AP binary}`` for everything this block names.
@@ -466,7 +446,7 @@ class NeuropixelsSpec:
                 int(probe): dict(block or {})
                 for probe, block in (data.get("by_probe") or {}).items()
             },
-            waveforms=WaveformSpec.from_dict(data.get("waveforms"), _NPX_WAVEFORMS),
+            waveforms=WaveformSpec.from_dict(data.get("waveforms"), WaveformSpec()),
         )
 
 
@@ -1025,6 +1005,12 @@ _RENAMED = {"cmp_file": "probe_file"}
 _RETIRED = {
     "export_groups": "the export now keeps every cluster not labelled noise in "
     "Phy, so there is nothing to choose -- delete the line",
+    "highpass_hz": "waveforms are now read through Kilosort's own preprocessing, which "
+    "filters at kilosort.highpass_cutoff, so there is no separate filter "
+    "-- delete the line",
+    "highpass_order": "waveforms are now read through Kilosort's own preprocessing, which "
+    "filters at kilosort.highpass_cutoff, so there is no separate filter "
+    "-- delete the line",
 }
 
 

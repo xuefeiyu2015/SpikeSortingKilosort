@@ -6,7 +6,7 @@ like ``make_probe.py``. Run it straight after cloning onto a new PC:
 
     python scripts/check_env.py
     python scripts/check_env.py --machine windows_rig
-    python scripts/check_env.py --config configs/Athos.yaml   # also checks inputs
+    python scripts/check_env.py --config Athos                # also checks inputs
     python scripts/check_env.py --sorting-env ks5             # check another env
     python scripts/check_env.py --sorting-env ks5 --sorting-env-path /opt/envs
 

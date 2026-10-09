@@ -11,8 +11,9 @@
 # data, so no Blackrock stage runs and there is nothing to align against.
 #
 # Set it up once with notebooks/setup_demo_data.ipynb, then:
-#   python run_sorting_pipeline.py   --config configs/session_demo_1probe.yaml
-#   python run_exporting_pipeline.py --config configs/session_demo_1probe.yaml
+#   conda activate kilosort4
+#   python run_sorting_pipeline.py   --config session_demo_1probe
+#   python run_exporting_pipeline.py --config session_demo_1probe
 
 # What to do with it. The demo sorts, and exports what it sorted; there is no LF
 # band beside a bare .bin to export, so that stays off. These keys are the only
