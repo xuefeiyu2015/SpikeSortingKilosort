@@ -38,6 +38,20 @@ def default_machine() -> str:
     return "hpc"
 
 
+def shell_arg(path: str | Path) -> str:
+    """``path`` ready to paste into a shell: double-quoted when it has a space.
+
+    The shares are named like ``Z:/Monkey Athos/...``, and an unquoted space
+    splits one path into two arguments. Double quotes are the one form that
+    cmd, PowerShell and bash all read as a single argument, so every path a
+    driver prints as a command to copy goes through here. A path with no
+    whitespace is printed as it is, so ``--config session_x`` reads back the
+    way it was typed.
+    """
+    text = str(path)
+    return f'"{text}"' if any(c.isspace() for c in text) else text
+
+
 def build_parser(description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(

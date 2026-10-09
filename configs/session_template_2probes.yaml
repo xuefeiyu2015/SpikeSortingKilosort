@@ -8,15 +8,18 @@
 # test pins that: the two resolve to the same session apart from those, so a
 # value tuned in one and not the other fails rather than drifting.
 #
-#   python run_sorting_pipeline.py --config configs/session_template_2probes.yaml \
-#          --machine windows_rig
+#   conda activate kilosort4
+#   python run_sorting_pipeline.py --config <session>
+#     <session> is this file's name, e.g. session_Porthos_1probe: no folder, no
+#     .yaml. --machine defaults to the platform, so the rig needs none.
 # curation in phy -- once per probe, and the sorting driver prints both lines
 #   conda activate phy
 #   cd <neuropixels_dir>/<run>_imec0/kilosort4/   (the directory holding params.py)
 #   phy template-gui params.py
-# after curation
-#  python run_exporting_pipeline.py --config configs/session_template_2probes.yaml \
-#          --machine windows_rig
+# after curation -- back in kilosort4: the waveform export reads the recording
+# through Kilosort's own preprocessing
+#   conda activate kilosort4
+#   python run_exporting_pipeline.py --config <session>
 #
 # --probe 1 on either driver runs one of them; without it, both run.
 #

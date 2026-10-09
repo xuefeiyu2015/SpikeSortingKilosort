@@ -2,15 +2,18 @@
 # so no second clock and nothing to align. Copy and edit.
 # Copies are gitignored; this template is tracked.
 #
-#   python run_sorting_pipeline.py --config configs/session_template_utah_only.yaml \
-#          --machine windows_rig
+#   conda activate kilosort4
+#   python run_sorting_pipeline.py --config <session>
+#     <session> is this file's name, e.g. session_Porthos_1probe: no folder, no
+#     .yaml. --machine defaults to the platform, so the rig needs none.
 # curation in phy
 #   conda activate phy
 #   cd <blackrock_dir>/kilosort4/        (the directory holding params.py)
 #   phy template-gui params.py
-# after curation
-#  python run_exporting_pipeline.py --config configs/session_template_utah_only.yaml \
-#          --machine windows_rig
+# after curation -- back in kilosort4: the waveform export reads the recording
+# through Kilosort's own preprocessing
+#   conda activate kilosort4
+#   python run_exporting_pipeline.py --config <session>
 # A new session means editing three values: the Blackrock directory and its two
 # filenames. Each block puts what changes first and
 # fences off what does not. Below a fence are the defaults -- change one only if
