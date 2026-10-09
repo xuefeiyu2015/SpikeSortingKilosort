@@ -823,9 +823,10 @@ def _unit_page_data(
 ) -> list[dict[str, Any]]:
     """What ``plots.save_unit_pages`` draws, one dict per unit, ordered by channel.
 
-    The waveform is the *measured* mean (+/- SEM) from :func:`export_waveforms`
-    where it ran, in uV or ADC as it says; otherwise Kilosort's template on the
-    peak channel, in whitened units -- the shape is right, the scale is not.
+    The waveform is exactly what ``sorted_spikes.mat`` holds: ``MeanWaveform``
+    +/- ``StdWaveform`` from :func:`export_waveforms`, in uV or ADC as it says.
+    A unit with no measured mean gets no waveform rather than Kilosort's
+    template, so the figure can never show a shape the ``.mat`` does not.
     """
     from ._export import final, metrics
 
@@ -847,7 +848,7 @@ def _unit_page_data(
     for unit_id in unit_ids:
         unit_id = int(unit_id)
         times = spike_times_s[unit_id] if spike_times_s is not None else phy.times_for(unit_id)
-        template, channel = final.mean_template_waveform(phy, unit_id)
+        _template, channel = final.mean_template_waveform(phy, unit_id)
         isi_counts, isi_edges = metrics.compute_isi_histogram(metrics.compute_isi(times))
         centers, rate = metrics.compute_firing_rate(
             times, duration, bin_s=max(1.0, duration / 100), start_s=start
@@ -876,15 +877,9 @@ def _unit_page_data(
         if mean is not None and unit_id in column and counts[column[unit_id]] > 0:
             i = column[unit_id]
             unit["waveform"] = mean[:, i]
-            unit["waveform_sem"] = std[:, i] / np.sqrt(counts[i])
+            unit["waveform_std"] = std[:, i]
             unit["waveform_t_ms"] = t_measured
             unit["waveform_units"] = measured.get("mean_units", "ADC")
-        else:
-            unit["waveform"] = template
-            unit["waveform_t_ms"] = (
-                np.arange(template.size) / phy.fs * 1000.0 if template.size else None
-            )
-            unit["waveform_units"] = "template (a.u.)"
         units.append(unit)
 
     units.sort(key=lambda u: (u["channel"] if u["channel"] is not None else np.inf,
@@ -933,7 +928,7 @@ def _write_summary(
                 "n_dropped": measured["n_dropped"],
                 "snippets_kept": measured["snippets_kept"],
                 "units": measured.get("mean_units"),
-                "highpass_hz": measured.get("highpass_hz"),
+                "preprocessing": {"by": "kilosort", **measured.get("preprocessing", {})},
                 "timebase": measured.get("timebase"),
             }
             if measured
@@ -1408,7 +1403,7 @@ def validate_remapping(
 
 
 # ----------------------------------------------------------------------------
-# Step 6a: waveforms from the raw samples
+# Step 6a: waveforms through Kilosort's own preprocessing
 # ----------------------------------------------------------------------------
 
 
@@ -1451,37 +1446,107 @@ def _resolve_spike_seconds(
     return None, "sorter", None
 
 
-def _binary_blocks(
-    path: Path,
-    n_chan: int,
-    overlap: int,
-    block_samples: int = 2_000_000,
-    regions: list[tuple[int, int]] | None = None,
-):
-    """Walk a flat int16 recording in order, yielding ``(start, samples)``.
+_NEEDS_KILOSORT = (
+    "the waveform export reads the recording through Kilosort's own "
+    "preprocessing, so it needs kilosort installed -- run "
+    "run_exporting_pipeline.py in the sorting env (kilosort4)"
+)
 
-    Without ``regions``, consecutive blocks overlap by ``overlap`` samples so a
-    spike whose window straddles a boundary is still wholly inside one of them.
 
-    With ``regions`` -- the merged ranges from ``_export.waveforms.snippet_regions``
-    -- only those are yielded, still in increasing offset order. That is the
-    difference between reading the whole file and reading the parts that hold a
-    spike being measured: filtering forces a block to be *materialised*, so
-    walking the file in 2M-sample steps would turn today's sparse read into a
-    full one. Sequential order is kept either way, because it is what a share
-    rewards.
+def _kilosort_preprocessing(results_dir: Path) -> dict[str, Any]:
+    """What Kilosort's reader will do to the signal, read from ``ops.npy``.
 
-    Row ranges of a memmap are contiguous reads; it is *column* slices that turn
-    into scattered page faults, which is the distinction :mod:`._io.spikeglx` was
-    rewritten around.
+    Recorded in ``waveforms.mat`` so the file says which band its means are in.
+    Also the first thing the waveform export touches that needs Kilosort, so a
+    missing install fails here, with the fix, before any recording is opened.
     """
-    data = np.memmap(path, dtype=np.int16, mode="r").reshape(-1, n_chan)
-    if regions is not None:
-        for start, stop in regions:
-            yield start, data[start:stop]
-        return
-    for start in range(0, data.shape[0], block_samples):
-        yield start, data[start : start + block_samples + overlap]
+    try:
+        import kilosort  # noqa: F401  (unpickling ops.npy needs it, and torch)
+    except ImportError as error:
+        raise ImportError(_NEEDS_KILOSORT) from error
+    for name in ("ops.npy", "whitening_mat_inv.npy"):
+        if not (results_dir / name).exists():
+            raise FileNotFoundError(
+                f"{results_dir / name} is missing; Kilosort writes it with every "
+                "sort, and the waveform export rebuilds Kilosort's reader from it"
+            )
+    ops = np.load(results_dir / "ops.npy", allow_pickle=True).item()
+    settings = ops.get("settings", {})
+    return {
+        "highpass_cutoff": float(settings.get("highpass_cutoff", np.nan)),
+        "do_CAR": bool(ops.get("do_CAR", settings.get("do_CAR", True))),
+        "invert_sign": bool(ops.get("invert_sign", settings.get("invert_sign", False))),
+        "artifact_threshold": float(
+            ops.get("artifact_threshold", settings.get("artifact_threshold", np.inf))
+        ),
+    }
+
+
+#: Longest range handed to Kilosort's reader at once: one of its batches. A
+#: merged range of dense spikes is split into pieces this long, so memory stays
+#: bounded however many spikes are measured.
+_KILOSORT_BLOCK_SAMPLES = 60_000
+
+
+def _kilosort_blocks(
+    results_dir: Path,
+    binary: Path,
+    n_chan: int,
+    regions: list[tuple[int, int]],
+    device: str,
+):
+    """Read ``regions`` through Kilosort's own reader, as ``(start, samples)``.
+
+    **This is Kilosort's preprocessing, not ours.** ``bfile_from_ops`` rebuilds
+    the reader the sort used from ``ops.npy`` -- per-channel mean, the median
+    across channels when ``do_CAR`` is set, its FFT high-pass at
+    ``highpass_cutoff``, whitening -- and ``whitening_mat_inv.npy`` undoes the
+    whitening, exactly as ``kilosort.data_tools.get_spike_waveforms`` does. What
+    comes back is ADC counts of the signal Kilosort sorted. Drift correction is
+    *not* in it: Kilosort applies that only batch by batch during sorting, and
+    its reader leaves it out for any other slice.
+
+    Three things differ from ``get_spike_waveforms``, all on purpose:
+
+    - **absolute samples.** ``spike_times.npy`` counts from the start of the
+      file, but the reader counts from ``tmin`` when the sort had a window. Each
+      range is shifted by the reader's ``imin`` -- Kilosort's own helper does not,
+      and cuts the wrong samples whenever ``tmin`` is set.
+    - **binary-row columns.** The reader returns the probe's channels in
+      ``chanMap`` order; they are put back at their rows of the binary, so a
+      snippet is indexed by the same channel number the export reports and the
+      gain is looked up by. Rows the probe does not use are NaN.
+    - **blanked batches are skipped.** With ``artifact_threshold`` set the reader
+      returns zeros for a batch it rejects; averaging those in would pull the
+      mean toward zero, so the range is skipped and its spikes left uncut.
+
+    Imports Kilosort and torch, which is why it is the one function here that
+    does; the cutting and averaging in ``_export.waveforms`` stay pure.
+    """
+    import torch
+    from kilosort import io as ks_io
+
+    ops = ks_io.load_ops(results_dir / "ops.npy", device=torch.device(device))
+    bfile = ks_io.bfile_from_ops(ops, filename=str(binary), device=torch.device(device))
+    unwhiten = np.load(results_dir / "whitening_mat_inv.npy")
+    # The reader opens a fresh memmap on every slice unless it is handed one --
+    # one file open per range, which over a share is most of the cost.
+    bfile.file_object = np.memmap(
+        binary, mode="r", dtype=bfile.dtype, shape=(bfile.total_samples, bfile.n_chan_bin)
+    )
+    rows = np.asarray(ops["probe"]["chanMap"], dtype=np.int64)
+    imin = int(bfile.imin)
+    for start, stop in regions:
+        local = bfile[start - imin : stop - imin].cpu().numpy()   # (n_probe, n)
+        if not local.any():
+            log.warning(
+                "samples %d-%d were blanked by Kilosort's artifact_threshold; "
+                "their spikes are left out of the mean", start, stop,
+            )
+            continue
+        block = np.full((local.shape[1], n_chan), np.nan, dtype=np.float32)
+        block[:, rows] = (unwhiten @ local).T
+        yield start, block
 
 
 def _uv_per_digit(
@@ -1507,11 +1572,11 @@ def _uv_per_digit(
             return (
                 np.full(n_chan, np.nan),
                 f"gain unknown: {meta_file.name} lists {scale.size} channels "
-                f"but the sorting read {n_chan}; snippets stay raw int16",
+                f"but the sorting read {n_chan}; snippets stay in ADC",
             )
         return (
             np.full(n_chan, np.nan),
-            f"gain unknown: no {meta_file.name} beside the binary; snippets stay raw int16",
+            f"gain unknown: no {meta_file.name} beside the binary; snippets stay in ADC",
         )
 
     if system == "blackrock" and config.blackrock.spike_file is not None:
@@ -1541,36 +1606,37 @@ def _uv_per_digit(
                 )
     return (
         np.full(n_chan, np.nan),
-        "gain unknown: the .ns6 header did not open; snippets stay raw int16",
+        "gain unknown: the .ns6 header did not open; snippets stay in ADC",
     )
 
 
 def export_waveforms(
     config: SessionConfig, system: str = "blackrock"
 ) -> dict | None:
-    """Measure every spike's waveform from the binary the sorter read.
+    """Measure every spike's waveform through Kilosort's own preprocessing.
 
     Kilosort saves templates, not snippets: ``templates.npy`` is the shape it
     *fitted*, in whitened units, so nothing else in the export has a real
-    amplitude. These are measured from the raw samples, and their per-unit mean
-    does.
+    amplitude. These snippets are the signal Kilosort sorted -- read with the
+    reader the sort used, whitening undone (see :func:`_kilosort_blocks`) --
+    centred on the spike sample and scaled to microvolts by each channel's gain.
 
     **The mean is always computed; only the snippets are optional.** Reading the
     recording is the expense and it is the same single pass either way, so
-    ``waveforms.export_snippets`` decides whether the ~120 MB per million
-    snippets is *kept*, not whether the recording is read.
+    ``waveforms.export_snippets`` decides whether the snippets are *kept*, not
+    whether the recording is read.
 
     **How much of the recording is read is bounded by the spikes, not the file.**
     ``waveforms.max_spikes`` caps the spikes per unit -- chosen uniformly over the
     session, so the subset spans it rather than clustering where the unit was
-    busiest -- and only the ranges holding those spikes are read. Everything else
-    about the cut lives in the same per-system ``waveforms:`` block: the window,
-    the high-pass, and the pad that keeps the filter's transient out of the kept
-    samples.
+    busiest -- and only the ranges holding those spikes are read, each padded by
+    ``filter_pad_ms`` so Kilosort's filter transient is cut away before a
+    snippet is taken.
 
-    Returns ``None`` when there is no sorting to read, or when the binary the
-    sorting was made from is not reachable -- the rest of the export is still
-    worth having, so that is a warning rather than a failure.
+    Needs Kilosort installed, and raises without it. Returns ``None`` when there
+    is no sorting to read, or when the binary the sorting was made from is not
+    reachable -- the rest of the export is still worth having, so that is a
+    warning rather than a failure.
     """
     _check(system)
     if not config.has_data(system):
@@ -1599,6 +1665,7 @@ def export_waveforms(
             binary,
         )
         return None
+    preprocessing = _kilosort_preprocessing(results_dir)
 
     phy = load_phy_results(results_dir)
     unit_ids = select_units(phy)
@@ -1616,9 +1683,9 @@ def export_waveforms(
     before = width // 2
     after = width - before
     n_samples = binary.stat().st_size // (2 * n_chan)
-    # Read either side of each snippet and throw it away, so the samples that are
-    # kept carry no filter transient. Nothing to pad when nothing is filtered.
-    pad = int(round(wf.filter_pad_ms * fs / 1000.0)) if wf.highpass_hz else 0
+    # Read either side of each snippet and throw it away, so the samples that
+    # are kept carry no transient from Kilosort's filter.
+    pad = int(round(wf.filter_pad_ms * fs / 1000.0))
 
     plan = plan_snippets(
         phy.spike_samples,
@@ -1630,7 +1697,7 @@ def export_waveforms(
         max_per_unit=wf.max_spikes,
         margin=pad,
     )
-    regions = snippet_regions(plan, pad)
+    regions = snippet_regions(plan, pad, max_samples=_KILOSORT_BLOCK_SAMPLES + 2 * pad)
     scale, scale_note = _uv_per_digit(config, system, n_chan, binary)
     # An unknown gain must not destroy the mean: the shape and the relative
     # amplitude are still worth having. uv_per_digit stays NaN so nobody
@@ -1641,21 +1708,20 @@ def export_waveforms(
     known = bool(used.size) and not np.isnan(scale[used]).any()
     mean_units = "uV" if known else "ADC"
     band = (
-        f"high-passed at {wf.highpass_hz:g} Hz" if wf.highpass_hz else "unfiltered"
+        f"Kilosort's preprocessing: {preprocessing['highpass_cutoff']:g} Hz FFT "
+        f"high-pass, CAR {'on' if preprocessing['do_CAR'] else 'off'}, whitening "
+        "undone, no drift correction"
     )
     log.info(
         "cutting %d of %d spikes (%d samples each) from %s in %d range(s); "
-        "%s, %s, mean in %s",
+        "%s; %s, in %s",
         plan.n_spikes, plan.n_available, width, binary.name, len(regions),
         band, scale_note, mean_units,
     )
     result = accumulate(
         plan,
-        _binary_blocks(binary, n_chan, width, regions=regions),
+        _kilosort_blocks(results_dir, binary, n_chan, regions, config.machine.device),
         uv_per_digit=scale if known else 1.0,
-        highpass_hz=wf.highpass_hz,
-        fs=fs,
-        highpass_order=wf.highpass_order,
         pad=pad,
     )
     for note in result.notes:
@@ -1699,19 +1765,20 @@ def export_waveforms(
                 "max_spikes_per_unit": (
                     float(wf.max_spikes) if wf.max_spikes is not None else np.nan
                 ),
-                "highpass_hz": (
-                    float(wf.highpass_hz) if wf.highpass_hz is not None else np.nan
-                ),
-                "highpass_order": float(wf.highpass_order),
-                "filter_pad_ms": float(wf.filter_pad_ms) if pad else 0.0,
+                "preprocessing": "kilosort",
+                "highpass_cutoff_hz": preprocessing["highpass_cutoff"],
+                "do_CAR": float(preprocessing["do_CAR"]),
+                "invert_sign": float(preprocessing["invert_sign"]),
+                "filter_pad_ms": float(wf.filter_pad_ms),
                 "source": str(binary),
                 "kept_snippets": float(bool(wf.export_snippets)),
                 "note": (
-                    "snippet is int16, nSamples x nSpikes in MATLAB, and is "
-                    "present only when waveforms.export_snippets is true; mean "
-                    f"and std are nSamples x nUnits in {mean_units}, measured "
-                    "from the recording rather than from Kilosort's templates. "
-                    f"Signal was {band}. "
+                    f"snippet is single-precision {mean_units}, nSamples x nSpikes "
+                    "in MATLAB, and is present only when waveforms.export_snippets "
+                    f"is true; mean and std are nSamples x nUnits in {mean_units} "
+                    "and are exactly the mean and std of those snippets. Each "
+                    "snippet is centred on its spike sample. Signal is "
+                    f"{band}. "
                     + (
                         f"Measured from {plan.n_spikes} of {plan.n_available} "
                         "spikes, sampled uniformly over the recording rather "
@@ -1737,7 +1804,7 @@ def export_waveforms(
         "window_ms": float(wf.window_ms),
         "samples_before": int(before),
         "fs": fs,
-        "highpass_hz": wf.highpass_hz,
+        "preprocessing": preprocessing,
         "timebase": timebase,
         "result": result,
     }

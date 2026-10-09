@@ -1332,37 +1332,39 @@ def _load_session(tmp_path: Path, body: str):
     )
 
 
-def test_each_system_states_its_own_waveform_band(tmp_path):
-    # The one waveform setting that is not the same everywhere. .ns6 is the
-    # broadband 30 kHz group, so its mean has to be filtered to be the signal
-    # Kilosort sorted; a Neuropixels AP binary arrives high-passed from the
-    # probe, and filtering it again would cascade a second rolloff onto the
-    # first. Both are recording-time settings, so both are stated, not derived.
+def test_the_waveform_filter_settings_are_retired_with_the_reason(tmp_path):
+    # Waveforms are read through Kilosort's own preprocessing now, so a session
+    # copy on the rig still naming a filter must say so rather than load: the
+    # number it states would be read by nobody.
+    for key in ("highpass_hz: 300", "highpass_order: 3"):
+        with pytest.raises(ValueError, match="retired: waveforms are now read through Kilosort"):
+            _load_session(
+                tmp_path,
+                f"blackrock:\n  spike_file: '/b/HUB.ns6'\n  waveforms:\n    {key}\n",
+            )
+
+
+def test_both_systems_start_from_the_same_waveform_settings(tmp_path):
+    # With the filter gone, nothing about the cut depends on the system.
     session = _load_session(
         tmp_path,
         "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/HUB.ns6'\n"
         "neuropixels:\n  bin_file: '/n/x.bin'\n",
     )
-    assert session.waveforms_for("blackrock").highpass_hz == 300.0
-    assert session.waveforms_for("neuropixels").highpass_hz is None
-
-    # ...and everything else about the two matches, so the band is the only
-    # thing that differs by system rather than by taste.
-    br = cfg.replace(session.waveforms_for("blackrock"), highpass_hz=None)
-    assert br == session.waveforms_for("neuropixels")
+    assert session.waveforms_for("blackrock") == session.waveforms_for("neuropixels")
 
 
 def test_a_waveforms_block_changes_only_the_keys_it_names(tmp_path):
-    # Stating one key must not silently reset the other five to the field
-    # defaults -- which for Neuropixels would switch its filter back on.
+    # Stating one key must not silently reset the others to the field defaults.
     session = _load_session(
         tmp_path,
-        "neuropixels:\n  bin_file: '/n/x.bin'\n  waveforms:\n    max_spikes: 50\n",
+        "neuropixels:\n  bin_file: '/n/x.bin'\n  waveforms:\n    max_spikes: 50\n"
+        "    window_ms: 3.0\n",
     )
     wf = session.waveforms_for("neuropixels")
     assert wf.max_spikes == 50
-    assert wf.highpass_hz is None                  # not reset to the 300 default
-    assert wf.window_ms == 2.0
+    assert wf.window_ms == 3.0
+    assert wf.filter_pad_ms == 10.0
 
 
 def test_null_is_how_a_session_asks_for_every_spike(tmp_path):
@@ -1395,8 +1397,8 @@ def test_a_flag_override_reaches_both_systems(tmp_path):
     overridden = cfg.with_overrides(session, waveforms={"export_snippets": True})
     assert overridden.waveforms_for("blackrock").export_snippets
     assert overridden.waveforms_for("neuropixels").export_snippets
-    # ...and it changes nothing else, the band included.
-    assert overridden.waveforms_for("neuropixels").highpass_hz is None
+    # ...and it changes nothing else.
+    assert overridden.waveforms_for("neuropixels").max_spikes == 2000
 
 
 # ---------------------------------------------------------------------------

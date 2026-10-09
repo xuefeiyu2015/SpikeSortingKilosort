@@ -55,19 +55,19 @@ def plot_isi_histogram(
 def plot_mean_waveform(
     waveform: np.ndarray,
     t_ms: np.ndarray | None = None,
-    sem: np.ndarray | None = None,
+    band: np.ndarray | None = None,
     ax: Any = None,
     color: str = "black",
     label: str | None = None,
 ) -> Any:
-    """Mean waveform, optionally with a +/-1 SEM band."""
+    """Mean waveform, optionally with a +/- ``band`` around it (std, SEM, ...)."""
     ax = _axes(ax)
     waveform = np.asarray(waveform)
     x = np.arange(waveform.size) if t_ms is None else np.asarray(t_ms)
     ax.plot(x, waveform, color=color, linewidth=1.5, label=label)
-    if sem is not None:
-        sem = np.asarray(sem)
-        ax.fill_between(x, waveform - sem, waveform + sem, color=color, alpha=0.2, linewidth=0)
+    if band is not None:
+        band = np.asarray(band)
+        ax.fill_between(x, waveform - band, waveform + band, color=color, alpha=0.2, linewidth=0)
     ax.set_xlabel("time (ms)" if t_ms is not None else "sample")
     ax.set_ylabel("amplitude")
     return ax
@@ -108,11 +108,19 @@ def plot_amplitudes(
     return ax
 
 
+def _no_waveform(ax: Any) -> None:
+    """Say so in the panel: there is no MeanWaveform for this unit in the .mat."""
+    ax.text(0.5, 0.5, "no measured waveform", ha="center", va="center",
+            transform=ax.transAxes, fontsize=7, color="0.4")
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
 def plot_unit_summary(unit: dict[str, Any], fig: Any = None) -> Any:
     """Four-panel summary for one unit.
 
     ``unit`` carries precomputed arrays: ``waveform``, optional ``waveform_t_ms``
-    and ``waveform_sem``, ``isi_counts`` + ``isi_edges_ms``, ``rate_centers_s`` +
+    and ``waveform_std``, ``isi_counts`` + ``isi_edges_ms``, ``rate_centers_s`` +
     ``rate_hz``, optional ``amp_times_s`` + ``amplitudes``, plus ``unit_id``,
     ``label`` and ``channel`` for the title.
     """
@@ -124,9 +132,11 @@ def plot_unit_summary(unit: dict[str, Any], fig: Any = None) -> Any:
 
     if unit.get("waveform") is not None and np.size(unit["waveform"]):
         plot_mean_waveform(
-            unit["waveform"], unit.get("waveform_t_ms"), unit.get("waveform_sem"), ax=axes[0, 0]
+            unit["waveform"], unit.get("waveform_t_ms"), unit.get("waveform_std"), ax=axes[0, 0]
         )
-    axes[0, 0].set_title("mean waveform (best channel)")
+    else:
+        _no_waveform(axes[0, 0])
+    axes[0, 0].set_title("mean waveform +/- std (best channel)")
 
     if unit.get("isi_counts") is not None:
         plot_isi_histogram(unit["isi_counts"], unit["isi_edges_ms"], ax=axes[0, 1])
@@ -149,7 +159,7 @@ def plot_unit_summary(unit: dict[str, Any], fig: Any = None) -> Any:
 
 
 #: The columns of a unit page, left to right, and each one's heading.
-UNIT_PANELS = ("mean waveform", "ISI", "firing rate", "amplitude stability")
+UNIT_PANELS = ("mean waveform +/- std", "ISI", "firing rate", "amplitude stability")
 
 
 def _unit_class(unit: dict[str, Any]) -> str:
@@ -208,10 +218,12 @@ def plot_unit_page(units: list[dict[str, Any]], rows: int, fig: Any = None) -> A
 
         if unit.get("waveform") is not None and np.size(unit["waveform"]):
             plot_mean_waveform(
-                unit["waveform"], unit.get("waveform_t_ms"), unit.get("waveform_sem"),
+                unit["waveform"], unit.get("waveform_t_ms"), unit.get("waveform_std"),
                 ax=axes[0],
             )
             axes[0].set_ylabel(unit.get("waveform_units", "amplitude"))
+        else:
+            _no_waveform(axes[0])
         if unit.get("isi_counts") is not None:
             plot_isi_histogram(unit["isi_counts"], unit["isi_edges_ms"], ax=axes[1])
         if unit.get("rate_centers_s") is not None:

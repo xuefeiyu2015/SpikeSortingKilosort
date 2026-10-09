@@ -104,6 +104,15 @@ class PhyResults:
         return self.channel_map[peak]
 
 
+def _label_column(path: Path) -> str | None:
+    """The value column a label ``.tsv`` declares in its header, or None."""
+    if not path.exists():
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        header = handle.readline().rstrip("\r\n").split("\t")
+    return header[1] if len(header) > 1 else None
+
+
 def _read_label_tsv(path: Path, value_column: str | None = None) -> dict[int, str]:
     if not path.exists():
         return {}
@@ -143,7 +152,15 @@ def load_phy_results(results_dir: str | Path, fs: float | None = None) -> PhyRes
     spike_samples = np.load(results_dir / "spike_times.npy").reshape(-1)
     spike_clusters = np.load(results_dir / "spike_clusters.npy").reshape(-1)
 
-    curated_labels = _read_label_tsv(results_dir / "cluster_group.tsv", "group")
+    # Kilosort4 writes cluster_group.tsv too -- a copy of cluster_KSLabel.tsv,
+    # header and all -- and Phy rewrites it with a `group` column on save. Only
+    # Phy's version is a curation; Kilosort's copy says nothing the KSLabel file
+    # does not, and reading it as curated would mark every fresh sort curated.
+    curated_labels = (
+        _read_label_tsv(results_dir / "cluster_group.tsv", "group")
+        if _label_column(results_dir / "cluster_group.tsv") == "group"
+        else {}
+    )
     auto_labels = _read_label_tsv(results_dir / "cluster_KSLabel.tsv", "KSLabel")
     labels = {**auto_labels, **curated_labels}
 

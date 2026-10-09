@@ -59,6 +59,29 @@ def _probe_json(path: Path, n: int = 4) -> Path:
     return path
 
 
+@pytest.fixture
+def raw_reader(monkeypatch):
+    """Stand in for Kilosort's reader with the raw samples, unprocessed.
+
+    The waveform export reads through Kilosort's own preprocessing, which needs
+    kilosort and torch; these tests are about what is cut, scaled and written,
+    so they get the binary as it is. The reader glue itself is tested against
+    a fake ``kilosort.io`` below.
+    """
+
+    def blocks(results_dir, binary, n_chan, regions, device):
+        data = np.memmap(binary, dtype=np.int16, mode="r").reshape(-1, n_chan)
+        for start, stop in regions:
+            yield start, np.asarray(data[start:stop], dtype=np.float32)
+
+    monkeypatch.setattr(
+        pipeline, "_kilosort_preprocessing",
+        lambda results_dir: {"highpass_cutoff": 300.0, "do_CAR": True,
+                             "invert_sign": False, "artifact_threshold": np.inf},
+    )
+    monkeypatch.setattr(pipeline, "_kilosort_blocks", blocks)
+
+
 # ---------------------------------------------------------------------------
 # The surface
 # ---------------------------------------------------------------------------
@@ -472,9 +495,9 @@ def test_a_utah_export_lands_on_the_nsp_clock(tmp_path, kilosort_results):
     assert info["nsp_time_map"]["drift_ppm"] == pytest.approx(-4.5, abs=0.2)
 
 
-def test_the_waveform_export_cuts_snippets_from_the_sorted_binary(tmp_path, kilosort_results):
+def test_the_waveform_export_cuts_snippets_from_the_sorted_binary(tmp_path, kilosort_results, raw_reader):
     # The one export that reads the recording again. Kilosort saves no snippets,
-    # so a waveform with a real amplitude can only come from the raw samples.
+    # so a waveform with a real amplitude can only come from the samples.
     import shutil
 
     import h5py
@@ -517,7 +540,7 @@ def test_the_waveform_export_cuts_snippets_from_the_sorted_binary(tmp_path, kilo
         width = int(round(2.0 * 30000.0 / 1000.0))     # 60 samples
         # MATLAB sees nSamples x nSpikes, so on disk it is (nSpikes, nSamples).
         assert wf["snippet"].shape == (out["n_spikes"], width)
-        assert wf["snippet"].attrs["MATLAB_class"] == b"int16"
+        assert wf["snippet"].attrs["MATLAB_class"] == b"single"
         assert wf["mean"].shape[1] == width
         # each unit was cut on its own peak channel, not one shared channel
         assert set(np.unique(wf["channel"][()])) == {2.0, 5.0, 7.0}
@@ -534,7 +557,7 @@ def test_the_waveform_export_cuts_snippets_from_the_sorted_binary(tmp_path, kilo
 
 
 def test_a_neuropixels_mean_is_in_microvolts_from_the_meta_beside_the_binary(
-    tmp_path, kilosort_results
+    tmp_path, kilosort_results, raw_reader
 ):
     # The gain is in the .meta beside the binary the sorter read, so the mean
     # can be scaled to microvolts -- per channel, since NP 1.0 sets it that way.
@@ -589,10 +612,10 @@ def test_a_neuropixels_mean_is_in_microvolts_from_the_meta_beside_the_binary(
 
 
 def test_the_mean_is_measured_even_when_the_snippets_are_not_kept(
-    tmp_path, kilosort_results
+    tmp_path, kilosort_results, raw_reader
 ):
     # Reading the recording is the expense, and it is the same single pass either
-    # way -- so export_waveforms decides whether the ~120 MB of snippets is kept,
+    # way -- so export_waveforms decides whether the snippets are kept,
     # not whether a real mean waveform exists at all.
     import shutil
 
@@ -641,7 +664,7 @@ def test_the_mean_is_measured_even_when_the_snippets_are_not_kept(
         assert handle["waveforms/snippet"].shape[0] == kept["n_spikes"]
 
 
-def test_an_unreachable_binary_costs_the_waveforms_and_nothing_else(tmp_path, kilosort_results):
+def test_an_unreachable_binary_costs_the_waveforms_and_nothing_else(tmp_path, kilosort_results, raw_reader):
     # A re-export where the recording is not mounted must still produce the rest
     # of the bundle rather than failing for want of a waveform.
     import shutil
@@ -1421,3 +1444,145 @@ def test_a_resort_clears_phys_state_from_the_previous_one(tmp_path):
         "spike_times.npy", "sync_edges.txt",
     ]
     assert (final / "cluster_group.tsv").read_text() == "new"
+
+
+def test_the_figure_draws_exactly_the_mean_the_mat_holds(tmp_path, kilosort_results, raw_reader):
+    # units.pdf and sorted_spikes.mat must never disagree: the figure draws
+    # MeanWaveform +/- StdWaveform, and a unit with no measured mean gets no
+    # waveform at all rather than Kilosort's template in whitened units.
+    import shutil
+
+    from spikesorting._export import final
+    from spikesorting._export.curated import load_phy_results, select_units
+
+    session = _session(
+        tmp_path,
+        "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/HUB.ns6'\n",
+    )
+    sorted_dir = session.paths.sorted_for("blackrock")
+    sorted_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(kilosort_results, sorted_dir, dirs_exist_ok=True)
+    n_chan = 8
+    spikes = np.load(sorted_dir / "spike_times.npy")
+    binary = tmp_path / "br" / "HUB.bin"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(0)
+    binary.write_bytes(
+        rng.integers(-20, 20, size=(int(spikes.max()) + 5000, n_chan), dtype=np.int16).tobytes()
+    )
+    (sorted_dir / "run_info.json").write_text(
+        json.dumps({"binary": str(binary), "settings": {"n_chan_bin": n_chan, "fs": 30000.0}}),
+        encoding="utf-8",
+    )
+
+    phy = load_phy_results(sorted_dir)
+    unit_ids = select_units(phy)
+    table = final.build_unit_table(phy, unit_ids, None)
+    measured = ss.export_waveforms(session, "blackrock")
+    in_mat = pipeline._waveform_fields(measured)
+
+    drawn = pipeline._unit_page_data(phy, unit_ids, None, table, measured)
+    column = {int(u): i for i, u in enumerate(in_mat["unit_ids"])}
+    assert drawn
+    for unit in drawn:
+        i = column[unit["unit_id"]]
+        np.testing.assert_array_equal(unit["waveform"], in_mat["mean"][:, i])
+        np.testing.assert_array_equal(unit["waveform_std"], in_mat["std"][:, i])
+        assert unit["waveform_units"] == in_mat["units"]
+
+    for unit in pipeline._unit_page_data(phy, unit_ids, None, table, None):
+        assert unit.get("waveform") is None
+
+
+def _fake_kilosort_reader(monkeypatch, data, chan_map, imin, scale=2.0):
+    """A ``kilosort.io`` whose reader 'whitens' by ``scale`` and counts from ``imin``.
+
+    Enough of ``BinaryFiltered`` to check the glue around it: what the reader
+    does to the signal is Kilosort's business, where its samples land is ours.
+    """
+    import sys
+    import types
+
+    class Tensor:
+        def __init__(self, array):
+            self.array = array
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.array
+
+    class Reader:
+        def __init__(self):
+            self.imin = imin
+            self.dtype = np.int16
+            self.total_samples, self.n_chan_bin = data.shape
+            self.file_object = None
+
+        def __getitem__(self, index):
+            rows = data[index.start + self.imin : index.stop + self.imin, chan_map]
+            return Tensor(scale * rows.T.astype(np.float32))   # (n_probe, n)
+
+    io = types.SimpleNamespace(
+        load_ops=lambda path, device=None: {"probe": {"chanMap": chan_map}},
+        bfile_from_ops=lambda ops, filename=None, device=None: Reader(),
+    )
+    monkeypatch.setitem(sys.modules, "kilosort", types.SimpleNamespace(io=io))
+    monkeypatch.setitem(sys.modules, "kilosort.io", io)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(device=lambda d: d))
+
+
+def test_kilosorts_reader_is_read_at_absolute_samples_in_binary_row_order(
+    tmp_path, monkeypatch
+):
+    # spike_times.npy counts from the start of the file but Kilosort's reader
+    # counts from tmin, and returns the probe's channels in chanMap order. The
+    # glue undoes both, and the whitening, so a block is indexed exactly like
+    # the binary -- by absolute sample and by binary row.
+    n, n_chan = 2_000, 5
+    data = np.arange(n * n_chan, dtype=np.int16).reshape(n, n_chan)
+    binary = tmp_path / "x.bin"
+    data.tofile(binary)
+    chan_map = np.array([3, 0, 4])                    # rows 1 and 2 not on the probe
+    np.save(tmp_path / "whitening_mat_inv.npy", np.eye(3) / 2.0)   # undoes the 2x
+    _fake_kilosort_reader(monkeypatch, data, chan_map, imin=300)
+
+    blocks = list(pipeline._kilosort_blocks(tmp_path, binary, n_chan, [(400, 450)], "cpu"))
+
+    [(start, block)] = blocks
+    assert start == 400
+    assert block.shape == (50, n_chan)
+    np.testing.assert_array_equal(block[:, chan_map], data[400:450, chan_map])
+    assert np.isnan(block[:, [1, 2]]).all()           # not on the probe: NaN, not 0
+
+
+def test_a_block_kilosort_blanked_is_skipped_not_averaged(tmp_path, monkeypatch):
+    # With artifact_threshold set, the reader returns zeros for a rejected
+    # batch. Zeros averaged in would pull every mean toward zero.
+    n, n_chan = 1_000, 2
+    data = np.ones((n, n_chan), dtype=np.int16)
+    data[100:200] = 0                                 # what a blanked batch looks like
+    binary = tmp_path / "x.bin"
+    data.tofile(binary)
+    np.save(tmp_path / "whitening_mat_inv.npy", np.eye(2))
+    _fake_kilosort_reader(monkeypatch, data, np.array([0, 1]), imin=0, scale=1.0)
+
+    starts = [
+        start for start, _ in pipeline._kilosort_blocks(
+            tmp_path, binary, n_chan, [(100, 200), (300, 400)], "cpu"
+        )
+    ]
+
+    assert starts == [300]
+
+
+def test_the_waveform_export_without_kilosort_says_how_to_get_it(tmp_path, monkeypatch):
+    # The export reads through Kilosort's preprocessing, so it needs kilosort --
+    # and must say so, with the env to run in, before opening any recording.
+    import sys
+
+    monkeypatch.setitem(sys.modules, "kilosort", None)
+
+    with pytest.raises(ImportError, match="kilosort4"):
+        pipeline._kilosort_preprocessing(tmp_path)

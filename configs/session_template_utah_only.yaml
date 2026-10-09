@@ -62,10 +62,8 @@ blackrock:
   waveforms:             # the mean-waveform export -- see "Waveforms"
     window_ms: 2.0       # snippet width, centred on the spike sample
     max_spikes: 2000     # per unit, spread over the session; null = every spike
-    highpass_hz: 300     # .ns6 is broadband, so measure the band Kilosort sorted
-    highpass_order: 3    # zero-phase Butterworth
-    filter_pad_ms: 10.0  # read either side and discard, so no filter transient
-    export_snippets: false   # keep per-spike snippets: ~120 MB per million
+    filter_pad_ms: 10.0  # read either side and discard: no Kilosort filter transient
+    export_snippets: false   # keep per-spike snippets: ~240 MB per million
 
 # The pulse train itself -- one signal, both systems see it. How each system
 # *reads* it is wiring, and stays in that system's block above.
@@ -219,24 +217,19 @@ kilosort: {}
 #   the same axis as spike times and event markers. `timebase` says which one is
 #   real: "stream" until the map is fitted, "blackrock" after.
 #
+#   Waveforms are cut through KILOSORT'S OWN PREPROCESSING: the reader the sort
+#   used is rebuilt from ops.npy (its highpass_cutoff, CAR when do_CAR is set,
+#   whitening -- then undone), so the mean is cut from the signal Kilosort
+#   sorted, on either system, and there is no separate filter to set here. Each
+#   snippet is centred on its spike sample and scaled to microvolts by its
+#   channel's gain (.ns6 header / .meta). Drift correction is not applied:
+#   Kilosort does that only batch by batch while sorting. The export therefore
+#   needs kilosort installed -- run it in the sorting env.
+#
 #   waveforms.export_snippets decides whether the per-spike snippets are KEPT,
 #   not whether the recording is read: the mean waveform is measured either way,
-#   so MeanWaveform always has a real amplitude. Keeping the snippets costs
-#   ~120 MB per million spikes. Note that this is the only waveform with physical
-#   units -- mean_template_waveform.npy is Kilosort's fitted template, in
-#   whitened units.
-#
-#   waveforms.highpass_hz is per system because it describes the BAND THAT WAS
-#   RECORDED, and that is a setting rather than a property. Kilosort sorts what
-#   its own 300 Hz pass produces and Phy displays a 150 Hz-filtered trace, so a
-#   mean cut from a broadband recording is neither of them -- every snippet rides
-#   on the LFP, and averaging does not remove it. Blackrock .ns6 is the broadband
-#   30 kHz group (Central's high-pass is applied on the way to the .nev, not to
-#   the .ns6), so it filters. A Neuropixels AP binary arrives already high-passed
-#   on the probe, so it does not: filtering again would cascade a second rolloff.
-#   Neither is guaranteed -- NP 1.0's AP filter is a programmable imro bit, NP 2.0
-#   has no AP/LF split at all, and a Blackrock sampling group's band is set in
-#   Central -- so check the recording rather than trusting the default.
+#   so MeanWaveform always has a real amplitude. Snippets are single-precision
+#   microvolts, ~240 MB per million spikes.
 #
 #   waveforms.max_spikes caps how many spikes each unit contributes, chosen
 #   uniformly over the RECORDING rather than over the spike list: every k-th
