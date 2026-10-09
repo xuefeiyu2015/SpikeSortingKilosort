@@ -587,6 +587,8 @@ def sort_with_kilosort(
     work_dir = _work_dir(config, system) or final_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     log.info("sorting %s -> %s", binary.summary(), work_dir)
+    if work_dir == final_dir:  # sorting in place: clear before Kilosort writes
+        _clear_previous_curation(final_dir)
 
     try:
         _ops, spike_times, clusters, *_rest = run_kilosort(
@@ -599,6 +601,7 @@ def sort_with_kilosort(
             **kwargs,
         )
         if work_dir != final_dir:
+            _clear_previous_curation(final_dir)
             _publish(work_dir, final_dir)
             _repoint_params(final_dir, binary)
     finally:
@@ -649,6 +652,28 @@ def _work_dir(config: SessionConfig, system: str) -> Path | None:
     if system == "neuropixels" and config.probe_tag is not None:
         name = f"{name}_{config.probe_tag}"
     return Path(config.cache_dir) / name
+
+
+_PREVIOUS_CURATION = (".phy", "phy.log", "cluster_*.tsv")
+
+
+def _clear_previous_curation(final_dir: Path) -> None:
+    """Remove what Phy left from a previous sort before a new one lands here.
+
+    Kilosort overwrites its own arrays but knows nothing of Phy's: the ``.phy/``
+    cache (spikes-per-cluster and cluster stats for the *old* cluster ids),
+    ``cluster_info.tsv`` and any label column added during curation. A re-sort
+    merged on top of them fails to open in Phy, and the labels would name
+    clusters that no longer exist. Every ``cluster_*.tsv`` goes, including
+    Kilosort's own, because the new sort writes its own set.
+    """
+    for pattern in _PREVIOUS_CURATION:
+        for path in final_dir.glob(pattern):
+            log.info("removing %s from the previous sort", path)
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
 
 
 def _publish(work_dir: Path, final_dir: Path) -> None:
