@@ -1398,3 +1398,26 @@ def test_a_dat_path_kilosort_wrote_as_a_list_is_still_understood(tmp_path):
     _repoint_params(tmp_path, Binary(source, 385, 30000.0))
 
     assert (tmp_path / "params.py").read_text(encoding="utf-8") == original
+
+
+def test_a_resort_clears_phys_state_from_the_previous_one(tmp_path):
+    final, work = tmp_path / "kilosort4", tmp_path / "cache"
+    (final / ".phy").mkdir(parents=True)
+    (final / ".phy" / "spikes_per_cluster.pkl").write_bytes(b"old")
+    for name in ("phy.log", "cluster_info.tsv", "cluster_group.tsv", "cluster_mylabel.tsv"):
+        (final / name).write_text("old")
+    for name in ("nsp_time_map.json", "sync_edges.txt"):  # not the sorting's
+        (final / name).write_text("keep")
+    (final / "export").mkdir()
+    work.mkdir()
+    (work / "spike_times.npy").write_text("new")
+    (work / "cluster_group.tsv").write_text("new")
+
+    pipeline._clear_previous_curation(final)
+    pipeline._publish(work, final)
+
+    assert sorted(p.name for p in final.iterdir()) == [
+        "cluster_group.tsv", "export", "nsp_time_map.json",
+        "spike_times.npy", "sync_edges.txt",
+    ]
+    assert (final / "cluster_group.tsv").read_text() == "new"
