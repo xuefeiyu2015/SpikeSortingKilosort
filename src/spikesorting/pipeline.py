@@ -1459,15 +1459,36 @@ def _binary_blocks(
         yield start, data[start : start + block_samples + overlap]
 
 
-def _uv_per_digit(config: SessionConfig, system: str, n_chan: int) -> tuple[np.ndarray, str]:
+def _uv_per_digit(
+    config: SessionConfig, system: str, n_chan: int, binary: Path
+) -> tuple[np.ndarray, str]:
     """Per-channel microvolts per ADC unit, and a note on where it came from.
 
-    Blackrock records the gain per channel and neo reports it, so those snippets
-    come out in real microvolts. SpikeGLX keeps the neural gain in ``~imroTbl``,
-    which nothing here parses, so those come back NaN rather than 1.0 -- a NaN
-    propagates loudly through any scaling, where a fabricated unit gain would
-    quietly produce plausible, wrong amplitudes.
+    Blackrock records the gain per channel and neo reports it. SpikeGLX keeps it
+    in the ``.meta`` beside ``binary`` -- the file the sorter read -- and
+    :func:`spikeglx.uv_per_digit` reads it from there. Anything unknown comes
+    back NaN rather than 1.0 -- a NaN propagates loudly through any scaling,
+    where a fabricated unit gain would quietly produce plausible, wrong
+    amplitudes.
     """
+    if system == "neuropixels":
+        from ._io import spikeglx
+
+        meta_file = spikeglx.meta_path_for(binary)
+        if meta_file.exists():
+            scale, source = spikeglx.uv_per_digit(spikeglx.read_meta(meta_file))
+            if scale.size == n_chan:
+                return scale, f"{source}, from {meta_file.name}"
+            return (
+                np.full(n_chan, np.nan),
+                f"gain unknown: {meta_file.name} lists {scale.size} channels "
+                f"but the sorting read {n_chan}; snippets stay raw int16",
+            )
+        return (
+            np.full(n_chan, np.nan),
+            f"gain unknown: no {meta_file.name} beside the binary; snippets stay raw int16",
+        )
+
     if system == "blackrock" and config.blackrock.spike_file is not None:
         from ._io import blackrock
 
@@ -1495,9 +1516,7 @@ def _uv_per_digit(config: SessionConfig, system: str, n_chan: int) -> tuple[np.n
                 )
     return (
         np.full(n_chan, np.nan),
-        "gain unknown -- SpikeGLX keeps it in ~imroTbl, which is not parsed here, "
-        "and a Blackrock header that will not open says nothing either; snippets "
-        "stay raw int16 and the mean is in those units",
+        "gain unknown: the .ns6 header did not open; snippets stay raw int16",
     )
 
 
@@ -1587,12 +1606,14 @@ def export_waveforms(
         margin=pad,
     )
     regions = snippet_regions(plan, pad)
-    scale, scale_note = _uv_per_digit(config, system, n_chan)
+    scale, scale_note = _uv_per_digit(config, system, n_chan, binary)
     # An unknown gain must not destroy the mean: the shape and the relative
-    # amplitude are still worth having, and on SpikeGLX the gain is never known
-    # here. uv_per_digit stays NaN so nobody mistakes ADC units for microvolts,
-    # and mean_units says which one the mean is in.
-    known = not np.isnan(scale).all()
+    # amplitude are still worth having. uv_per_digit stays NaN so nobody
+    # mistakes ADC units for microvolts, and mean_units says which one the mean
+    # is in. Every unit's channel must be known for "uV" -- a mean half in
+    # microvolts and half in counts would be worse than either.
+    used = np.unique(plan.channel) if plan.n_spikes else np.empty(0, dtype=np.int64)
+    known = bool(used.size) and not np.isnan(scale[used]).any()
     mean_units = "uV" if known else "ADC"
     band = (
         f"high-passed at {wf.highpass_hz:g} Hz" if wf.highpass_hz else "unfiltered"

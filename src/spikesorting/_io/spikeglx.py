@@ -35,6 +35,7 @@ __all__ = [
     "iter_channel",
     "read_sy_word",
     "raw_to_volts",
+    "uv_per_digit",
     "RunLayout",
     "run_layout",
     "probe_number",
@@ -276,8 +277,8 @@ def raw_to_volts(info: StreamInfo, raw: np.ndarray, gain: float = 1.0) -> np.nda
     """Convert raw int16 to volts using the stream's range/max-int meta keys.
 
     ``gain`` is 1 for auxiliary analog inputs such as the OneBox XA channels that
-    carry the 14 s coded burst. Neural channels need their per-channel gain from
-    ``~imroTbl``, which this function does not read.
+    carry the 14 s coded burst. Neural channels need their per-channel gain,
+    which :func:`uv_per_digit` reads from the meta.
     """
     range_key, max_key = _SCALE_KEYS[info.stream_type]
     if range_key not in info.meta or max_key not in info.meta:
@@ -285,6 +286,100 @@ def raw_to_volts(info: StreamInfo, raw: np.ndarray, gain: float = 1.0) -> np.nda
     ai_range = float(info.meta[range_key])
     max_int = float(info.meta[max_key])
     return np.asarray(raw, dtype=np.float64) * (ai_range / max_int) / gain
+
+
+#: Probe types whose ``~imroTbl`` carries a gain per channel, as
+#: ``(chan bank ref apGain lfGain apFilt)``. The list is SpikeGLX's own
+#: (``readSGLX.ChanGainsIM``); type 0 is the 3B NP 1.0, 1030 the NHP long probe.
+_NP1_IMRO_TYPES = frozenset({0, 1020, 1030, 1100, 1120, 1121, 1122, 1123, 1200, 1300})
+#: Probe types with one fixed AP gain and no LF band.
+_FIXED_AP_GAIN = {21: 80.0, 24: 80.0, 2013: 100.0}
+
+
+def _saved_channels(meta: dict[str, str], n_saved: int) -> np.ndarray:
+    """Acquired-channel index of each row in the binary.
+
+    ``snsSaveChanSubset`` is ``all`` or inclusive ranges such as ``0:191,384``;
+    a recording that saved a subset has rows that are not channels 0..n-1.
+    """
+    subset = meta.get("snsSaveChanSubset", "all").strip()
+    if subset in ("", "all"):
+        return np.arange(n_saved)
+    chans: list[int] = []
+    for part in subset.split(","):
+        lo, _, hi = part.partition(":")
+        chans.extend(range(int(lo), int(hi or lo) + 1))
+    return np.asarray(chans, dtype=np.int64)
+
+
+def _imec_gains(meta: dict[str, str], n_ap: int, n_lf: int) -> tuple[np.ndarray, np.ndarray, str]:
+    """Per-acquired-channel (AP gain, LF gain, where they came from).
+
+    Follows SpikeGLX's reference reader, except that a probe it does not know
+    gets NaN rather than its fallback of 1.0: a unit gain would turn ADC counts
+    into "microvolts" that are wrong by a factor of hundreds and look fine.
+    """
+    probe_type = int(meta.get("imDatPrb_type", "0"))
+    imro = meta.get("~imroTbl", meta.get("imroTbl", ""))
+    entries = [e.strip("( ") for e in imro.split(")") if e.strip("( ")]
+    ap = np.full(n_ap, np.nan)
+    lf = np.full(n_lf, np.nan)
+
+    if probe_type in _NP1_IMRO_TYPES and len(entries) > n_ap:
+        fields = [e.split() for e in entries[1 : n_ap + 1]]
+        if all(len(f) >= 5 for f in fields):
+            ap[:] = [float(f[3]) for f in fields]
+            lf[: min(n_lf, n_ap)] = [float(f[4]) for f in fields[: min(n_lf, n_ap)]]
+            return ap, lf, f"per channel from ~imroTbl (probe type {probe_type})"
+    if "imChan0apGain" in meta:
+        ap[:] = float(meta["imChan0apGain"])
+        if n_lf and "imChan0lfGain" in meta:
+            lf[:] = float(meta["imChan0lfGain"])
+        return ap, lf, f"imChan0apGain (probe type {probe_type})"
+    if probe_type == 1110 and entries:
+        header = entries[0].split(",")
+        ap[:], lf[:] = float(header[3]), float(header[4])
+        return ap, lf, "from the ~imroTbl header (probe type 1110)"
+    if probe_type in _FIXED_AP_GAIN:
+        ap[:] = _FIXED_AP_GAIN[probe_type]
+        return ap, lf, f"fixed for probe type {probe_type}"
+    return ap, lf, f"unknown for probe type {probe_type}"
+
+
+def uv_per_digit(meta: dict[str, str]) -> tuple[np.ndarray, str]:
+    """Microvolts per ADC count for each row of an imec binary, and its source.
+
+    One value per *saved* channel, in binary row order, so it indexes exactly
+    like the samples it scales. ``snsApLfSy`` says how many saved rows are AP,
+    LF and SY, so the same call serves an ``.ap.bin`` and an ``.lf.bin``. The SY
+    word, and any channel whose gain the meta does not state, is NaN -- never a
+    guessed 1.0 or 500.
+
+    ``uV = 1e6 * imAiRangeMax / imMaxInt / gain``. ``imMaxInt`` defaults to 512
+    when absent, as SpikeGLX's own reader does: older NP 1.0 metas omit it.
+    """
+    n_saved = int(meta["nSavedChans"])
+    out = np.full(n_saved, np.nan)
+    if not all(k in meta for k in ("imAiRangeMax", "acqApLfSy", "snsApLfSy")):
+        return out, "gain unknown: the meta has no imAiRangeMax/acqApLfSy/snsApLfSy"
+
+    n_ap, n_lf, _ = (int(x) for x in meta["acqApLfSy"].split(","))
+    saved_ap, saved_lf, _ = (int(x) for x in meta["snsApLfSy"].split(","))
+    ap, lf, source = _imec_gains(meta, n_ap, n_lf)
+    volts_per_count = float(meta["imAiRangeMax"]) / float(meta.get("imMaxInt", "512"))
+
+    explicit = meta.get("snsSaveChanSubset", "all").strip() not in ("", "all")
+    chans = _saved_channels(meta, n_saved)
+    for row in range(min(saved_ap + saved_lf, n_saved)):
+        if row < saved_ap:
+            gains, acq = ap, chans[row] if explicit else row
+        else:
+            # LF channels are numbered after the AP ones in an explicit subset.
+            gains = lf
+            acq = chans[row] - n_ap if explicit else row - saved_ap
+        if 0 <= acq < gains.size and gains[acq] > 0:
+            out[row] = 1e6 * volts_per_count / gains[acq]
+    return out, f"gain {source}"
 
 
 #: A SpikeGLX AP/LF filename: ``<run>_g<gate>_t<trigger>.imec<probe>.ap.bin``.
@@ -487,12 +582,11 @@ def export_lfp(
     Streamed, never held: an hour of 385-channel LF band is ~7 GB, so the file is
     filled a chunk at a time and gzipped on the way in.
 
-    Samples stay **int16**, as recorded. Converting to microvolts needs a
-    per-channel gain from ``~imroTbl`` that nothing here parses, so
-    ``uv_per_digit`` is NaN rather than invented: a NaN propagates loudly through
-    any scaling, where a fabricated 1.0 would quietly produce plausible, wrong
-    numbers. ``ai_range_max`` and ``max_int`` are carried so the conversion can be
-    finished downstream.
+    Samples stay **int16**, as recorded. ``uv_per_digit`` scales each channel to
+    microvolts, read from the meta by :func:`uv_per_digit`; a channel whose gain
+    the meta does not state is NaN rather than invented, since a NaN propagates
+    loudly through any scaling where a fabricated 1.0 would quietly produce
+    plausible, wrong numbers. ``ai_range_max`` and ``max_int`` are carried too.
 
     This is **extraction**, so it runs beside the other extraction and needs
     nothing but the recording -- on the rig, straight after the session. The axis
@@ -536,6 +630,11 @@ def export_lfp(
             )
 
     range_key, max_key = _SCALE_KEYS[info.stream_type]
+    scale = (
+        uv_per_digit(info.meta)[0]
+        if info.stream_type == "imec" and "nSavedChans" in info.meta
+        else np.full(n_chan, np.nan)
+    )
 
     fs_out = info.fs / decimate
     nan = float("nan")
@@ -561,7 +660,7 @@ def export_lfp(
                 "n_samples": float(n_out),
                 "n_chan": float(n_chan),
                 "channel_ids": np.arange(n_chan, dtype=np.float64),
-                "uv_per_digit": np.full(n_chan, np.nan),
+                "uv_per_digit": scale,
                 "ai_range_max": float(info.meta.get(range_key, "nan")),
                 "max_int": float(info.meta.get(max_key, "nan")),
                 "sy_index": float(info.sy_index if info.sy_index is not None else -1),
@@ -572,8 +671,8 @@ def export_lfp(
                     "t0 + k/fs on this stream's own clock, and at "
                     "t0_blackrock + k/fs_blackrock on Blackrock's when timebase "
                     "is 'blackrock' (NaN when no time map had been fitted yet). "
-                    "volts = value * ai_range_max / max_int / gain, and the "
-                    "per-channel gain lives in the meta's ~imroTbl"
+                    "microvolts = value * uv_per_digit, per channel; NaN "
+                    "where the meta states no gain (and on the SY word)"
                 ),
             }
         },
