@@ -77,11 +77,59 @@ neuropixels:
   # read back off this filename -- see "Where the SpikeGLX run went".
   bin_file: "{neuropixels_dir}/Athos_2026_08_13_g0_t0.imec0.ap.bin"
   lf_file: null          # only when the LF band is not beside the AP one
-  kilosort:
-    bad_channels: []     # same key, same meaning as the blackrock one
-    nblocks: 1           # rigid drift correction -- see "Drift correction"
-    #tmin : 0     # sort from this second of the binary; omit for the start
-    #tmax : 1800   # ...to this one; omit for the end. See "Sort window".
+  kilosort:                    # every Kilosort parameter, stated -- see "Kilosort settings"
+    # ---- this session ----
+    bad_channels: []             # dead sites, as recording channel numbers -- see "Bad channels"
+    nblocks: 1                   # rigid drift correction -- see "Drift correction"
+    tmin: 0                      # sort from this second of the binary -- see "Sort window"
+    tmax: .inf                   # ...to this one; .inf = the end of the file
+    # ---- Kilosort's own values: change only if you know what they mean ----
+    # preprocessing -- Kilosort's, on every batch; there is none outside it
+    do_CAR: true                 # subtract the median across channels
+    invert_sign: false           # flip the sign of the data before sorting
+    highpass_cutoff: 300         # Hz, Fourier-domain highpass
+    artifact_threshold: .inf     # zero any batch whose |value| exceeds this
+    whitening_range: 32          # nearby channels used for local whitening
+    nskip: 25                    # batch stride when estimating the whitening matrix
+    shift: null                  # offset added to the raw data before anything else
+    scale: null                  # ...then multiplied by this
+    # batching
+    batch_size: 60000            # samples per batch: 2 s at 30 kHz
+    batch_downsampling: 1        # sort every n-th batch; 1 = all of them
+    # drift estimation -- read only when nblocks > 0
+    binning_depth: 5             # um, depth bin of the drift histogram
+    sig_interp: 20               # um, width of the interpolation kernel
+    drift_smoothing: [0.5, 0.5, 0.5]   # Gaussian sigma: correlation, time, depth
+    # detection and templates
+    Th_universal: 9              # detection threshold, universal templates
+    Th_learned: 8                # detection threshold, learned templates
+    Th_single_ch: 6              # single-channel threshold, in whitened SDs
+    nt: 61                       # samples per waveform
+    nt0min: null                 # trough sample within nt; null = int(20 * nt / 61)
+    dmin: null                   # um, vertical template spacing; null = from the probe
+    dminx: 32                    # um, horizontal template spacing
+    min_template_size: 10        # um, smallest universal-template envelope
+    template_sizes: 5            # how many envelope sizes
+    nearest_chans: 10            # channels searched for a local maximum
+    nearest_templates: 100       # template positions searched for a local maximum
+    max_channel_distance: 32     # um, farthest a template may sit from its channel
+    max_peels: 100               # matching-pursuit passes per batch
+    templates_from_data: true    # learn the universal template shapes from the data
+    n_templates: 6               # single-channel universal templates
+    n_pcs: 6                     # single-channel PCs per spike
+    # clustering
+    acg_threshold: 0.2           # refractory violations allowed for a "good" label
+    ccg_threshold: 0.25          # ...and for a split or merge
+    cluster_neighbors: 10        # graph neighbours per spike
+    cluster_downsampling: 20     # 1 spike in n is a landmark
+    max_cluster_subset: 25000    # spikes searched for neighbours
+    x_centers: null              # horizontal cluster centres; null = from the probe
+    cluster_init_seed: 5         # k-means++ seed: same seed, same sort
+    duplicate_spike_ms: 0.25     # a unit's repeats inside this are dropped; 0 keeps them
+    position_limit: 100          # um, channels used to locate a spike
+    # what is kept
+    save_extra_vars: false       # also save per-spike features (large)
+    clear_cache: false           # free GPU memory between steps: slower, smaller
 
   # ---------- defaults: change only if you know what they mean ----------
   probe_file: null       # the .meta beside bin_file wins -- see "Probes"
@@ -103,8 +151,10 @@ sync_period_s: 1.0
 burst_interval_s: 14.0
 alignment_tolerance_s: 0.001      # step 9 passes below this burst residual
 
-# Kilosort settings shared by both systems; a system's own kilosort: block is
-# merged over this one. Empty means Kilosort's defaults. See "Kilosort settings".
+# Kilosort settings shared by every stream. Empty on purpose: each system (and,
+# with two probes, each probe) states its whole list above, and that list is
+# merged over this one key by key -- so a key put here is overridden there and
+# does nothing. See "Kilosort settings".
 kilosort: {}
 
 
@@ -301,23 +351,44 @@ kilosort: {}
 #   rather than moving it -- the correction can only subtract signal here. Drift
 #   on a chronic array is real; this is not the tool for it.
 #
+# Sort window
+#   tmin/tmax are seconds from the start of the binary, and Kilosort sorts only
+#   what lies between them. Spike times still count from the start of the FILE,
+#   not from tmin, so nothing downstream shifts. Leave 0 / .inf for a whole-file
+#   sort; narrow it to try settings on half an hour before committing to six.
+#
 # Kilosort settings
+#   Every parameter Kilosort takes is written out in each kilosort: block, at the
+#   value Kilosort itself would use, so a sort is fully described by this file
+#   and changing one means editing the line that already states it. The values
+#   are Kilosort 4's parameters.py and run_kilosort() defaults, except nblocks.
+#
 #   There is no preprocessing outside Kilosort, because Kilosort already does it
-#   on every batch: it subtracts the median across channels when do_CAR is set,
+#   on every batch: it subtracts each channel's mean, then the median across
+#   channels when do_CAR is set (the name says average; the code takes a median),
 #   then highpasses at highpass_cutoff, whitens, and drift-corrects. The question
 #   is which of *those* to turn on, not what to do beforehand.
 #
-#     do_CAR                       true    subtract the median across channels
-#                                          (the name says average; the code takes
-#                                          a median, which is what an array wants)
-#     highpass_cutoff              300     Hz
-#     whitening_range              32      channels used for local whitening
-#     artifact_threshold           inf     zero out any batch exceeding this
-#     skip_kilosort_preprocessing  false   only if you filtered the data yourself
-#     nblocks                      1       drift blocks; per system, see above
-#     bad_channels                 null    per system, see above
+#   Three layers, merged key by key: the top-level kilosort: block, then the
+#   system's, then (with two probes) the probe's under by_probe:. A key at a lower
+#   layer replaces the one above -- a list is overridden, not extended. Settings
+#   that describe the hardware (nblocks, bad_channels) differ between systems;
+#   the rest are stated identically in each block, and tests/test_config.py pins
+#   that every block names the same keys, so none can go missing from one.
 #
-#   Every other Kilosort parameter passes through unchanged. Any of them can be
-#   given per system, not just those two, and a per-system value *replaces* the
-#   shared one -- a list is overridden, not extended. A key Kilosort does not know
-#   fails at sort time with the full list of valid ones, so a typo is loud.
+#   Not listed, on purpose:
+#     n_chan_bin, fs, filename, probe, results_dir, data_dtype, device
+#         set by the pipeline from the .meta / .ns6 / machine profile; naming one
+#         here is refused with the setting that actually controls it
+#     save_preprocessed_copy
+#         writes a whitened .dat the size of the recording, which is not copied
+#         out of the cache, so it would be thrown away
+#     progress_bar, verbose_console, verbose_log, torch_thread_lim, shank_idx
+#         logging and resource knobs, not how the data is sorted
+#
+#   Each key goes to whichever of Kilosort's two places takes it -- the settings
+#   dict or run_kilosort()'s arguments -- as the INSTALLED Kilosort says, and a
+#   key it does not know is refused by name. So if the rig's Kilosort predates
+#   one of these (cluster_init_seed, max_cluster_subset, batch_downsampling are
+#   recent), the sort stops at once naming it: delete that line.
+#   `run_sorting_pipeline.py --dry-run` makes the same check without a GPU.

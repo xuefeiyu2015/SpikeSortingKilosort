@@ -68,6 +68,14 @@ def test_template_leaves_no_unresolved_placeholders():
 
 _FENCE = "---------- defaults"
 
+TRACKED_CONFIGS = (
+    ("session_template_utah_probe.yaml", "windows_rig"),
+    ("session_template_1probe.yaml", "windows_rig"),
+    ("session_template_2probes.yaml", "windows_rig"),
+    ("session_template_utah_only.yaml", "windows_rig"),
+    ("session_demo_1probe.yaml", "mac"),
+)
+
 
 def _keys_below_the_fence(text: str, block: str) -> list[str]:
     """Keys inside ``block:`` that sit after its defaults fence, in file order."""
@@ -92,13 +100,7 @@ def test_the_tracked_configs_state_the_code_defaults_below_their_fences():
     # default; a value chosen for this recording belongs above it.
     stock = {"blackrock": cfg.BlackrockSpec(), "neuropixels": cfg.NeuropixelsSpec()}
 
-    for name, machine in (
-        ("session_template_utah_probe.yaml", "windows_rig"),
-        ("session_template_1probe.yaml", "windows_rig"),
-        ("session_template_2probes.yaml", "windows_rig"),
-        ("session_template_utah_only.yaml", "windows_rig"),
-        ("session_demo_1probe.yaml", "mac"),
-    ):
+    for name, machine in TRACKED_CONFIGS:
         text = (CONFIG_DIR / name).read_text()
         session = cfg.load_session_config(CONFIG_DIR / name, machine, CONFIG_DIR)
         fenced = 0
@@ -189,11 +191,17 @@ def test_the_two_probe_template_differs_only_by_the_second_binary():
     imec0 = two.for_probe(0)
     assert imec0.neuropixels_dir == one.neuropixels_dir      # the same probe folder
     assert imec0.neuropixels.bin_file == one.neuropixels.bin_file
-    assert imec0.kilosort_for("neuropixels") == one.kilosort_for("neuropixels")
+    # Each probe states its own whole Kilosort list under by_probe:, and both
+    # resolve to exactly what the 1-probe template sorts with.
+    for probe in two.probes:
+        assert two.for_probe(probe).kilosort_for("neuropixels") == one.kilosort_for(
+            "neuropixels"
+        )
 
     # `session` is the config filename, so two files necessarily differ there;
-    # neuropixels_dir is the gate folder here and the probe folder there.
-    stated = {"session", "neuropixels", "neuropixels_dir"}
+    # neuropixels_dir is the gate folder here and the probe folder there; and the
+    # Kilosort list sits under by_probe: rather than the system block.
+    stated = {"session", "neuropixels", "neuropixels_dir", "kilosort_by_system"}
     differing = [
         f
         for f in one.__dataclass_fields__
@@ -202,8 +210,51 @@ def test_the_two_probe_template_differs_only_by_the_second_binary():
     assert differing == [], differing
     # ...and inside the neuropixels block, only how the binaries are named.
     assert cfg.replace(
-        two.neuropixels, bin_files=None, bin_file=one.neuropixels.bin_file
+        two.neuropixels, bin_files=None, bin_file=one.neuropixels.bin_file, by_probe={}
     ) == one.neuropixels
+
+
+
+def _stated_kilosort_blocks():
+    """Every Kilosort list a tracked config sorts with, as (label, system, dict)."""
+    for name, machine in TRACKED_CONFIGS:
+        session = cfg.load_session_config(CONFIG_DIR / name, machine, CONFIG_DIR)
+        for system in ("blackrock", "neuropixels"):
+            if not getattr(session, f"sorts_{system}"):
+                continue
+            streams = session.per_probe() if system == "neuropixels" else [(None, session)]
+            for tag, stream in streams:
+                yield f"{name}:{system}:{tag}", system, stream.kilosort_for(system)
+
+
+def test_every_tracked_kilosort_block_states_the_same_parameters():
+    # The templates write out every Kilosort parameter so nothing is left to a
+    # default nobody can see. That only holds while every block names the same
+    # list: a key added to one template and forgotten in another would quietly
+    # sort that session with Kilosort's value instead.
+    blocks = list(_stated_kilosort_blocks())
+    assert {system for _, system, _ in blocks} == {"blackrock", "neuropixels"}
+    first_label, _, first = blocks[0]
+    for label, _, block in blocks[1:]:
+        assert set(block) == set(first), (label, set(block) ^ set(first))
+
+    # Settings that describe the hardware differ by system; the rest describe how
+    # to sort, and must not drift apart between the two.
+    hardware = {"nblocks"}
+    by_system = {system: block for _, system, block in blocks}
+    assert {k: v for k, v in by_system["blackrock"].items() if k not in hardware} == {
+        k: v for k, v in by_system["neuropixels"].items() if k not in hardware
+    }
+    assert by_system["blackrock"]["nblocks"] == 0
+    assert by_system["neuropixels"]["nblocks"] == 1
+
+
+def test_no_tracked_kilosort_block_names_a_setting_the_pipeline_owns():
+    # pipeline._RESERVED refuses these at sort time; a template naming one would
+    # fail on the rig rather than here.
+    pipeline = pytest.importorskip("spikesorting.pipeline")
+    for label, _, block in _stated_kilosort_blocks():
+        assert not set(block) & set(pipeline._RESERVED), label
 
 
 def test_the_utah_only_template_differs_only_by_the_missing_probe():

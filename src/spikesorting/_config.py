@@ -734,13 +734,13 @@ class SessionConfig:
         Merged key by key rather than replaced, so a system can change ``nblocks``
         without discarding the rest of the shared block. The layer is one level
         deep: a per-system ``bad_channels`` *replaces* the list above it rather
-        than extending it. Everything here is passed straight to ``run_sorter`` --
-        Kilosort's own parameters plus the ones SpikeInterface adds (``do_CAR``,
-        ``bad_channels``, ``invert_sign``, ``skip_kilosort_preprocessing``,
-        ``save_preprocessed_copy``).
+        than extending it. Everything here is passed to Kilosort's own
+        ``run_kilosort``, split by ``pipeline._kilosort_arguments`` into its
+        ``settings`` dict and its keyword arguments (``do_CAR``, ``bad_channels``,
+        ``invert_sign``, ...).
 
-        Empty means Kilosort's defaults, which already highpass at 300 Hz and
-        subtract the median across channels on every batch.
+        Empty means Kilosort's defaults. The tracked templates state every key
+        anyway, so a sort is described by its session file alone.
         """
         merged = dict(self.kilosort)
         merged.update(self.kilosort_by_system.get(system) or {})
