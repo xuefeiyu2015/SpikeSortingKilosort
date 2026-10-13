@@ -448,14 +448,10 @@ def _run_preprocessing(config: SessionConfig, system: str, directory: Path) -> d
 
 
 def _has_spikeglx_meta(config: SessionConfig) -> bool:
-    """Whether SpikeInterface's own SpikeGLX reader can open this binary."""
+    """Whether the binary has a ``.meta`` to read the probe and ADC offsets from."""
     from ._io import spikeglx
 
-    bin_file = config.neuropixels.bin_file
-    return (
-        spikeglx.meta_path_for(bin_file).exists()
-        and spikeglx.run_layout(bin_file) is not None
-    )
+    return spikeglx.meta_path_for(config.neuropixels.bin_file).exists()
 
 
 def _si_steps(spec: Any) -> list[str]:

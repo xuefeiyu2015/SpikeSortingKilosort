@@ -395,3 +395,43 @@ def test_a_bare_binary_is_read_without_its_sy_word_and_written_flat(tmp_path):
     out = si.write(recording, tmp_path / "out" / "demo.bin")
     written = np.fromfile(out, dtype=np.int16).reshape(-1, 4)
     assert np.array_equal(written, data[:, :4])
+
+
+def test_only_the_named_binary_is_read_whatever_else_is_in_its_folder(tmp_path, monkeypatch):
+    # neo's SpikeGLX reader walks a folder recursively, so a CatGT tcat output in
+    # preprocessed/ below the run became a second segment with no LF band:
+    # KeyError: (0, 'imec0.lf'). The binary is read by name instead, and the
+    # probe and ADC offsets come from its own .meta.
+    from spikesorting._preprocess import si
+
+    pytest.importorskip("spikeinterface.core")
+    probeinterface = pytest.importorskip("probeinterface")
+    n_chan, n_ap = 9, 8
+    data = np.arange(3000 * n_chan, dtype=np.int16).reshape(3000, n_chan)
+    run = tmp_path / "run_g0" / "run_g0_imec0"
+    run.mkdir(parents=True)
+    source = run / "run_g0_t0.imec0.ap.bin"
+    source.write_bytes(data.tobytes())
+    source.with_suffix(".meta").write_text("nSavedChans=9\n", encoding="utf-8")
+    (run / "run_g0_t0.imec0.lf.bin").write_bytes(b"")
+    (run / "run_g0_t0.imec0.lf.meta").write_text("nSavedChans=9\n", encoding="utf-8")
+    stray = run / "preprocessed" / "catgt" / "run_g0_imec0"
+    stray.mkdir(parents=True)
+    (stray / "run_g0_tcat.imec0.ap.bin").write_bytes(b"")
+    (stray / "run_g0_tcat.imec0.ap.meta").write_text("nSavedChans=9\n", encoding="utf-8")
+
+    probe = probeinterface.generate_linear_probe(num_elec=n_ap, ypitch=20)
+    probe.set_device_channel_indices(np.arange(n_ap))
+    read = []
+    monkeypatch.setattr(
+        probeinterface, "read_spikeglx", lambda path: read.append(Path(path)) or probe
+    )
+    monkeypatch.setattr(si, "_sample_shifts", lambda probe: np.linspace(0, 0.5, n_ap))
+
+    recording = si.read_neuropixels(source, n_chan, 30000.0, sy_index=8, has_meta=True)
+
+    assert read == [source.with_suffix(".meta")]          # this binary's own .meta
+    assert recording.get_num_channels() == n_ap            # SY left out
+    assert recording.has_probe()
+    assert "inter_sample_shift" in recording.get_property_keys()
+    assert np.array_equal(recording.get_traces(), data[:, :n_ap])

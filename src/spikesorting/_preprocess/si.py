@@ -74,23 +74,50 @@ def read_neuropixels(
 
     The sync word is a bit field, and filtering or re-referencing it would
     destroy it, so it is left out: the result is the AP channels alone, in the
-    binary's own order. With a ``.meta`` SpikeInterface's own reader is used,
-    because it attaches the probe and each channel's ADC offset -- what
-    ``phase_shift`` and motion correction need. A bare binary (the Kilosort demo)
-    is read flat.
+    binary's own order.
+
+    **Only the named binary is read.** SpikeInterface's ``read_spikeglx`` takes a
+    *folder*, and neo walks it recursively, treating every ``.bin``/``.meta``
+    pair below it as part of the recording -- including the CatGT output this
+    pipeline writes to ``<neuropixels_dir>/preprocessed/``, whose ``tcat``
+    trigger becomes a second segment with no LF band (``KeyError: (0,
+    'imec0.lf')``), or any copy someone left beside the run. So the file is
+    read flat, and what ``read_spikeglx`` would attach -- the probe and each
+    channel's ADC sample offset, which ``phase_shift`` and motion correction
+    need -- is attached from this binary's own ``.meta``, the way SpikeInterface
+    itself does it. A bare binary with no ``.meta`` (the Kilosort demo) gets
+    neither.
     """
-    if has_meta:
-        from spikeinterface.extractors import read_spikeglx
-
-        stream = f"{bin_file.name.split('.')[-3]}.ap"          # "imec0.ap"
-        return read_spikeglx(bin_file.parent, stream_id=stream)
-
     from spikeinterface.core import read_binary
 
     recording = read_binary(bin_file, sampling_frequency=fs, dtype="int16", num_channels=n_chan)
     if sy_index is not None:
         recording = recording.remove_channels([recording.channel_ids[sy_index]])
+    if not has_meta:
+        return recording
+
+    import probeinterface
+
+    probe = probeinterface.read_spikeglx(Path(bin_file).with_suffix(".meta"))
+    if probe.shank_ids is not None:
+        recording = recording.set_probe(probe, group_mode="by_shank")
+    else:
+        recording = recording.set_probe(probe)
+    shifts = _sample_shifts(probe)
+    if shifts is not None:
+        recording.set_property("inter_sample_shift", shifts)
     return recording
+
+
+def _sample_shifts(probe: Any) -> Any:
+    """Each channel's ADC offset as a fraction of a sample, or None if unknown."""
+    try:
+        from spikeinterface.extractors.neuropixels_utils import (
+            get_neuropixels_sample_shifts_from_probe,
+        )
+    except ImportError:          # an older SpikeInterface: phase_shift will say so
+        return None
+    return get_neuropixels_sample_shifts_from_probe(probe)
 
 
 def write(recording: Any, path: Path, job_kwargs: dict | None = None) -> Path:
