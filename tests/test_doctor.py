@@ -944,3 +944,44 @@ def test_a_session_that_does_not_sort_needs_no_channel_map(tmp_path):
     assert not [c for c in checks if "probe" in c.detail.lower()]
     assert doctor.exit_code(checks) == 0
 
+
+
+def _npx_session(tmp_path, preprocess: str = ""):
+    from conftest import spikeglx_run
+
+    from spikesorting import _config as cfg
+
+    machines = tmp_path / "machines"
+    machines.mkdir(parents=True, exist_ok=True)
+    (machines / "m.yaml").write_text(f"cache_dir: '{tmp_path / 'c'}'\n", encoding="utf-8")
+    binary = spikeglx_run(tmp_path / "npx")[0]
+    (tmp_path / "s.yaml").write_text(
+        f"neuropixels_dir: '{binary.parent}'\n"
+        f"neuropixels:\n  bin_file: '{binary}'\n{preprocess}",
+        encoding="utf-8",
+    )
+    return cfg.load_session_config(tmp_path / "s.yaml", "m", tmp_path)
+
+
+def test_catgt_preprocessing_on_a_machine_without_catgt_blocks_before_the_job(tmp_path):
+    # No fallback: the session says catgt. Caught here, with the two ways out,
+    # rather than as an error once the job has started.
+    import doctor
+
+    checks = doctor.check_session(_npx_session(tmp_path))
+
+    blocking = [c for c in checks if c.name.endswith(":preprocess")]
+    assert blocking and blocking[0].status == doctor.MISSING
+    assert "method: spikeinterface" in (blocking[0].fix or "")
+    assert doctor.exit_code(checks) == 1
+
+
+def test_spikeinterface_preprocessing_needs_no_catgt(tmp_path):
+    import doctor
+
+    session = _npx_session(
+        tmp_path, "  preprocess:\n    method: spikeinterface\n    gfix: null\n"
+    )
+    checks = doctor.check_session(session)
+
+    assert not [c for c in checks if c.name.endswith(":preprocess")]

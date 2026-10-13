@@ -12,6 +12,9 @@ exactly this, which is why the Blackrock detector writes the same format.
 written only when files are concatenated, the channel list changes, filters or
 tshift are applied, or a time range is exported. Adding any such flag to an
 extraction run would duplicate a >100 GB recording, so this wrapper never does.
+The one deliberate rewrite is the preprocessing pass, built in
+``_preprocess/catgt.py``, which reuses :func:`run_catgt` and writes to
+``<neuropixels_dir>/preprocessed/``.
 
 Reference: https://billkarsh.github.io/SpikeGLX/More_help/CatGT_ReadMe.html
 """

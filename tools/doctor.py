@@ -950,7 +950,8 @@ def check_external_tools(machine: MachineProfile) -> list[Check]:
             machine.catgt_dir,
             catgt.catgt_script,
             CATGT_DOCS,
-            "sync/edges.py detects the same edges in pure NumPy",
+            "sync/edges.py detects the same edges in pure NumPy -- but a "
+            "session with preprocess.method: catgt cannot be preprocessed here",
         ),
         (
             "TPrime",
@@ -1193,6 +1194,8 @@ def check_session(config: SessionConfig) -> list[Check]:
             )
         )
 
+    checks.extend(_check_catgt_preprocessing(config))
+
     brk = config.blackrock
     if config.sorts_blackrock and brk.probe_file is None:
         checks.append(
@@ -1215,6 +1218,51 @@ def check_session(config: SessionConfig) -> list[Check]:
                 section=SECTION_SESSION,
             )
         )
+    return checks
+
+
+def _check_catgt_preprocessing(config: SessionConfig) -> list[Check]:
+    """A session preprocessing with CatGT, on a machine without it, is blocked.
+
+    There is no fallback -- the session file decides the preprocessing -- so the
+    gap is reported before the job rather than as an error once it starts.
+    Unless the CatGT output is already here (preprocessed on the rig and copied
+    across) and still matches the session, in which case it is simply reused.
+    """
+    from spikesorting import pipeline
+
+    if config.preprocess_for("neuropixels").method != "catgt" or config.machine.has_catgt:
+        return []
+    checks: list[Check] = []
+    for tag, stream in config.per_probe():
+        if not stream.sorts_neuropixels:
+            continue
+        name = f"session:{config.session}:preprocess" + (f":{tag}" if tag else "")
+        try:
+            reasons, _ = pipeline._stale_reasons(stream, "neuropixels")
+        except OSError:
+            reasons = ["the AP binary is not reachable"]
+        if not reasons:
+            checks.append(Check(
+                name=name, status=OK, section=SECTION_SESSION,
+                detail="CatGT output already here and matching the session; reused",
+            ))
+            continue
+        checks.append(Check(
+            name=name,
+            status=MISSING,
+            detail=(
+                f"neuropixels.preprocess.method is catgt, but machine "
+                f"'{config.machine.name}' has no catgt_dir ({reasons[0]})"
+            ),
+            disables=("preprocess_neuropixels", "sort_neuropixels"),
+            fix=(
+                "preprocess on the rig and copy <neuropixels_dir>/preprocessed/ "
+                "here, or set neuropixels.preprocess.method: spikeinterface "
+                "(and gfix: null) in the session"
+            ),
+            section=SECTION_SESSION,
+        ))
     return checks
 
 

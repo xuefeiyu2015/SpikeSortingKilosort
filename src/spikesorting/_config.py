@@ -38,6 +38,7 @@ __all__ = [
     "MachineProfile",
     "BlackrockSpec",
     "NeuropixelsSpec",
+    "PreprocessSpec",
     "OutputPaths",
     "SessionConfig",
     "load_machine",
@@ -198,6 +199,9 @@ class MachineProfile:
     conda_envs: dict[str, EnvLocation] = field(default_factory=dict)
     #: torch device string handed to Kilosort4 ("cuda", "cuda:0", "cpu").
     device: str = "cuda"
+    #: Worker processes SpikeInterface uses to preprocess. A fact about the box:
+    #: its core count, and how hard its disk can be read in parallel.
+    n_jobs: int = 4
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> "MachineProfile":
@@ -211,6 +215,7 @@ class MachineProfile:
             conda_envs_dir=_as_path(data.get("conda_envs_dir")),
             conda_envs=_as_env_locations(data.get("conda_envs")),
             device=str(data.get("device", "cuda")),
+            n_jobs=int(data.get("n_jobs", 4)),
         )
 
     @property
@@ -273,6 +278,92 @@ class WaveformSpec:
         )
 
 
+#: How the signal can be preprocessed before Kilosort sees it. There is no
+#: "kilosort" method: Kilosort only whitens (and re-applies its highpass), and
+#: everything else happens here, so it is stated in one place.
+PREPROCESS_METHODS = ("catgt", "spikeinterface")
+#: CatGT's own names for its global CAR filters. ``gblcar`` subtracts the median
+#: across channels (CatGT >= 3.6); ``gbldmx`` subtracts the mean within each
+#: group of channels the probe digitises at the same instant.
+CAR_MODES = ("gblcar", "gbldmx")
+#: SpikeInterface ``correct_motion`` presets. Listed rather than imported so this
+#: layer stays importable without SpikeInterface.
+MOTION_PRESETS = (
+    "dredge",
+    "dredge_fast",
+    "nonrigid_accurate",
+    "nonrigid_fast_and_accurate",
+    "rigid_fast",
+    "kilosort_like",
+    "medicine",
+)
+
+
+@dataclass(frozen=True)
+class PreprocessSpec:
+    """What is done to one system's signal before Kilosort reads it.
+
+    The whole chain is stated per system, and which tool runs it is a setting
+    rather than a fallback: ``catgt`` that cannot run stops and names
+    ``method: spikeinterface``, so the session file always says what was done.
+    ``pipeline.preprocess`` writes the result beside the recording, and that file
+    -- not the raw one -- is what Kilosort, Phy and the waveform export read.
+    """
+
+    #: ``catgt`` (Neuropixels only: CatGT reads SpikeGLX runs and nothing else)
+    #: or ``spikeinterface``.
+    method: str = "catgt"
+    #: Band edges in Hz. CatGT ``-apfilter=butter,12,lo,hi``; SpikeInterface
+    #: ``bandpass_filter(freq_min, freq_max)``.
+    highpass_hz: float = 300.0
+    lowpass_hz: float = 10000.0
+    #: ``gblcar``, ``gbldmx`` (CatGT only) or None for no common reference.
+    #: Kilosort's own ``do_CAR`` is always off: CAR happens here or not at all.
+    car_mode: str | None = "gblcar"
+    #: CatGT ``-gfix=amplitude_mV,slope_mV_per_sample,noise_mV``: transients
+    #: crossing both are zeroed until the signal falls back below the noise
+    #: level. None turns it off. CatGT only; SpikeInterface has no equivalent.
+    gfix: tuple[float, float, float] | None = (0.40, 0.10, 0.02)
+    #: Correct the ADC multiplexing offset between channels (CatGT tshift,
+    #: SpikeInterface ``phase_shift``). Neuropixels only; needs the ``.meta``.
+    phase_shift: bool = True
+    #: A SpikeInterface ``correct_motion`` preset, or None. When set, Kilosort's
+    #: ``nblocks`` must be 0 so drift is not corrected twice.
+    motion: str | None = None
+
+    @classmethod
+    def from_dict(
+        cls, data: dict[str, Any] | None, default: "PreprocessSpec"
+    ) -> "PreprocessSpec":
+        """Parse a ``preprocess:`` block, falling back to ``default`` per key.
+
+        A key *present* with ``null`` means off; only an absent key takes the
+        default -- so ``car_mode: null`` is no CAR, not CatGT's default.
+        """
+        data = data or {}
+
+        def stated(key: str) -> Any:
+            return data[key] if key in data else getattr(default, key)
+
+        gfix = stated("gfix")
+        return cls(
+            method=str(stated("method")),
+            highpass_hz=float(stated("highpass_hz")),
+            lowpass_hz=float(stated("lowpass_hz")),
+            car_mode=None if stated("car_mode") is None else str(stated("car_mode")),
+            gfix=None if gfix is None else tuple(float(v) for v in gfix),
+            phase_shift=bool(stated("phase_shift")),
+            motion=None if stated("motion") is None else str(stated("motion")),
+        )
+
+
+#: Each system's starting point. Neuropixels follows the workshop pipeline
+#: (CatGT, tshift, -gblcar, -gfix); a Utah array has no multiplexing to undo and
+#: nothing CatGT can read, so it gets the SpikeInterface band and CAR alone.
+NEUROPIXELS_PREPROCESS = PreprocessSpec()
+BLACKROCK_PREPROCESS = PreprocessSpec(method="spikeinterface", gfix=None, phase_shift=False)
+
+
 
 @dataclass(frozen=True)
 class BlackrockSpec:
@@ -317,6 +408,8 @@ class BlackrockSpec:
     #: How the waveform export cuts and filters this system's snippets. The
     #: .ns6 group is broadband, so the default high-passes.
     waveforms: WaveformSpec = field(default_factory=WaveformSpec)
+    #: What is done to the signal before Kilosort reads it.
+    preprocess: PreprocessSpec = field(default_factory=lambda: BLACKROCK_PREPROCESS)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "BlackrockSpec":
@@ -332,6 +425,7 @@ class BlackrockSpec:
             allow_segments=bool(data.get("allow_segments", False)),
             probe_file=_as_config_path(data.get("probe_file")),
             waveforms=WaveformSpec.from_dict(data.get("waveforms"), WaveformSpec()),
+            preprocess=PreprocessSpec.from_dict(data.get("preprocess"), BLACKROCK_PREPROCESS),
         )
 
 
@@ -401,6 +495,9 @@ class NeuropixelsSpec:
     #: How the waveform export cuts and filters this system's snippets. The AP
     #: band arrives high-passed from the probe, so the default does not filter.
     waveforms: WaveformSpec = field(default_factory=WaveformSpec)
+    #: What is done to the signal before Kilosort reads it. One block for every
+    #: probe of the session: ``by_probe:`` takes only ``kilosort:``.
+    preprocess: PreprocessSpec = field(default_factory=lambda: NEUROPIXELS_PREPROCESS)
 
     def binaries_by_probe(self) -> dict[int, Path]:
         """``{probe: AP binary}`` for everything this block names.
@@ -447,6 +544,7 @@ class NeuropixelsSpec:
                 for probe, block in (data.get("by_probe") or {}).items()
             },
             waveforms=WaveformSpec.from_dict(data.get("waveforms"), WaveformSpec()),
+            preprocess=PreprocessSpec.from_dict(data.get("preprocess"), NEUROPIXELS_PREPROCESS),
         )
 
 
@@ -502,6 +600,15 @@ class OutputPaths:
     def sorted_for(self, system: str) -> Path:
         """Where one system's sorting lands. The system-agnostic form."""
         return self._require(system) / self.sorter
+
+    def preprocessed_for(self, system: str) -> Path:
+        """Where the preprocessed binary Kilosort reads is written.
+
+        Beside the recording and one level above the sorting, so a re-sort
+        neither deletes it nor makes it again: it is the size of the recording,
+        and Phy and the waveform export read it long after the sort is done.
+        """
+        return self._require(system) / "preprocessed"
 
     def sync_for(self, system: str) -> Path:
         """Edge files, in the same folder as the sorting they are aligned with.
@@ -757,6 +864,12 @@ class SessionConfig:
             raise ValueError(f"unknown system {system!r}")
         return self.blackrock.waveforms if system == "blackrock" else self.neuropixels.waveforms
 
+    def preprocess_for(self, system: str) -> PreprocessSpec:
+        """What is done to one system's signal before Kilosort reads it."""
+        if system not in ("blackrock", "neuropixels"):
+            raise ValueError(f"unknown system {system!r}")
+        return getattr(self, system).preprocess
+
     def has_data(self, system: str) -> bool:
         """Did this system record? Derived from whether its paths are *declared*.
 
@@ -988,6 +1101,7 @@ def _spec_keys(spec: type) -> frozenset[str]:
 _BLACKROCK_KEYS = _spec_keys(BlackrockSpec) | {"kilosort"}
 _NEUROPIXELS_KEYS = _spec_keys(NeuropixelsSpec) | {"kilosort"}
 _WAVEFORM_KEYS = _spec_keys(WaveformSpec)
+_PREPROCESS_KEYS = _spec_keys(PreprocessSpec)
 #: All a per-probe block may say. See :attr:`NeuropixelsSpec.by_probe`.
 _BY_PROBE_KEYS = frozenset({"kilosort"})
 
@@ -1046,6 +1160,9 @@ def _reject_unknown_keys(data: dict[str, Any], path: Path) -> None:
         waveforms = block.get("waveforms")
         if isinstance(waveforms, dict):
             scopes.append((f"{system}.waveforms.", waveforms, _WAVEFORM_KEYS))
+        preprocess = block.get("preprocess")
+        if isinstance(preprocess, dict):
+            scopes.append((f"{system}.preprocess.", preprocess, _PREPROCESS_KEYS))
         # A by_probe: entry takes `kilosort:` and nothing else. Geometry comes
         # from each probe's own .meta and the paths come from the run layout, so
         # a `probe_file:` or `bin_file:` here would be read by nobody.
@@ -1166,9 +1283,93 @@ def load_session_config(
         },
     )
     _reject_bad_probe_list(config, session_path)
+    _reject_bad_preprocess(config, session_path)
     _reject_sorting_nothing(config, data, session_path)
     _reject_colliding_system_dirs(config, session_path)
     return config
+
+
+def _reject_bad_preprocess(config: SessionConfig, path: Path) -> None:
+    """Refuse a ``preprocess:`` block that cannot be done as written.
+
+    Each of these would otherwise surface hours in, or -- worse -- run as
+    something other than what the file says: a ``gfix`` nobody applies, drift
+    corrected twice, a CatGT flag handed to SpikeInterface.
+    """
+    for system in ("neuropixels", "blackrock"):
+        spec = config.preprocess_for(system)
+        where = f"{path}: {system}.preprocess"
+
+        if spec.method not in PREPROCESS_METHODS:
+            if spec.method == "kilosort":
+                raise ValueError(
+                    f"{where}.method: kilosort is not a method. Preprocessing "
+                    "happens before Kilosort, which only whitens; choose "
+                    + " or ".join(PREPROCESS_METHODS) + "."
+                )
+            raise ValueError(
+                f"{where}.method: {spec.method!r} is not one of "
+                + ", ".join(PREPROCESS_METHODS)
+            )
+        if system == "blackrock":
+            if spec.method == "catgt":
+                raise ValueError(
+                    f"{where}.method: catgt reads SpikeGLX runs only, not a .ns6. "
+                    "Use method: spikeinterface."
+                )
+            for key, off in (("phase_shift", False), ("motion", None)):
+                if getattr(spec, key) != off:
+                    raise ValueError(
+                        f"{where}.{key}: Neuropixels only. A Utah array samples "
+                        "every channel at once and its 400 um pitch leaves nothing "
+                        f"to interpolate drift across -- set it to {off!r} "
+                        "or delete the line."
+                    )
+        if spec.car_mode is not None and spec.car_mode not in CAR_MODES:
+            raise ValueError(
+                f"{where}.car_mode: {spec.car_mode!r} is not one of "
+                + ", ".join(CAR_MODES) + ", or null for no common reference"
+            )
+        if spec.method != "catgt":
+            if spec.gfix is not None:
+                raise ValueError(
+                    f"{where}.gfix is CatGT's transient removal, and method is "
+                    f"{spec.method}, which has no equivalent. Set gfix: null, or "
+                    "method: catgt."
+                )
+            if spec.car_mode == "gbldmx":
+                raise ValueError(
+                    f"{where}.car_mode: gbldmx is CatGT's demuxed CAR, and "
+                    f"{spec.method} has no equivalent. Use gblcar, or method: catgt."
+                )
+        if spec.gfix is not None and len(spec.gfix) != 3:
+            raise ValueError(
+                f"{where}.gfix takes three numbers -- amplitude mV, slope "
+                f"mV/sample, noise mV -- got {list(spec.gfix)}"
+            )
+        if not 0 < spec.highpass_hz < spec.lowpass_hz:
+            raise ValueError(
+                f"{where}: need 0 < highpass_hz < lowpass_hz, got "
+                f"{spec.highpass_hz} and {spec.lowpass_hz}"
+            )
+        if spec.motion is not None:
+            if spec.motion not in MOTION_PRESETS:
+                raise ValueError(
+                    f"{where}.motion: {spec.motion!r} is not a SpikeInterface "
+                    "correct_motion preset: " + ", ".join(MOTION_PRESETS)
+                    + ", or null"
+                )
+            if getattr(config, f"sorts_{system}"):
+                # Per probe: a by_probe: block may set nblocks for one of them.
+                for _, stream in config.per_probe():
+                    nblocks = stream.kilosort_for(system).get("nblocks", 1)
+                    if nblocks != 0:
+                        tag = f" ({stream.probe_tag})" if stream.probe_tag else ""
+                        raise ValueError(
+                            f"{where}.motion: {spec.motion} corrects drift before "
+                            f"Kilosort, but kilosort nblocks{tag} is {nblocks}, so "
+                            "it would be corrected twice. Set nblocks: 0."
+                        )
 
 
 def _reject_sorting_nothing(

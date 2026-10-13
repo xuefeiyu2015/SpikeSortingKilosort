@@ -328,7 +328,9 @@ def test_a_utah_array_with_no_map_at_all_refuses_to_sort(tmp_path):
 
 def test_none_propagates_so_a_sequence_needs_no_branching(tmp_path):
     # This is what lets the runner be a flat list of calls.
-    session = _session(tmp_path, "kilosort_on_neuropixels: false\n")
+    session = _session(
+        tmp_path, "neuropixels:\n  bin_file: '/a/x.bin'\nkilosort_on_neuropixels: false\n"
+    )
 
     assert ss.sort_with_kilosort(session, "neuropixels") is None
 
@@ -803,6 +805,42 @@ def test_skip_reason_is_none_when_the_verb_will_actually_run(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _fake_preprocessing(monkeypatch) -> list[dict]:
+    """Stand in for the preprocessing engines, keeping everything around them.
+
+    CatGT and SpikeInterface's filters are what the rig runs; what these tests
+    check is the machinery around them -- the record, the reuse, which file
+    Kilosort is handed -- so the engine writes a binary of the right shape and
+    nothing else. The Blackrock reader still runs, because opening the .ns6
+    (gap tolerance, segments) is part of what is under test. Returns the list of
+    binaries made, one entry per engine run.
+    """
+    made: list[dict] = []
+
+    def run(config, system, directory):
+        directory.mkdir(parents=True, exist_ok=True)
+        if system == "blackrock":
+            recording = pipeline._read_blackrock(config)
+            n_chan = int(recording.get_num_channels())
+            fs = float(recording.get_sampling_frequency())
+            n_samples = sum(
+                int(recording.get_num_frames(segment_index=s))
+                for s in range(recording.get_num_segments())
+            )
+            path = directory / f"{config.blackrock.spike_file.stem}.bin"
+        else:
+            info = pipeline._neuropixels_stream(config)
+            n_chan, fs, n_samples = info.n_chan, info.fs, info.n_samples
+            path = directory / f"{info.path.stem}.bin"
+        path.write_bytes(b"\x00" * (n_chan * n_samples * 2))
+        made.append({"system": system, "path": path, "spec": config.preprocess_for(system)})
+        return {"binary": str(path), "n_chan": n_chan, "fs": fs,
+                "n_samples": n_samples, "steps": ["fake"]}
+
+    monkeypatch.setattr(pipeline, "_run_preprocessing", run)
+    return made
+
+
 def _fake_kilosort(monkeypatch, seen: list[dict]):
     """Stand in for Kilosort4, recording what ``run_kilosort`` was told.
 
@@ -865,6 +903,7 @@ def _fake_kilosort(monkeypatch, seen: list[dict]):
     monkeypatch.setitem(sys.modules, "kilosort", package)
     monkeypatch.setitem(sys.modules, "kilosort.run_kilosort", module)
     monkeypatch.setitem(sys.modules, "torch", torch)
+    package.preprocessed = _fake_preprocessing(monkeypatch)
     return package
 
 
@@ -892,16 +931,28 @@ def test_the_kilosort_block_is_split_into_settings_and_arguments(tmp_path, monke
     _fake_kilosort(monkeypatch, seen)
     session = _npx_session(
         tmp_path,
-        "  kilosort:\n    nblocks: 0\n    do_CAR: false\n    bad_channels: [3]\n",
+        "  kilosort:\n    nblocks: 0\n    invert_sign: true\n    bad_channels: [3]\n",
     )
 
     ss.sort_with_kilosort(session, "neuropixels")
 
     call = seen[0]
     assert call["settings"] == {"n_chan_bin": 8, "fs": 30000.0, "nblocks": 0}
-    assert call["do_CAR"] is False
+    assert call["invert_sign"] is True
     assert call["bad_channels"] == [3]
     assert call["data_dtype"] == "int16"
+    # The common reference is taken before Kilosort, so it never takes one too.
+    assert call["do_CAR"] is False
+
+
+def test_kilosorts_own_car_cannot_be_turned_back_on(tmp_path, monkeypatch):
+    # CAR is preprocess.car_mode's job. A do_CAR: true here would take the
+    # median a second time, on a signal that already had it subtracted.
+    _fake_kilosort(monkeypatch, [])
+    session = _npx_session(tmp_path, "  kilosort:\n    do_CAR: true\n")
+
+    with pytest.raises(ValueError, match="preprocess.car_mode"):
+        ss.sort_with_kilosort(session, "neuropixels")
 
 
 def test_a_parameter_kilosort_does_not_have_is_refused_by_name(tmp_path, monkeypatch):
@@ -1208,39 +1259,97 @@ def test_a_paused_recording_stops_rather_than_being_concatenated(tmp_path, monke
     assert ss.sort_with_kilosort(allowed, "blackrock") is not None
 
 
-def test_the_ns6_is_transformed_once_beside_the_recording(tmp_path, monkeypatch):
-    # A .ns6 is not a flat binary, so it is transformed into one -- and that file
-    # has to persist: params.py points at it, so Phy shows raw traces only while
-    # it exists, and re-transforming an unchanged .ns6 is minutes of I/O for
-    # nothing.
+def test_the_ns6_is_preprocessed_once_beside_the_recording(tmp_path, monkeypatch):
+    # A .ns6 is not a flat binary, so SpikeInterface reads it, filters it and
+    # writes one -- and that file has to persist: params.py points at it, so Phy
+    # shows traces only while it exists, and remaking an unchanged recording is
+    # minutes of I/O for nothing.
     seen: list[dict] = []
-    transformed: list[dict] = []
-    _fake_kilosort(monkeypatch, seen)
-    _fake_blackrock(monkeypatch, transformed)
-
-    probe = _probe_json(tmp_path / "probes" / "utah.json", n=96)
-    session = _session(
-        tmp_path,
-        "blackrock:\n  sync_file: '/b/y.ns5'\n"
-        f"  spike_file: '{tmp_path / 'br' / 'HUB-A_001.ns6'}'\n  probe_file: '{probe}'\n",
-    )
-    (tmp_path / "br").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "br" / "HUB-A_001.ns6").write_bytes(b"\x00" * 16)
+    fake = _fake_kilosort(monkeypatch, seen)
+    _fake_blackrock(monkeypatch, [])
+    session = _utah_session(tmp_path)
 
     first = ss.sort_with_kilosort(session, "blackrock")
 
-    assert transformed[0]["dtype"] == "int16"
-    assert transformed[0]["data_name"] == "HUB-A_001.bin"
-    binary = tmp_path / "br" / "HUB-A_001.bin"
+    binary = tmp_path / "br" / "preprocessed" / "HUB-A_001.bin"
     assert binary.exists()                       # beside the recording, not in the cache
     assert Path(seen[0]["filename"]) == binary
     assert seen[0]["settings"]["n_chan_bin"] == 96
     assert first.results_dir.name == "kilosort4"
+    assert fake.preprocessed[0]["spec"].method == "spikeinterface"
+    record = json.loads((binary.parent / "preprocess.json").read_text(encoding="utf-8"))
+    assert record["engine"] == "spikeinterface"
+    assert record["binary"] == str(binary)
 
     ss.sort_with_kilosort(session, "blackrock")
 
-    assert len(transformed) == 1                 # reused, not written again
+    assert len(fake.preprocessed) == 1           # reused, not made again
     assert binary.exists()
+
+
+def test_a_changed_preprocess_block_makes_the_binary_again(tmp_path, monkeypatch):
+    # Reuse is decided by the record, not by the file being there: a binary
+    # filtered at 300 Hz must not be sorted as though it were filtered at 500.
+    fake = _fake_kilosort(monkeypatch, [])
+    _fake_blackrock(monkeypatch, [])
+    ss.sort_with_kilosort(_utah_session(tmp_path), "blackrock")
+
+    changed = _utah_session(tmp_path, "  preprocess:\n    highpass_hz: 500\n")
+    ss.sort_with_kilosort(changed, "blackrock")
+
+    assert len(fake.preprocessed) == 2
+    assert fake.preprocessed[1]["spec"].highpass_hz == 500
+
+
+def test_a_binary_whose_size_no_longer_matches_its_record_is_made_again(tmp_path, monkeypatch):
+    # An interrupted copy, a truncated share: the record alone is not trusted.
+    fake = _fake_kilosort(monkeypatch, [])
+    _fake_blackrock(monkeypatch, [])
+    session = _utah_session(tmp_path)
+    ss.sort_with_kilosort(session, "blackrock")
+
+    binary = tmp_path / "br" / "preprocessed" / "HUB-A_001.bin"
+    binary.write_bytes(b"\x00" * 10)
+    ss.sort_with_kilosort(session, "blackrock")
+
+    assert len(fake.preprocessed) == 2
+
+
+def test_catgt_that_cannot_run_stops_and_names_the_switch(tmp_path):
+    # No silent fallback: the session says catgt, this machine has no CatGT, so
+    # the run stops and says how to choose SpikeInterface -- in the file.
+    session = _npx_session(tmp_path)          # the mac profile: no catgt_dir
+
+    with pytest.raises(RuntimeError) as excinfo:
+        ss.preprocess(session, "neuropixels")
+
+    message = str(excinfo.value)
+    assert "no catgt_dir" in message
+    assert "method: spikeinterface" in message
+    assert not (tmp_path / "np" / "preprocessed" / "preprocess.json").exists()
+
+
+def test_preprocess_is_a_no_op_for_a_stream_that_is_not_sorted(tmp_path):
+    session = _session(
+        tmp_path, "neuropixels:\n  bin_file: '/a/x.bin'\nkilosort_on_neuropixels: false\n"
+    )
+    assert ss.preprocess(session, "neuropixels") is None
+    assert ss.skip_reason(session, ss.preprocess, "neuropixels") == (
+        "kilosort_on_neuropixels is false"
+    )
+
+
+def test_a_dry_run_says_what_preprocessing_it_would_do(tmp_path, monkeypatch):
+    seen: list[dict] = []
+    fake = _fake_kilosort(monkeypatch, seen)
+    session = _npx_session(tmp_path)
+
+    report = ss.sort_with_kilosort(session, "neuropixels", dry_run=True)
+
+    assert not fake.preprocessed                 # nothing written
+    assert report["preprocessing"]["status"].startswith("will be made")
+    assert any("CatGT" in step for step in report["preprocessing"]["steps"])
+    assert any("no catgt_dir" in step for step in report["preprocessing"]["steps"])
 
 
 # ---------------------------------------------------------------------------

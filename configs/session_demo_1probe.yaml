@@ -41,6 +41,14 @@ neuropixels:
   # once by notebooks/setup_demo_data.ipynb; a real run leaves this null and lets
   # setup_probe read ~snsGeomMap from the .meta instead.
   probe_file: "configs/probes/np1_default.json"
+  preprocess:            # done before Kilosort, which then only whitens
+    method: spikeinterface   # CatGT needs a SpikeGLX-named run; this file is not one
+    highpass_hz: 300
+    lowpass_hz: 10000
+    car_mode: gblcar
+    gfix: null           # CatGT only
+    phase_shift: false   # needs the .meta this download does not have
+    motion: null
   kilosort:                    # every Kilosort parameter, stated -- see "Kilosort settings"
     # ---- this session ----
     bad_channels: []             # dead sites, as recording channel numbers -- see "Bad channels"
@@ -48,8 +56,8 @@ neuropixels:
     tmin: 0                      # sort from this second of the binary -- see "Sort window"
     tmax: .inf                   # ...to this one; .inf = the end of the file
     # ---- Kilosort's own values: change only if you know what they mean ----
-    # preprocessing -- Kilosort's, on every batch; there is none outside it
-    do_CAR: true                 # subtract the median across channels
+    # Kilosort's own preprocessing, on every batch. Its CAR is always off:
+    # that is preprocess.car_mode's job, done before Kilosort reads the file
     invert_sign: false           # flip the sign of the data before sorting
     highpass_cutoff: 300         # Hz, Fourier-domain highpass
     artifact_threshold: .inf     # zero any batch whose |value| exceeds this

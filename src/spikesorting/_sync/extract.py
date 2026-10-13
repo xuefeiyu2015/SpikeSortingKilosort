@@ -185,8 +185,15 @@ def _run_layout(config: SessionConfig) -> spikeglx.RunLayout | None:
     return None if npx.bin_file is None else spikeglx.run_layout(npx.bin_file)
 
 
-def _catgt_specs(config: SessionConfig, layout: spikeglx.RunLayout) -> list[catgt.ExtractorSpec]:
-    """The extractors this session needs, in CatGT terms."""
+def catgt_extractors(
+    config: SessionConfig, layout: spikeglx.RunLayout
+) -> list[catgt.ExtractorSpec]:
+    """The extractors this session needs, in CatGT terms.
+
+    Public because the CatGT preprocessing pass (``pipeline.preprocess``) runs
+    them too, in the same read of the AP binary -- and has to ask for exactly
+    these, or its edges could not stand in for this module's own.
+    """
     npx = config.neuropixels
     specs = [
         catgt.digital_spec(
@@ -229,7 +236,11 @@ def _run_catgt_extraction(
         )
         return {}
 
-    specs = _catgt_specs(config, layout)
+    specs = catgt_extractors(config, layout)
+    reused = _edges_from_preprocessing(config, specs, report)
+    if reused is not None:
+        return reused
+
     args = catgt.build_extract_args(
         run_dir=layout.directory,
         run_name=layout.run_name,
@@ -251,7 +262,52 @@ def _run_catgt_extraction(
 
     catgt.run_catgt(machine.catgt_dir, args)
     produced = catgt.find_edge_files(config.paths.sync_for("neuropixels") / "catgt")
+    return _match_edge_files(produced, specs, report)
 
+
+def _edges_from_preprocessing(
+    config: SessionConfig,
+    specs: list[catgt.ExtractorSpec],
+    report: ExtractionReport,
+) -> dict[str, np.ndarray] | None:
+    """CatGT's edges from the preprocessing pass, when they answer this session.
+
+    The CatGT preprocessing pass runs these same extractors while it filters, so
+    the AP binary need not be read by CatGT a second time. Used only when its
+    record says it read *this* binary, unchanged, with *these* extractors; the
+    NumPy detector still runs and is compared against them either way.
+    """
+    from .._preprocess import provenance
+
+    if config.neuropixels.bin_file is None:
+        return None
+    record = provenance.read(config.paths.preprocessed_for("neuropixels"))
+    if not record or record.get("engine") != "catgt" or not record.get("edge_dir"):
+        return None
+    source = provenance.normalise(provenance.source_fingerprint(config.neuropixels.bin_file))
+    if record.get("source") != source:
+        report.note("CatGT edges from preprocessing not reused: the AP binary changed since")
+        return None
+    if record.get("extractors") != [spec.to_flag() for spec in specs]:
+        report.note(
+            "CatGT edges from preprocessing not reused: they were extracted with "
+            f"{record.get('extractors')}, the session now asks for "
+            f"{[spec.to_flag() for spec in specs]}"
+        )
+        return None
+    report.note(
+        f"CatGT edges from the preprocessing pass ({record['edge_dir']}); "
+        "no second CatGT read of the AP binary"
+    )
+    return _match_edge_files(catgt.find_edge_files(record["edge_dir"]), specs, report)
+
+
+def _match_edge_files(
+    produced: dict[str, Path],
+    specs: list[catgt.ExtractorSpec],
+    report: ExtractionReport,
+) -> dict[str, np.ndarray]:
+    """Each extractor's edge times, from the files CatGT wrote."""
     result: dict[str, np.ndarray] = {}
     for spec in specs:
         matches = [key for key in produced if f".{spec.kind}_" in f".{key}"]

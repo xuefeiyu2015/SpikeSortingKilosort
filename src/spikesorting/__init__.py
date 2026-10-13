@@ -8,6 +8,7 @@ Everything you run is a verb in :mod:`spikesorting.pipeline`, re-exported here::
     import spikesorting as ss
 
     config = ss.load_session_config("configs/athos.yaml", "windows_rig")
+    ss.preprocess(config, "blackrock")
     ss.sort_with_kilosort(config, "blackrock")
 
 Modules prefixed with an underscore are the machinery those verbs call:
@@ -34,6 +35,7 @@ from .pipeline import (  # noqa: F401
     extract_sync,
     load_machine,
     load_session_config,
+    preprocess,
     setup_probe,
     skip_reason,
     stamp_lfp_timebase,
@@ -49,6 +51,7 @@ __all__ = [
     "skip_reason",
     "load_session_config",
     "setup_probe",
+    "preprocess",
     "sort_with_kilosort",
     "extract_sync",
     "extract_lfp",
