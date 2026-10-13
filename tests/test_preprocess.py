@@ -49,7 +49,7 @@ def test_each_system_starts_from_its_own_defaults(tmp_path):
     assert npx.method == "catgt"
     assert (npx.highpass_hz, npx.lowpass_hz) == (300.0, 10000.0)
     assert npx.car_mode == "gblcar"
-    assert npx.gfix == (0.40, 0.10, 0.02)
+    assert npx.gfix is None                            # artifact removal is opt-in
     assert npx.phase_shift is True and npx.motion is None
 
     utah = session.preprocess_for("blackrock")
@@ -79,8 +79,8 @@ def test_a_stated_null_turns_a_step_off_rather_than_restoring_the_default(tmp_pa
          "Neuropixels only"),
         ("blackrock:\n  spike_file: '/b/z.ns6'\n  preprocess:\n    motion: dredge\n",
          "Neuropixels only"),
-        ("neuropixels:\n  bin_file: '/a/x.bin'\n  preprocess:\n    method: spikeinterface\n",
-         "gfix is CatGT's"),
+        ("neuropixels:\n  bin_file: '/a/x.bin'\n  preprocess:\n    method: spikeinterface\n"
+         "    gfix: [0.4, 0.1, 0.02]\n", "gfix is CatGT's"),
         ("neuropixels:\n  bin_file: '/a/x.bin'\n  preprocess:\n    method: spikeinterface\n"
          "    gfix: null\n    car_mode: gbldmx\n", "demuxed"),
         ("neuropixels:\n  bin_file: '/a/x.bin'\n  preprocess:\n    car_mode: loccar\n",
@@ -163,6 +163,9 @@ def test_the_catgt_command_is_the_workshops(tmp_path):
     args = catgt_pre.build_preprocess_args(
         layout, cfg.NEUROPIXELS_PREPROCESS, tmp_path / "out"
     )
+    assert not any(a.startswith("-gfix") for a in args)   # off unless asked for
+    spec = cfg.replace(cfg.NEUROPIXELS_PREPROCESS, gfix=(0.40, 0.10, 0.02))
+    args = catgt_pre.build_preprocess_args(layout, spec, tmp_path / "out")
 
     assert f"-dir={layout.directory}" in args
     assert "-run=run" in args and "-g=0" in args and "-t=0,0" in args

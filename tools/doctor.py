@@ -1259,7 +1259,7 @@ def _check_catgt_preprocessing(config: SessionConfig) -> list[Check]:
             fix=(
                 "preprocess on the rig and copy <neuropixels_dir>/preprocessed/ "
                 "here, or set neuropixels.preprocess.method: spikeinterface "
-                "(and gfix: null) in the session"
+                "(and gfix: null, if set) in the session"
             ),
             section=SECTION_SESSION,
         ))

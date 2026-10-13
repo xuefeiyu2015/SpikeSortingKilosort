@@ -322,8 +322,11 @@ class PreprocessSpec:
     car_mode: str | None = "gblcar"
     #: CatGT ``-gfix=amplitude_mV,slope_mV_per_sample,noise_mV``: transients
     #: crossing both are zeroed until the signal falls back below the noise
-    #: level. None turns it off. CatGT only; SpikeInterface has no equivalent.
-    gfix: tuple[float, float, float] | None = (0.40, 0.10, 0.02)
+    #: level. None (the default) turns it off -- the ReadMe's example values,
+    #: ``(0.40, 0.10, 0.02)``, are a starting point to try on a session with
+    #: chewing or licking artifacts, not something tuned for every recording.
+    #: CatGT only; SpikeInterface has no equivalent.
+    gfix: tuple[float, float, float] | None = None
     #: Correct the ADC multiplexing offset between channels (CatGT tshift,
     #: SpikeInterface ``phase_shift``). Neuropixels only; needs the ``.meta``.
     phase_shift: bool = True
@@ -358,10 +361,11 @@ class PreprocessSpec:
 
 
 #: Each system's starting point. Neuropixels follows the workshop pipeline
-#: (CatGT, tshift, -gblcar, -gfix); a Utah array has no multiplexing to undo and
+#: (CatGT, tshift, -gblcar; -gfix only when asked for); a Utah array has no
+#: multiplexing to undo and
 #: nothing CatGT can read, so it gets the SpikeInterface band and CAR alone.
 NEUROPIXELS_PREPROCESS = PreprocessSpec()
-BLACKROCK_PREPROCESS = PreprocessSpec(method="spikeinterface", gfix=None, phase_shift=False)
+BLACKROCK_PREPROCESS = PreprocessSpec(method="spikeinterface", phase_shift=False)
 
 
 

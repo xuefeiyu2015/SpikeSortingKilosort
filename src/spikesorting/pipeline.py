@@ -504,8 +504,7 @@ def _run_catgt_preprocessing(
             "instead by changing the session:\n"
             "      neuropixels:\n"
             "        preprocess:\n"
-            "          method: spikeinterface\n"
-            "          gfix: null          # CatGT-only; SpikeInterface has no equivalent"
+            "          method: spikeinterface   # and gfix: null, if it is set"
         )
 
     extractors = extract.catgt_extractors(config, layout)
@@ -517,7 +516,7 @@ def _run_catgt_preprocessing(
     except RuntimeError as error:
         raise RuntimeError(
             f"{error}\n  To preprocess without CatGT, set "
-            "neuropixels.preprocess.method: spikeinterface (and gfix: null)."
+            "neuropixels.preprocess.method: spikeinterface (and gfix: null, if set)."
         ) from None
 
     raw = _neuropixels_stream(config)

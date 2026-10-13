@@ -95,7 +95,10 @@ neuropixels:
     highpass_hz: 300     # band-pass, Hz: CatGT -apfilter=butter,12,lo,hi
     lowpass_hz: 10000
     car_mode: gblcar     # gblcar (median) | gbldmx (demuxed mean, CatGT only) | null
-    gfix: [0.40, 0.10, 0.02]   # CatGT transient removal: mV, mV/sample, mV; null = off
+    gfix: null           # CatGT artifact removal, off. To use it: [0.40, 0.10, 0.02]
+                         #   = zero any transient over 0.40 mV AND steeper than
+                         #   0.10 mV/sample, until it falls below 0.02 mV.
+                         #   For chewing/licking/cable artifacts -- see "Preprocessing"
     phase_shift: true    # ADC multiplexing correction (CatGT tshift)
     motion: null         # a SpikeInterface correct_motion preset (dredge, ...); needs nblocks: 0
   # (one preprocess: block for both probes -- by_probe: takes only kilosort:)
@@ -454,8 +457,9 @@ kilosort: {}
 # Preprocessing
 #   Done BEFORE Kilosort, which then only whitens (and re-applies its own
 #   highpass_cutoff, harmlessly, on an already band-passed signal). This is the
-#   workshop pipeline: CatGT -apfilter=butter,12,300,10000 -gblcar -gfix plus its
-#   tshift, optionally DREDge, then Kilosort with do_CAR off.
+#   workshop pipeline: CatGT -apfilter=butter,12,300,10000 -gblcar plus its
+#   tshift (and -gfix if asked for), optionally DREDge, then Kilosort with
+#   do_CAR off.
 #
 #     method        catgt (Neuropixels only -- it reads SpikeGLX runs) or
 #                   spikeinterface (both systems, and machines without CatGT).
@@ -468,11 +472,24 @@ kilosort: {}
 #                   gbldmx subtracts the mean within each group of channels the
 #                   probe digitises together -- CatGT only. null: no reference.
 #                   Kilosort's do_CAR is always false; it is not a setting here.
-#     gfix          CatGT finds fast, large transients (chewing, licking, cable
-#                   knocks) -- amplitude above the first number in mV AND slope
-#                   above the second in mV/sample -- and zeroes them until the
-#                   signal falls back below the third (mV). CatGT only;
-#                   SpikeInterface has no equivalent, so it must be null there.
+#     gfix          Off (null) by default. When set, CatGT finds fast, large
+#                   transients -- chewing, licking, cable knocks, solenoid
+#                   clicks, usually on most channels at once -- and zeroes them
+#                   (CatGT >= 4.4: a straight line) until the signal falls back
+#                   to noise. Three numbers, e.g. [0.40, 0.10, 0.02], the CatGT
+#                   ReadMe's example:
+#                     0.40  minimum |amplitude|, mV (400 uV)
+#                     0.10  minimum |slope|, mV/sample (100 uV in 33 us)
+#                     0.02  noise level, mV: the cut ends below this (20 uV)
+#                   An event must pass BOTH the amplitude and the slope test, so
+#                   ordinary spikes (50-300 uV over several samples) are left
+#                   alone; very large, sharp units can come close -- raise the
+#                   first two (e.g. [0.6, 0.15, 0.02]) if big units lose spikes.
+#                   Try it when Phy shows junk clusters of huge multichannel
+#                   events; compare a sort with and without. Without it, the
+#                   only artifact control left is Kilosort's artifact_threshold,
+#                   which blanks a whole 2 s batch. CatGT only: SpikeInterface
+#                   has no equivalent, so it must be null there.
 #     phase_shift   Neuropixels digitises its channels in groups, a fraction of
 #                   a sample apart; this re-aligns them (CatGT tshift, which is
 #                   on unless -no_tshift). Needs the .meta.
