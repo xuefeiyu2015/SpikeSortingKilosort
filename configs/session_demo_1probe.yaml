@@ -45,7 +45,8 @@ neuropixels:
     method: spikeinterface   # CatGT needs a SpikeGLX-named run; this file is not one
     highpass_hz: 300
     lowpass_hz: 10000
-    car_mode: gblcar
+    car_mode: gblcar     # gblcar = subtract the median across channels | null = no CAR
+                         #   anywhere (Kilosort's do_CAR is always off). gbldmx is CatGT only
     gfix: null           # CatGT only
     phase_shift: false   # needs the .meta this download does not have
     motion: null
