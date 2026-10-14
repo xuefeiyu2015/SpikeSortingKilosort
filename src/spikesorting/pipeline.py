@@ -505,6 +505,7 @@ def _run_catgt_preprocessing(
 
     extractors = extract.catgt_extractors(config, layout)
     dest = directory / "catgt"
+    dest.mkdir(parents=True, exist_ok=True)  # CatGT refuses a -dest that does not exist
     args = catgt_pre.build_preprocess_args(layout, spec, dest, extractors)
     log.info("CatGT: runit %s", " ".join(args))
     try:

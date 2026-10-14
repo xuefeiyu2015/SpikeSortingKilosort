@@ -219,7 +219,9 @@ def run_catgt(
     """Run CatGT and return the completed process.
 
     Raises ``RuntimeError`` on a non-zero exit, with CatGT's own output attached --
-    its error messages are specific and worth surfacing verbatim.
+    its error messages are specific and worth surfacing verbatim. CatGT writes
+    them to ``CatGT.log`` beside the script rather than to stdout/stderr, so the
+    end of that log is attached too; without it the error is empty.
     """
     script = catgt_script(catgt_dir)
     command = [str(script), *args]
@@ -232,14 +234,24 @@ def run_catgt(
     )
     if result.returncode != 0:
         raise RuntimeError(
-            "CatGT failed (exit {code})\ncommand: {cmd}\nstdout:\n{out}\nstderr:\n{err}".format(
+            "CatGT failed (exit {code})\ncommand: {cmd}\nstdout:\n{out}\nstderr:\n{err}\n{log}".format(
                 code=result.returncode,
-                cmd=" ".join(command),
+                cmd=subprocess.list2cmdline(command),
                 out=result.stdout,
                 err=result.stderr,
+                log=_log_tail(Path(catgt_dir) / "CatGT.log"),
             )
         )
     return result
+
+
+def _log_tail(path: Path, lines: int = 20) -> str:
+    """The last ``lines`` of CatGT's log, labelled -- or say there is none."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return f"{path.name}: not found at {path}"
+    return f"{path} (last {lines} lines):\n" + "\n".join(text[-lines:])
 
 
 def find_edge_files(dest: str | Path) -> dict[str, Path]:
