@@ -223,6 +223,7 @@ def test_the_sync_extractors_ride_along_in_the_same_pass(tmp_path):
     assert "-xd=2,0,-1,6,500" in args
     assert any(a.startswith("-xa=1,0,1,") for a in args)
     assert "-ob" in args                               # the OneBox stream, for -xa
+    assert "-obx=0" in args                            # ...and which OneBox
     assert args.count("-ap") == 1
 
 

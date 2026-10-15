@@ -54,6 +54,24 @@ def test_build_extract_args_emits_one_stream_flag_per_type():
     assert args.count("-ob") == 1
     assert args.count("-ap") == 1
     assert "-prb=0" in args
+    assert args.count("-obx=0") == 1
+
+
+def test_obx_names_the_onebox_each_extractor_addresses():
+    # -ob says "OneBox streams"; -obx says which. It comes from the extractors'
+    # own ip, so CatGT always opens the box each one reads.
+    specs = [
+        catgt.digital_spec(catgt.JS_OB, 2, -1, 6, 500),
+        catgt.analog_spec(catgt.JS_OB, 2, 1, 1.0),
+    ]
+    assert "-obx=2" in catgt.build_extract_args("D:/data", "run", specs)
+
+
+def test_no_onebox_extractor_means_no_obx():
+    specs = [catgt.digital_spec(catgt.JS_AP, 0, -1, 6, 500)]
+    args = catgt.build_extract_args("D:/data", "run", specs)
+    assert not any(a.startswith("-obx") for a in args)
+    assert "-ob" not in args
 
 
 def test_build_extract_args_contains_no_binary_rewriting_flags():

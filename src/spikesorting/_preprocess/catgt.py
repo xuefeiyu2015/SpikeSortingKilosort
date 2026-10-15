@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .._io.spikeglx import RunLayout
-from .._sync.catgt import _FOLDER_HINTS, ExtractorSpec
+from .._sync.catgt import _FOLDER_HINTS, ExtractorSpec, onebox_selection
 
 __all__ = [
     "catgt_unavailable",
@@ -72,6 +72,7 @@ def build_preprocess_args(
     # -ap always; -ob only when an extractor reads the OneBox.
     streams = ["-ap"] + [e.stream_flag for e in extractors if e.stream_flag != "-ap"]
     args.extend(dict.fromkeys(streams))
+    args.extend(onebox_selection(extractors))
     args.append(f"-apfilter=butter,12,{_num(spec.highpass_hz)},{_num(spec.lowpass_hz)}")
     if spec.car_mode is not None:
         args.append(f"-{spec.car_mode}")

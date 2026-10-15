@@ -210,11 +210,14 @@ def catgt_extractors(
     ]
     # Only when the run actually has a OneBox file: asking CatGT for an -xa
     # extraction from a stream that is not there is an error, not an empty result.
+    # Its ip is the OneBox's own number, read off the file found, so CatGT reads
+    # the file the NumPy detector does; -obx is derived from these ips.
     if layout.obx is not None:
+        onebox = spikeglx.onebox_number(layout.obx) or 0
         specs.append(
             catgt.analog_spec(
                 catgt.JS_OB,
-                0,
+                onebox,
                 npx.burst_word,
                 npx.burst_threshold_v[0],
                 npx.burst_threshold_v[1],
@@ -224,7 +227,7 @@ def catgt_extractors(
         )
         specs.append(
             catgt.digital_spec(
-                catgt.JS_OB, 0, -1, npx.sync_bit, npx.sync_pulse_ms, label=NPX_OBX_1HZ
+                catgt.JS_OB, onebox, -1, npx.sync_bit, npx.sync_pulse_ms, label=NPX_OBX_1HZ
             )
         )
     return specs

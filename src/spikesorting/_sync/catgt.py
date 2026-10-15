@@ -35,6 +35,7 @@ __all__ = [
     "read_edge_file",
     "catgt_script",
     "build_extract_args",
+    "onebox_selection",
     "run_catgt",
     "find_edge_files",
 ]
@@ -200,6 +201,7 @@ def build_extract_args(
 
     if any(spec.js in (JS_AP, JS_LF) for spec in specs):
         args.append("-prb=" + ",".join(str(p) for p in probes))
+    args.extend(onebox_selection(specs))
 
     args.extend(spec.to_flag() for spec in specs)
 
@@ -209,6 +211,18 @@ def build_extract_args(
         args.append(f"-dest={dest}")
 
     return args
+
+
+def onebox_selection(specs: list[ExtractorSpec]) -> list[str]:
+    """``-obx=<n,...>`` for the OneBoxes the extractors read, or nothing.
+
+    ``-ob`` says to process OneBox streams; ``-obx`` says *which* -- the
+    counterpart of ``-prb`` -- and the manual gives no default for leaving it
+    out. Derived from the extractors' own ip rather than stated beside them, so
+    the stream CatGT opens is always the one each extractor addresses.
+    """
+    boxes = sorted({spec.ip for spec in specs if spec.js == JS_OB})
+    return ["-obx=" + ",".join(str(n) for n in boxes)] if boxes else []
 
 
 def run_catgt(

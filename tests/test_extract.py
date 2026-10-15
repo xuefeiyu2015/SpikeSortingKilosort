@@ -169,6 +169,23 @@ def test_the_onebox_1hz_wave_is_extracted_from_its_own_sy_word(tmp_path):
     assert np.allclose(report.edge_sets[extract.NPX_1HZ].times_s, 0.25 + np.arange(5), atol=1e-6)
     # ...and CatGT is asked for the same thing: -xd on js=1, the OneBox.
     assert "-xd=1,0,-1,6,500" in report.catgt_commands[0]
+    assert "-obx=0" in report.catgt_commands[0]
+
+
+def test_the_onebox_number_comes_from_its_filename(tmp_path):
+    # A run whose OneBox is obx1: every OneBox extractor, and -obx, says 1.
+    from conftest import spikeglx_run
+
+    ap = spikeglx_run(tmp_path / "npx", obx_phase=0.4)[0]
+    layout = spikeglx.run_layout(ap)
+    layout.obx.rename(layout.obx.with_name("run_g0_t0.obx1.obx.bin"))
+    session = make_session(tmp_path, ap, n_chan=None, fs=None)
+
+    specs = extract.catgt_extractors(session, spikeglx.run_layout(ap))
+
+    assert spikeglx.onebox_number(spikeglx.run_layout(ap).obx) == 1
+    assert {s.ip for s in specs if s.js == catgt.JS_OB} == {1}
+    assert "-obx=1" in catgt.onebox_selection(specs)
 
 
 def test_a_run_without_a_onebox_has_no_onebox_edges(tmp_path):
