@@ -10,6 +10,9 @@ Two mappings live here:
   (the HPC, macOS).
 * TPrime -- the authoritative fine alignment, run by :mod:`spikesorting._sync.tprime`.
 
+:func:`fit_same_run_map` is a third, inside one SpikeGLX run: it takes the OneBox
+clock onto the probe's, so the burst can be compared on the probe clock.
+
 Both are validated the same way: map the 14 s burst onsets and check the
 residuals, which is pipeline step 9.
 """
@@ -26,7 +29,9 @@ __all__ = [
     "overlap_window",
     "trim_to_window",
     "trim_pair_to_overlap",
+    "trim_pair_under_map",
     "fit_linear_map",
+    "fit_same_run_map",
     "apply_linear_map",
     "validate_alignment",
 ]
@@ -122,6 +127,29 @@ def trim_pair_to_overlap(
     return reference, other
 
 
+def trim_pair_under_map(
+    reference_s: np.ndarray,
+    other_s: np.ndarray,
+    other_mapped_s: np.ndarray,
+    margin_s: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Trim both trains to their common window, judged through a coarse map.
+
+    ``other_mapped_s`` is ``other_s`` already on the reference clock (the burst
+    map, drift included). Returns ``(reference, other, other_mapped)`` trimmed,
+    with ``other`` still on its own clock -- that is what the fine fit needs.
+    """
+    other = np.asarray(other_s, dtype=np.float64).reshape(-1)
+    mapped = np.asarray(other_mapped_s, dtype=np.float64).reshape(-1)
+    if other.size != mapped.size:
+        raise ValueError(f"other has {other.size} times but its mapping has {mapped.size}")
+    start, stop = overlap_window(reference_s, mapped)
+    start += margin_s
+    stop -= margin_s
+    keep = (mapped >= start) & (mapped <= stop)
+    return trim_to_window(reference_s, start, stop), other[keep], mapped[keep]
+
+
 def fit_linear_map(other_s: np.ndarray, reference_s: np.ndarray) -> LinearMap:
     """Least-squares fit taking ``other`` times onto ``reference`` times.
 
@@ -144,6 +172,27 @@ def fit_linear_map(other_s: np.ndarray, reference_s: np.ndarray) -> LinearMap:
         n_points=int(other.size),
         residuals_s=residuals,
     )
+
+
+def fit_same_run_map(
+    other_s: np.ndarray, reference_s: np.ndarray, period_s: float = 1.0
+) -> LinearMap:
+    """Fit one SpikeGLX stream's 1 Hz edges onto another's from the same run.
+
+    The streams of one run start together, so the edges pair with no offset; only
+    the rates differ. A gap wider than a quarter period is a missing edge, not a
+    match, which keeps a dropped pulse from pairing with its neighbour.
+    """
+    from .burst import match_times  # local import keeps the two modules independent
+
+    reference, other = trim_pair_to_overlap(reference_s, other_s, 0.0, margin_s=period_s / 4)
+    ref_idx, other_idx = match_times(reference, other, 0.0, tolerance_s=period_s / 4)
+    if ref_idx.size < 2:
+        raise ValueError(
+            f"only {ref_idx.size} 1 Hz edges pair between the two streams; "
+            "cannot fit a map between them"
+        )
+    return fit_linear_map(other[other_idx], reference[ref_idx])
 
 
 def apply_linear_map(times_s: np.ndarray, mapping: LinearMap) -> np.ndarray:

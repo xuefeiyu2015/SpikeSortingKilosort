@@ -1385,6 +1385,73 @@ def test_time_remapping_recovers_a_planted_offset_and_drift(tmp_path):
     assert "ppm" in result.summary()
 
 
+def _plant_burst_on_the_onebox_clock(session, with_onebox_1hz):
+    """Three hours: a probe 50 ppm off Blackrock, a OneBox 30 ppm off the probe.
+
+    The burst is written on the OneBox clock, as it is recorded, so it can only
+    land on Blackrock time within 1 ms once it has been taken onto the probe
+    clock first. 50 ppm over three hours is 540 ms -- past the 1 Hz pairing's
+    250 ms window, so the right cycle is found only through the drift-aware
+    coarse map.
+    """
+    from conftest import coded_burst_times
+    from spikesorting._sync import catgt
+
+    def to_probe(t):
+        return (t - 12.3456) * (1 + 50e-6)
+
+    def to_onebox(t):
+        return (t - 0.002) / (1 + 30e-6)
+
+    br_1hz = np.arange(0.0, 10800.0, 1.0) + 100.0
+    br_burst = coded_burst_times(770, interval_s=14.0, pulses_per_burst=8, start_s=105.0)
+    br_sync, npx_sync = (session.paths.sync_for(s) for s in ("blackrock", "neuropixels"))
+    for folder in (br_sync, npx_sync):
+        folder.mkdir(parents=True, exist_ok=True)
+    catgt.write_edge_file(br_sync / "blackrock_1hz.txt", br_1hz)
+    catgt.write_edge_file(br_sync / "blackrock_burst.txt", br_burst)
+    catgt.write_edge_file(npx_sync / "npx_1hz.txt", to_probe(br_1hz))
+    catgt.write_edge_file(npx_sync / "npx_burst.txt", to_onebox(to_probe(br_burst)))
+    if with_onebox_1hz:
+        catgt.write_edge_file(npx_sync / "npx_obx_1hz.txt", to_onebox(to_probe(br_1hz)))
+
+
+def test_the_burst_is_mapped_off_the_onebox_clock_before_validation(tmp_path):
+    session = _session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+
+    result = ss.time_remapping(session, "neuropixels")
+    report = ss.validate_remapping(session, figures=False)
+
+    assert result.mapping.intercept == pytest.approx(12.3456, abs=1e-5)  # right cycle
+    assert report.passed
+    assert report.max_residual_s < 1e-5
+    time_map = json.loads((session.paths.aligned / "time_map.json").read_text())
+    assert time_map["burst_clock"] == "probe"
+    assert time_map["onebox_to_probe"]["drift_ppm"] == pytest.approx(30.0, abs=0.01)
+    validation = json.loads((session.paths.aligned / "validation.json").read_text())
+    assert validation["burst_clock"] == "probe"
+
+
+def test_without_the_onebox_1hz_wave_the_onebox_drift_fails_validation(tmp_path):
+    # The bug this pins: the probe's map applied to OneBox-clock burst times.
+    session = _session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=False)
+
+    result = ss.time_remapping(session, "neuropixels")
+    report = ss.validate_remapping(session, figures=False)
+
+    assert result.mapping.intercept == pytest.approx(12.3456, abs=1e-5)  # map is right
+    assert report.n_checked > 0                  # it did compare bursts...
+    assert not report.passed                     # ...and the drift showed
+    assert report.max_residual_s > 1e-3
+    time_map = json.loads((session.paths.aligned / "time_map.json").read_text())
+    assert time_map["burst_clock"] == "onebox"
+    assert time_map["onebox_to_probe"] is None
+    validation = json.loads((session.paths.aligned / "validation.json").read_text())
+    assert validation["burst_clock"] == "onebox"
+
+
 def test_two_probes_are_each_fitted_onto_blackrock_time_on_their_own(tmp_path):
     # Two probes in one run are two oscillators, and now two session files. One
     # fit cannot serve both, so each gets its own map in its own directory -- and

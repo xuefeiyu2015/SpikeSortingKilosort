@@ -1417,6 +1417,40 @@ def _load_edges(config: SessionConfig, name: str) -> np.ndarray | None:
     return catgt.read_edge_file(path) if path.exists() else None
 
 
+def _burst_on_probe_clock(
+    config: SessionConfig, npx_burst: np.ndarray | None
+) -> tuple[np.ndarray | None, align.LinearMap | None]:
+    """The burst times on the probe's clock, and the map that put them there.
+
+    The burst is read off the OneBox, the 1 Hz train off the probe's headstage:
+    two crystals. The OneBox's own SY word carries the same 1 Hz wave, so pairing
+    its edges with the probe's maps one clock onto the other. Without them the
+    burst stays on the OneBox clock and is returned unchanged with ``None``.
+    """
+    if npx_burst is None or not npx_burst.size:
+        return npx_burst, None
+    npx_1hz = _load_edges(config, extract.NPX_1HZ)
+    if npx_1hz is None or not npx_1hz.size:
+        return npx_burst, None  # the caller reports the missing probe train
+    obx_1hz = _load_edges(config, extract.NPX_OBX_1HZ)
+    if obx_1hz is None or not obx_1hz.size:
+        log.warning(
+            "no OneBox 1 Hz edges (%s.txt), so the burst stays on the OneBox clock and "
+            "its comparison with Blackrock includes the OneBox-to-probe drift; "
+            "re-run extract_sync to map it",
+            extract.NPX_OBX_1HZ,
+        )
+        return npx_burst, None
+    obx_map = align.fit_same_run_map(obx_1hz, npx_1hz, config.sync_period_s)
+    log.info(
+        "burst mapped OneBox -> probe clock from %d edges: %+.2f ppm, offset %.6f s, "
+        "fit residual max %.1f us",
+        obx_map.n_points, obx_map.drift_ppm, obx_map.intercept,
+        np.abs(obx_map.residuals_s).max() * 1e6,
+    )
+    return obx_map.apply(npx_burst), obx_map
+
+
 # ----------------------------------------------------------------------------
 # Step 5: onto the Blackrock timebase
 # ----------------------------------------------------------------------------
@@ -1478,7 +1512,9 @@ def time_remapping(
     br_1hz = _load_edges(config, extract.BR_1HZ)
     npx_1hz = _load_edges(config, extract.NPX_1HZ)
     br_burst = _load_edges(config, extract.BR_BURST)
-    npx_burst = _load_edges(config, extract.NPX_BURST)
+    npx_burst, obx_map = _burst_on_probe_clock(
+        config, _load_edges(config, extract.NPX_BURST)
+    )
 
     missing = [
         name
@@ -1491,16 +1527,18 @@ def time_remapping(
         )
         return None
 
-    # 1. Coarse offset from the 14 s coded bursts.
+    # 1. Coarse map from the 14 s coded bursts, paired by code so drift cannot
+    #    pick the wrong cycle -- and a line, so it holds at both ends of hours.
     match = None
     if br_burst is not None and npx_burst is not None and br_burst.size and npx_burst.size:
         match = burst.match_bursts(br_burst, npx_burst, min_gap_s=config.burst_interval_s / 2)
         offset = match.offset_s
+        coarse = match.apply
         log.info(
-            "coarse offset %.6f s from %d matched bursts (of %d Blackrock / %d SpikeGLX), "
-            "max residual %.3f ms",
-            offset, match.n_matched, match.n_reference, match.n_other,
-            match.max_residual_s * 1e3,
+            "coarse map from %d code-matched bursts (of %d Blackrock / %d SpikeGLX; "
+            "runner-up offset had %d): %+.1f ppm, offset %.6f s, max residual %.3f ms",
+            match.n_matched, match.n_reference, match.n_other, match.runner_up_matches,
+            (match.slope - 1.0) * 1e6, offset, match.max_residual_s * 1e3,
         )
     else:
         log.warning(
@@ -1510,11 +1548,14 @@ def time_remapping(
         offset = burst.estimate_offset(br_1hz, npx_1hz, tolerance_s=0.1)
         log.info("coarse offset %.6f s from the 1 Hz trains", offset)
 
+        def coarse(times):
+            return np.asarray(times, dtype=np.float64) + offset
+
     # 2. Trim both 1 Hz trains to their overlapping window. TPrime aligns edge
     #    *sequences*, so an edge present in only one recording shifts the
     #    correspondence by whole cycles.
-    br_trim, npx_trim = align.trim_pair_to_overlap(
-        br_1hz, npx_1hz, offset, margin_s=config.sync_period_s / 4
+    br_trim, npx_trim, npx_coarse = align.trim_pair_under_map(
+        br_1hz, npx_1hz, coarse(npx_1hz), margin_s=config.sync_period_s / 4
     )
     log.info(
         "1 Hz trains trimmed to overlap: Blackrock %d -> %d, SpikeGLX %d -> %d",
@@ -1527,7 +1568,7 @@ def time_remapping(
 
     # 3. Pair the trimmed edges and fit the map (also the TPrime fallback).
     ref_idx, other_idx = burst.match_times(
-        br_trim, npx_trim, offset, tolerance_s=config.sync_period_s / 4
+        br_trim, npx_coarse, 0.0, tolerance_s=config.sync_period_s / 4
     )
     if ref_idx.size < 2:
         raise ValueError(f"only {ref_idx.size} matched 1 Hz edges; cannot fit a time map")
@@ -1545,7 +1586,7 @@ def time_remapping(
     spike_times_path = results_dir / "spike_times.npy"
     if not spike_times_path.exists():
         log.info("no sorting at %s; wrote the time map only", results_dir)
-        _save_map(aligned_dir, mapping, offset, config)
+        _save_map(aligned_dir, mapping, offset, config, obx_map)
         stamp_lfp_timebase(config, mapping)
         return TimeMap(mapping, offset, "map_only", burst_match=match)
 
@@ -1585,13 +1626,17 @@ def time_remapping(
         )
         method = "linear_fit"
 
-    _save_map(aligned_dir, mapping, offset, config)
+    _save_map(aligned_dir, mapping, offset, config, obx_map)
     stamp_lfp_timebase(config, mapping)
     return TimeMap(mapping, offset, method, aligned_path=out_path, burst_match=match)
 
 
 def _save_map(
-    aligned_dir: Path, mapping: align.LinearMap, offset: float, config: SessionConfig
+    aligned_dir: Path,
+    mapping: align.LinearMap,
+    offset: float,
+    config: SessionConfig,
+    obx_map: align.LinearMap | None = None,
 ) -> None:
     payload = {
         "session": config.session,
@@ -1603,6 +1648,16 @@ def _save_map(
         "n_points": mapping.n_points,
         "fit_max_residual_s": float(np.abs(mapping.residuals_s).max()),
         "formula": "blackrock_time = slope * spikeglx_time + intercept",
+        # Which clock the burst was on when it picked the coarse offset.
+        "burst_clock": "probe" if obx_map is not None else "onebox",
+        "onebox_to_probe": None if obx_map is None else {
+            "slope": obx_map.slope,
+            "intercept": obx_map.intercept,
+            "drift_ppm": obx_map.drift_ppm,
+            "n_points": obx_map.n_points,
+            "fit_max_residual_s": float(np.abs(obx_map.residuals_s).max()),
+            "formula": "probe_time = slope * onebox_time + intercept",
+        },
     }
     with open(Path(aligned_dir) / "time_map.json", "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
@@ -1616,6 +1671,11 @@ def validate_remapping(
     A real check precisely because the bursts were **held out** of the 1 Hz fit.
     Uncorrected clock drift of tens of ppm is 72 ms/hour at 20 ppm and fails the
     1 ms tolerance, which is the point.
+
+    The burst is recorded on the OneBox, not the probe, so it is first mapped onto
+    the probe clock by the OneBox's own 1 Hz edges. ``validation.json`` says
+    whether that happened (``burst_clock``); when it did not, the residuals
+    include the OneBox-to-probe drift as well as the alignment's error.
 
     Returns ``None`` when only one system is declared, no map has been fitted, or
     neither system recorded bursts -- in which case the 1 Hz fit residuals in
@@ -1633,7 +1693,9 @@ def validate_remapping(
         return None
 
     br_burst = _load_edges(config, extract.BR_BURST)
-    npx_burst = _load_edges(config, extract.NPX_BURST)
+    npx_burst, obx_map = _burst_on_probe_clock(
+        config, _load_edges(config, extract.NPX_BURST)
+    )
     if br_burst is None or npx_burst is None or not br_burst.size or not npx_burst.size:
         log.warning(
             "no 14 s burst edges on one or both systems, so the alignment cannot be "
@@ -1666,6 +1728,7 @@ def validate_remapping(
                 "median_residual_s": report.median_residual_s,
                 "tolerance_s": report.tolerance_s,
                 "passed": report.passed,
+                "burst_clock": "probe" if obx_map is not None else "onebox",
             },
             handle,
             indent=2,

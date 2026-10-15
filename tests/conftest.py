@@ -77,6 +77,7 @@ def spikeglx_run(
     sites: dict[int, int] | None = None,
     duration_s: float = 5.0,
     n_chan: int = 8,
+    obx_phase: float | None = None,
 ) -> dict[int, Path]:
     """A SpikeGLX run folder holding one AP binary + ``.meta`` per probe.
 
@@ -87,6 +88,9 @@ def spikeglx_run(
     Returns ``{probe index: AP binary}``. A session names the binary, so that is
     what a caller needs; the run folder around it is what ``run_layout`` reads
     back to drive CatGT.
+
+    ``obx_phase`` also writes the run's OneBox file -- XA0, XA1, SY -- whose SY
+    bit 6 carries the same 1 Hz wave, first edge at that phase.
     """
     fs = 30000.0
     gate_dir = Path(root) / f"{run_name}_g{gate}"
@@ -105,6 +109,18 @@ def spikeglx_run(
             _imec_meta(n_chan, (sites or {}).get(probe, 4)), encoding="utf-8"
         )
         built[probe] = bin_path
+
+    if obx_phase is not None:
+        data = np.zeros((int(duration_s * fs), 3), dtype=np.int16)
+        wave = square_wave(duration_s, fs, period_s=1.0, phase_s=obx_phase)
+        data[: wave.size, -1] = (wave.astype(np.uint16) << 6).astype(np.int16)
+        obx_path = gate_dir / f"{run_name}_g{gate}_t{trigger}.obx0.obx.bin"
+        obx_path.write_bytes(data.tobytes())
+        obx_path.with_suffix(".meta").write_text(
+            "nSavedChans=3\nobSampRate=30000\ntypeThis=obx\nsnsXaDwSy=2,0,1\n"
+            "obAiRangeMax=5\nobMaxInt=32768\n",
+            encoding="utf-8",
+        )
     return built
 
 

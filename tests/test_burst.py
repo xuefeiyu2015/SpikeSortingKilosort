@@ -64,22 +64,15 @@ def test_candidate_offsets_are_one_burst_interval_apart():
     assert np.allclose(np.diff(candidates), 14.0, atol=1e-6)
 
 
-def test_score_offset_prefers_the_coded_alignment():
-    # A one-cycle error still lines the 20 burst onsets up perfectly -- that is
-    # exactly the ambiguity onsets cannot resolve. The 140 remaining pulses carry
-    # the code, and at the wrong cycle almost none of them agree.
+def test_codes_pair_each_burst_with_itself_and_nothing_else():
+    # A one-cycle error lines the onsets up perfectly -- the ambiguity onsets
+    # cannot resolve. The intervals inside each burst can: every burst's code
+    # matches its own and no other.
     reference = coded_burst_times(20, pulses_per_burst=8)
-    tolerance = 1e-4
 
-    correct = burst.score_offset(reference, reference, 0.0, tolerance)
-    off_by_one = burst.score_offset(reference, reference, 14.0, tolerance)
-    off_by_two = burst.score_offset(reference, reference, 28.0, tolerance)
+    _, _, ref_idx, other_idx = burst.match_burst_codes(reference, reference - 3.0)
 
-    assert correct == reference.size == 160
-    assert off_by_one < 0.25 * correct
-    assert off_by_two < 0.25 * correct
-    # Barely more than the 20 onsets survive a wrong-cycle alignment.
-    assert off_by_one < 40
+    assert ref_idx.tolist() == other_idx.tolist() == list(range(20))
 
 
 def test_match_times_is_one_to_one():
@@ -101,7 +94,8 @@ def test_match_bursts_end_to_end():
     assert match.offset_s == pytest.approx(offset, abs=1e-9)
     assert match.n_matched == 20
     assert match.max_residual_s < 1e-9
-    assert match.pulse_score == reference.size
+    assert match.slope == pytest.approx(1.0, abs=1e-12)
+    assert match.code_matches == 20
 
 
 def test_match_bursts_uses_the_code_when_starts_do_not_overlap():
@@ -118,7 +112,45 @@ def test_match_bursts_uses_the_code_when_starts_do_not_overlap():
     assert match.n_matched == 20  # bursts 5..24
     assert match.n_reference == 25
     assert match.n_other == 25
-    assert match.pulse_score > match.runner_up_score
+    assert match.runner_up_matches == 0
+
+
+@pytest.mark.parametrize("ppm", [5.0, 20.0, 50.0])
+def test_match_bursts_holds_the_right_cycle_under_hours_of_drift(ppm):
+    # Three hours at 50 ppm is 540 ms -- no single offset lines the bursts up to
+    # a few ms, which used to let a wrong cycle win on chance coincidences.
+    # Pairing by code involves no offset, and the line through the pairs carries
+    # the drift.
+    reference = coded_burst_times(770, pulses_per_burst=8, start_s=105.0)
+    other = (reference - 12.3456) * (1 + ppm * 1e-6)
+
+    match = burst.match_bursts(reference, other)
+
+    assert match.n_matched == 770
+    assert (match.slope - 1.0) * 1e6 == pytest.approx(-ppm, rel=1e-3)
+    assert match.max_residual_s < 1e-6
+    assert np.allclose(match.apply(other), reference, atol=1e-6)
+
+
+def test_a_code_repeated_hourly_is_resolved_by_agreement():
+    # The real burst code repeats every hour, so each burst also matches the
+    # one 3600 s away. Those false pairs disagree with the true offset by an
+    # hour, and lose the vote.
+    hour = coded_burst_times(257, pulses_per_burst=8)[: 257 * 8]
+    reference = np.concatenate([hour, hour + 257 * 14.0])     # two hours, same codes
+    other = reference[reference < 4000.0] - 10.0
+
+    match = burst.match_bursts(reference, other)
+
+    assert match.offset_s == pytest.approx(10.0, abs=1e-6)
+    assert match.code_matches > match.runner_up_matches > 0
+
+
+def test_codes_that_never_agree_are_refused_not_guessed():
+    reference = coded_burst_times(10, pulses_per_burst=8)
+    other = coded_burst_times(10, pulses_per_burst=5)          # different code entirely
+    with pytest.raises(ValueError, match="carries the code"):
+        burst.match_bursts(reference, other)
 
 
 def test_match_bursts_rejects_empty_input():

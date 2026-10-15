@@ -1,12 +1,13 @@
 """Drive sync-edge extraction for a session (pipeline steps 2 and 4).
 
-Produces four canonical edge files, each in the folder beside the recording it
+Produces five canonical edge files, each in the folder beside the recording it
 came from -- the SpikeGLX pair under ``neuropixels_dir/kilosort4/``, the NSP pair
 under ``blackrock_dir/kilosort4/``:
 
 ===================== ==============================================
 ``npx_1hz.txt``       SpikeGLX SY-word bit 6, the 1 Hz square wave
 ``npx_burst.txt``     OneBox XA1, the 14 s coded burst
+``npx_obx_1hz.txt``   OneBox SY-word bit 6, the same 1 Hz wave on the OneBox clock
 ``blackrock_1hz.txt`` NSP ns5 channel 1, the same 1 Hz square wave
 ``blackrock_burst.txt`` NSP ns5 channel 2, the same 14 s burst
 ===================== ==============================================
@@ -14,6 +15,11 @@ under ``blackrock_dir/kilosort4/``:
 Every file uses the CatGT convention: leading-edge times in seconds from stream
 start, one per line. Downstream (``burst``, ``align``, ``tprime``) reads only
 these, so it does not care which extractor produced them.
+
+**The burst and the 1 Hz train are on different clocks.** ``npx_1hz`` is the
+probe's headstage; ``npx_burst`` is the OneBox. The OneBox records the same 1 Hz
+wave in its own SY word, which is what ``npx_obx_1hz`` is: it lets alignment put
+the burst on the probe clock before comparing it with Blackrock.
 
 SpikeGLX edges are produced twice where possible -- once by CatGT, once by the
 NumPy fallback -- and compared. Agreement is the correctness check that lets the
@@ -52,6 +58,7 @@ __all__ = [
 
 NPX_1HZ = "npx_1hz"
 NPX_BURST = "npx_burst"
+NPX_OBX_1HZ = "npx_obx_1hz"
 BR_1HZ = "blackrock_1hz"
 BR_BURST = "blackrock_burst"
 
@@ -60,6 +67,7 @@ BR_BURST = "blackrock_burst"
 EDGE_SYSTEM = {
     NPX_1HZ: "neuropixels",
     NPX_BURST: "neuropixels",
+    NPX_OBX_1HZ: "neuropixels",
     BR_1HZ: "blackrock",
     BR_BURST: "blackrock",
 }
@@ -214,6 +222,11 @@ def catgt_extractors(
                 label=NPX_BURST,
             )
         )
+        specs.append(
+            catgt.digital_spec(
+                catgt.JS_OB, 0, -1, npx.sync_bit, npx.sync_pulse_ms, label=NPX_OBX_1HZ
+            )
+        )
     return specs
 
 
@@ -311,9 +324,10 @@ def _match_edge_files(
     result: dict[str, np.ndarray] = {}
     for spec in specs:
         matches = [key for key in produced if f".{spec.kind}_" in f".{key}"]
-        if spec.kind == "xd":
+        # By stream, not by kind: the imec and the OneBox SY words are both -xd.
+        if spec.js == catgt.JS_AP:
             matches = [k for k in matches if ".ap." in k or ".imec" in k]
-        elif spec.kind == "xa":
+        elif spec.js == catgt.JS_OB:
             matches = [k for k in matches if ".obx" in k or ".ob." in k]
         if matches:
             result[spec.label] = catgt.read_edge_file(produced[matches[0]])
@@ -389,6 +403,36 @@ def extract_neuropixels_edges(
             report,
             stream=f"{obx_info.path.name} XA{npx.burst_word}",
         )
+
+        # The same 1 Hz wave on the OneBox's own clock: what maps the burst onto
+        # the probe's. Without it the burst stays on the OneBox clock.
+        if obx_info.sy_index is None:
+            report.note(
+                f"OneBox 1 Hz extraction skipped: {obx_info.path.name} has no SY word, "
+                "so the burst stays on the OneBox clock."
+            )
+        else:
+            times = edges.stream_pulse_times(
+                _sy_bit_chunks(obx_info, npx.sync_bit, chunk_bytes),
+                threshold=0.5,
+                fs=obx_info.fs,
+                duration_ms=npx.sync_pulse_ms,
+            )
+            report.edge_sets[NPX_OBX_1HZ] = _finalize(
+                NPX_OBX_1HZ,
+                times,
+                obx_info.fs,
+                catgt_times.get(NPX_OBX_1HZ),
+                sync_dir,
+                report,
+                stream=f"{obx_info.path.name} SY bit {npx.sync_bit}",
+            )
+            if times.size == 0:
+                report.note(
+                    f"No 1 Hz sync pulses found in {obx_info.path.name} SY bit "
+                    f"{npx.sync_bit}, so the burst cannot be mapped onto the probe clock "
+                    "and validation will include the OneBox-to-probe drift."
+                )
 
     return report
 
