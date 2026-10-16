@@ -152,6 +152,75 @@ def test_two_probes_of_one_run_are_two_sessions_with_their_own_edges(tmp_path):
     assert written[0] != written[1]
 
 
+def test_the_onebox_1hz_wave_is_extracted_from_its_own_sy_word(tmp_path):
+    # The burst is on the OneBox clock; its SY word carries the same 1 Hz wave,
+    # which is what maps the burst onto the probe's. A different phase from the
+    # probe's proves the edges were read from the OneBox file, not the AP one.
+    from conftest import spikeglx_run
+
+    ap = spikeglx_run(tmp_path / "npx", phases={0: 0.25}, obx_phase=0.4)[0]
+    session = make_session(tmp_path, ap, n_chan=None, fs=None)
+
+    report = extract.extract_neuropixels_edges(session)
+
+    obx = report.edge_sets[extract.NPX_OBX_1HZ]
+    assert obx.path == session.paths.sync_for("neuropixels") / "npx_obx_1hz.txt"
+    assert np.allclose(obx.times_s, 0.4 + np.arange(5), atol=1e-6)
+    assert np.allclose(report.edge_sets[extract.NPX_1HZ].times_s, 0.25 + np.arange(5), atol=1e-6)
+    # ...and CatGT is asked for the same thing: -xd on js=1, the OneBox.
+    assert "-xd=1,0,-1,6,500" in report.catgt_commands[0]
+    assert "-obx=0" in report.catgt_commands[0]
+
+
+def test_the_onebox_number_comes_from_its_filename(tmp_path):
+    # A run whose OneBox is obx1: every OneBox extractor, and -obx, says 1.
+    from conftest import spikeglx_run
+
+    ap = spikeglx_run(tmp_path / "npx", obx_phase=0.4)[0]
+    layout = spikeglx.run_layout(ap)
+    layout.obx.rename(layout.obx.with_name("run_g0_t0.obx1.obx.bin"))
+    session = make_session(tmp_path, ap, n_chan=None, fs=None)
+
+    specs = extract.catgt_extractors(session, spikeglx.run_layout(ap))
+
+    assert spikeglx.onebox_number(spikeglx.run_layout(ap).obx) == 1
+    assert {s.ip for s in specs if s.js == catgt.JS_OB} == {1}
+    assert "-obx=1" in catgt.onebox_selection(specs)
+
+
+def test_a_run_without_a_onebox_has_no_onebox_edges(tmp_path):
+    from conftest import spikeglx_run
+
+    ap = spikeglx_run(tmp_path / "npx")[0]
+    session = make_session(tmp_path, ap, n_chan=None, fs=None)
+
+    report = extract.extract_neuropixels_edges(session)
+
+    assert extract.NPX_OBX_1HZ not in report.edge_sets
+    assert not (session.paths.sync_for("neuropixels") / "npx_obx_1hz.txt").exists()
+    assert "-xd=1," not in report.catgt_commands[0]
+
+
+def test_catgt_edge_files_are_told_apart_by_stream_not_by_kind(tmp_path):
+    # Both SY words are -xd extractions; only the stream in the filename says
+    # which is the probe's and which the OneBox's.
+    for name, value in (
+        ("run_g0_tcat.imec0.ap.xd_384_6_500.txt", 0.25),
+        ("run_g0_tcat.obx0.obx.xd_2_6_500.txt", 0.4),
+    ):
+        catgt.write_edge_file(tmp_path / name, np.array([value]))
+    produced = catgt.find_edge_files(tmp_path)
+    specs = [
+        catgt.digital_spec(catgt.JS_AP, 0, -1, 6, 500, label=extract.NPX_1HZ),
+        catgt.digital_spec(catgt.JS_OB, 0, -1, 6, 500, label=extract.NPX_OBX_1HZ),
+    ]
+
+    found = extract._match_edge_files(produced, specs, extract.ExtractionReport())
+
+    assert found[extract.NPX_1HZ][0] == pytest.approx(0.25)
+    assert found[extract.NPX_OBX_1HZ][0] == pytest.approx(0.4)
+
+
 def test_extract_sync_returns_none_for_a_system_that_never_recorded(tmp_path):
     # Each system is extracted on its own now, so "Blackrock did not record" is a
     # None from that call rather than a note buried in a combined report.
@@ -184,7 +253,7 @@ def test_alignment_recovers_a_known_offset_and_drift(tmp_path):
     npx_1hz = to_spikeglx(br_1hz[br_1hz >= 200.0])
     npx_burst = to_spikeglx(br_burst[br_burst >= 200.0])
 
-    match = burst.match_bursts(br_burst, npx_burst, min_gap_s=7.0, tolerance_s=0.05)
+    match = burst.match_bursts(br_burst, npx_burst, min_gap_s=7.0)
     assert match.n_matched > 50
     assert match.offset_s == pytest.approx(offset, abs=0.5)
 

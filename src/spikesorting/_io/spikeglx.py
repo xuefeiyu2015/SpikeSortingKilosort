@@ -394,6 +394,8 @@ _RUN_FILENAME = re.compile(
 #: The probe number in a SpikeGLX stream filename -- ``.imec<n>.`` anywhere in
 #: it. Looser than :data:`_RUN_FILENAME`, which needs the whole run.
 _PROBE_IN_NAME = re.compile(r"\.imec(\d+)\.")
+#: The OneBox index in a name: ``<run>_g0_t0.obx0.obx.bin`` -> 0.
+_ONEBOX_IN_NAME = re.compile(r"\.obx(\d+)\.")
 
 
 def probe_number(path: str | Path) -> int | None:
@@ -405,6 +407,16 @@ def probe_number(path: str | Path) -> int | None:
     extract) simply returns None, leaving the caller to fall back on position.
     """
     match = _PROBE_IN_NAME.search(Path(path).name)
+    return int(match.group(1)) if match else None
+
+
+def onebox_number(path: str | Path) -> int | None:
+    """The OneBox a binary belongs to, read off its name, or None if it says none.
+
+    SpikeGLX numbers OneBoxes from zero in the filename (``.obx0.``); CatGT
+    addresses one by the same number, as ``-obx=<n>`` and as an extractor's ip.
+    """
+    match = _ONEBOX_IN_NAME.search(Path(path).name)
     return int(match.group(1)) if match else None
 
 

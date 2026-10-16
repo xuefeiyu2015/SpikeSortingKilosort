@@ -13,6 +13,7 @@ from .summary import (  # noqa: F401
     plot_isi_histogram,
     plot_mean_waveform,
     plot_sorting_overview,
+    plot_spike_positions,
     plot_unit_page,
     plot_unit_summary,
     save_figure,

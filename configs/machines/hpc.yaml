@@ -31,3 +31,7 @@ tprime_dir: null
 #   curation: phy
 
 device: "cuda"
+
+# Worker processes for SpikeInterface preprocessing (preprocess.method:
+# spikeinterface, and motion correction). Raise it on a box with cores to spare.
+n_jobs: 4

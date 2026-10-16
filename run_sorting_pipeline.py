@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Pipeline part 1 of 2: sorting, and nothing else.
+"""Pipeline part 1 of 2: preprocessing and sorting, and nothing else.
 
     conda activate kilosort4
     python run_sorting_pipeline.py --config Athos_2026_08_13
@@ -7,8 +7,11 @@
 ``--config`` takes the session's name, looked up in ``configs/`` (a path works
 too), and ``--machine`` defaults to the platform, so on the rig that is all.
 
-One stage per stream: resolve the channel map, then hand it and the recording's
-binary to Kilosort4's own ``run_kilosort``. Nothing here reads a sync pulse or
+Two stages per stream. ``preprocess`` writes the binary Kilosort reads -- the
+recording band-passed and re-referenced by CatGT or SpikeInterface, as the
+session's ``<system>.preprocess:`` block says -- beside the recording, and reuses
+it while it still matches. ``sort_with_kilosort`` then resolves the channel map
+and hands both to Kilosort4's own ``run_kilosort``, which only whitens. Nothing here reads a sync pulse or
 writes an LFP -- those belong with the stages that consume them, in
 ``run_exporting_pipeline.py``. Then it **stops**, because what comes next is
 manual: curation in Phy is not scriptable.
@@ -20,7 +23,10 @@ The one thing paths cannot say is whether to sort:
     kilosort_on_<system>    false -> keep the recording, do not sort it
 
 This is the half that needs a GPU, and the only half that does -- which is what
-lets it go to a cluster while the rest stays on the rig.
+lets it go to a cluster while the rest stays on the rig. ``method: catgt`` needs
+CatGT, so on the cluster either preprocess on the rig first and copy
+``<system>_dir/preprocessed/`` across, or use ``method: spikeinterface``; it does
+not switch by itself.
 
 Stops at the first stage that fails and exits non-zero. Stages that are
 skipped are reported and do not fail the run.
@@ -78,7 +84,8 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="report the map, the binary and the settings for each stream; sort nothing",
+        help="report the map, the preprocessing, the binary and the settings for "
+        "each stream; write and sort nothing",
     )
     args = parser.parse_args()
     _log_pipeline_messages()
@@ -93,17 +100,29 @@ def main() -> int:
     # hands back an ordinary one-probe config for each, so nothing below (and
     # nothing in the pipeline) has a probe argument.
     for tag, probe_config in config.per_probe():
+        label = "neuropixels" if tag is None else f"neuropixels {tag}"
+        if not args.dry_run:
+            run(
+                ss.preprocess,
+                probe_config,
+                "neuropixels",
+                system="neuropixels",
+                label=label,
+                config=probe_config,
+            )
         run(
             ss.sort_with_kilosort,
             probe_config,
             "neuropixels",
             dry_run=args.dry_run,
             system="neuropixels",
-            label="neuropixels" if tag is None else f"neuropixels {tag}",
+            label=label,
             config=probe_config,
         )
 
     # Once, whatever the probes: there is one Utah array, on one recording.
+    if not args.dry_run:
+        run(ss.preprocess, config, "blackrock", system="blackrock")
     run(
         ss.sort_with_kilosort,
         config,

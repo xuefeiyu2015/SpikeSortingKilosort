@@ -9,12 +9,22 @@ Pure computation: arrays in, arrays out.
 
 The strategy is deliberately not "assume the first burst in each file is the same
 burst". The two systems start at different times, so one file routinely misses
-bursts the other has. Instead the offset is found as the densest cluster of
-pairwise onset differences, which tolerates missing bursts at either end.
+bursts the other has.
+
+**Bursts are paired by their code, never by one global offset.** The two clocks
+drift apart -- 20 ppm is 216 ms over three hours -- so no single offset lines
+every burst up to a few ms, and scoring offsets that way lets a wrong cycle win
+on chance coincidences once the true one stops fitting. A burst's code is its
+intra-burst intervals, which span ~200 ms: drift over that is nanoseconds. So
+each burst is paired with the bursts carrying the same code, and the pairs that
+agree on one offset (to within a few seconds -- drift, not cycles) are kept. That
+also resolves the code's hourly repeat, whose false pairs sit 3600 s away. A line
+through the kept onsets is the coarse map, drift included.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
 import numpy as np
@@ -25,17 +35,22 @@ __all__ = [
     "burst_patterns",
     "estimate_offset",
     "candidate_offsets",
-    "score_offset",
     "match_times",
+    "match_burst_codes",
     "match_bursts",
 ]
 
 
 @dataclass(frozen=True)
 class BurstMatch:
-    """Result of matching two burst-onset sequences."""
+    """Result of matching two burst-onset sequences.
 
-    #: Seconds to add to *other* times to bring them onto the reference timebase.
+    ``reference = slope * other + intercept`` is the coarse map, drift included;
+    use :meth:`apply` to put other times on the reference clock. ``offset_s`` is
+    its constant summary, for logs -- over hours it is wrong by the drift.
+    """
+
+    #: Median of ``reference - other`` over the matched onsets.
     offset_s: float
     #: Onsets that matched, in each timebase.
     reference_matched: np.ndarray
@@ -44,11 +59,17 @@ class BurstMatch:
     n_other: int
     #: Residuals after applying the offset, in seconds.
     residuals_s: np.ndarray
-    #: How many individual pulses (not just onsets) the winning offset matched,
-    #: and how many the runner-up did. A winner that barely beats the runner-up
-    #: means the burst code did not actually disambiguate.
-    pulse_score: int = 0
-    runner_up_score: int = 0
+    slope: float = 1.0
+    intercept: float = 0.0
+    #: Code-matched bursts agreeing with the winning offset, and with the next
+    #: most popular one. A runner-up near the winner means the code did not
+    #: actually disambiguate.
+    code_matches: int = 0
+    runner_up_matches: int = 0
+
+    def apply(self, times_s: np.ndarray) -> np.ndarray:
+        """Other times onto the reference clock, through the coarse map."""
+        return self.slope * np.asarray(times_s, dtype=np.float64) + self.intercept
 
     @property
     def n_matched(self) -> int:
@@ -80,8 +101,8 @@ def group_burst_onsets(times_s: np.ndarray, min_gap_s: float = 7.0) -> np.ndarra
 def burst_patterns(times_s: np.ndarray, min_gap_s: float = 7.0) -> list[np.ndarray]:
     """Intra-burst inter-pulse intervals, one array per burst.
 
-    This is the actual "code" carried by each burst. Useful for verifying a match
-    found by :func:`estimate_offset` when extra confidence is wanted.
+    This is the actual "code" carried by each burst, and what
+    :func:`match_burst_codes` compares.
     """
     times = np.asarray(times_s, dtype=np.float64).reshape(-1)
     if times.size == 0:
@@ -104,8 +125,8 @@ def estimate_offset(
        whole-period shift is equally valid, and the densest cluster is simply the
        one giving maximum overlap. That is why the 14 s signal is *coded*. Pass
        the full pulse trains (not just burst onsets) to :func:`match_bursts`, which
-       scores candidate offsets against the intra-burst code and so picks the
-       right cycle rather than the most overlapping one.
+       pairs bursts by their intra-burst code and so picks the right cycle rather
+       than the most overlapping one.
     """
     candidates = candidate_offsets(reference_s, other_s, tolerance_s, max_candidates=1)
     if candidates.size == 0:
@@ -151,22 +172,6 @@ def candidate_offsets(
     return np.asarray(found, dtype=np.float64)
 
 
-def score_offset(
-    reference_s: np.ndarray,
-    other_s: np.ndarray,
-    offset_s: float,
-    tolerance_s: float = 5e-3,
-) -> int:
-    """How many pulses line up under a given offset.
-
-    Run on the *full* pulse trains this reads the burst code: a wrong-by-one-cycle
-    offset still lines the onsets up, but the intra-burst patterns then disagree
-    and the score collapses.
-    """
-    ref_idx, _ = match_times(reference_s, other_s, offset_s, tolerance_s)
-    return int(ref_idx.size)
-
-
 def match_times(
     reference_s: np.ndarray,
     other_s: np.ndarray,
@@ -205,20 +210,77 @@ def _nearest_index(haystack: np.ndarray, needles: np.ndarray) -> np.ndarray:
     return np.where(take_left, pos - 1, pos)
 
 
+def match_burst_codes(
+    reference_s: np.ndarray,
+    other_s: np.ndarray,
+    min_gap_s: float = 7.0,
+    code_tolerance_s: float = 1e-3,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Every pair of bursts, one per recording, carrying the same code.
+
+    Returns ``(reference_onsets, other_onsets, reference_idx, other_idx)``. Codes
+    match when they have the same number of pulses and every interval agrees to
+    ``code_tolerance_s``. A burst with fewer than two intervals carries no code --
+    the partial burst at either end of a recording, typically -- and pairs with
+    nothing. No offset is involved, so drift cannot affect it.
+    """
+    ref_onsets, ref_codes = _onsets_and_codes(reference_s, min_gap_s)
+    other_onsets, other_codes = _onsets_and_codes(other_s, min_gap_s)
+
+    ref_pairs: list[np.ndarray] = []
+    other_pairs: list[np.ndarray] = []
+    ref_lengths = np.array([c.size for c in ref_codes], dtype=np.int64)
+    other_lengths = np.array([c.size for c in other_codes], dtype=np.int64)
+    for n in np.intersect1d(ref_lengths, other_lengths):
+        if n < 2:
+            continue
+        ref_i = np.flatnonzero(ref_lengths == n)
+        other_i = np.flatnonzero(other_lengths == n)
+        ref_block = np.stack([ref_codes[i] for i in ref_i])
+        other_block = np.stack([other_codes[i] for i in other_i])
+        distance = np.abs(ref_block[:, None, :] - other_block[None, :, :]).max(axis=2)
+        a, b = np.nonzero(distance <= code_tolerance_s)
+        ref_pairs.append(ref_i[a])
+        other_pairs.append(other_i[b])
+
+    empty = np.empty(0, dtype=np.int64)
+    return (
+        ref_onsets,
+        other_onsets,
+        np.concatenate(ref_pairs) if ref_pairs else empty,
+        np.concatenate(other_pairs) if other_pairs else empty,
+    )
+
+
+def _onsets_and_codes(
+    times_s: np.ndarray, min_gap_s: float
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    return group_burst_onsets(times_s, min_gap_s), burst_patterns(times_s, min_gap_s)
+
+
+def _densest_window(values: np.ndarray, width: float) -> tuple[np.ndarray, int]:
+    """Indices of ``values`` inside the most populated window of ``width``."""
+    order = np.argsort(values)
+    ordered = values[order]
+    right = np.searchsorted(ordered, ordered + width, side="right")
+    counts = right - np.arange(ordered.size)
+    best = int(np.argmax(counts))
+    return order[best : right[best]], int(counts[best])
+
+
 def match_bursts(
     reference_s: np.ndarray,
     other_s: np.ndarray,
     min_gap_s: float = 7.0,
-    tolerance_s: float = 5e-3,
-    max_candidates: int = 16,
-    already_onsets: bool = False,
+    code_tolerance_s: float = 1e-3,
 ) -> BurstMatch:
-    """Full coarse alignment, using the burst code to pick the right cycle.
+    """Full coarse alignment: pair bursts by code, then fit a line through them.
 
-    Pass the **full pulse trains**, not pre-grouped onsets. Onsets alone are
-    periodic and cannot distinguish burst *k* from burst *k+1*; the intra-burst
-    pattern can, so candidate offsets are proposed from the onsets and then scored
-    against every pulse.
+    Pass the **full pulse trains**, not pre-grouped onsets: onsets are periodic
+    and carry no code. Code-matched pairs vote with their onset difference, and
+    the most popular offset -- within ``min_gap_s``, far wider than any drift and
+    far narrower than the hourly repeat -- wins. The winners are fitted with a
+    line, so the map holds across the whole recording rather than at its middle.
 
     ``reference_s`` is normally the Blackrock burst channel, since Blackrock is
     the reference timebase for the whole pipeline.
@@ -228,42 +290,55 @@ def match_bursts(
     if ref_pulses.size == 0 or other_pulses.size == 0:
         raise ValueError("cannot match bursts from an empty pulse train")
 
-    ref_onsets = ref_pulses if already_onsets else group_burst_onsets(ref_pulses, min_gap_s)
-    other_onsets = other_pulses if already_onsets else group_burst_onsets(other_pulses, min_gap_s)
-
-    candidates = candidate_offsets(ref_onsets, other_onsets, tolerance_s, max_candidates)
-    if candidates.size == 0:
-        raise ValueError("cannot estimate an offset from an empty burst sequence")
-
-    scores = np.array(
-        [score_offset(ref_pulses, other_pulses, c, tolerance_s) for c in candidates]
+    ref_onsets, other_onsets, ref_idx, other_idx = match_burst_codes(
+        ref_pulses, other_pulses, min_gap_s, code_tolerance_s
     )
-    order = np.argsort(scores)[::-1]
-    offset = float(candidates[order[0]])
-    best_score = int(scores[order[0]])
-    runner_up = int(scores[order[1]]) if scores.size > 1 else 0
-
-    # Refine using every matched pulse, not just the onsets.
-    pulse_ref_idx, pulse_other_idx = match_times(
-        ref_pulses, other_pulses, offset, tolerance_s
-    )
-    if pulse_ref_idx.size:
-        offset += float(
-            np.mean(ref_pulses[pulse_ref_idx] - (other_pulses[pulse_other_idx] + offset))
+    if ref_idx.size == 0:
+        raise ValueError(
+            f"no burst in one recording carries the code of any burst in the other "
+            f"({ref_onsets.size} vs {other_onsets.size} bursts, intervals compared to "
+            f"{code_tolerance_s * 1e3:g} ms). Check both burst thresholds: a missed or "
+            "extra pulse changes a burst's code."
         )
 
-    ref_idx, other_idx = match_times(ref_onsets, other_onsets, offset, tolerance_s)
-    matched_ref = ref_onsets[ref_idx]
-    matched_other = other_onsets[other_idx]
-    residuals = matched_ref - (matched_other + offset)
+    differences = ref_onsets[ref_idx] - other_onsets[other_idx]
+    winners, n_win = _densest_window(differences, min_gap_s)
+    centre = float(np.median(differences[winners]))
+    losers = np.flatnonzero(np.abs(differences - centre) > min_gap_s)
+    runner_up = _densest_window(differences[losers], min_gap_s)[1] if losers.size else 0
 
-    return BurstMatch(
-        offset_s=offset,
+    # One partner per burst: a code repeated within the window would be a burst
+    # matched twice, so keep the pair nearest the consensus.
+    winners = winners[np.argsort(np.abs(differences[winners] - centre), kind="stable")]
+    _, first_ref = np.unique(ref_idx[winners], return_index=True)
+    winners = winners[first_ref]
+    _, first_other = np.unique(other_idx[winners], return_index=True)
+    winners = np.sort(winners[first_other])
+
+    matched_ref = ref_onsets[ref_idx[winners]]
+    matched_other = other_onsets[other_idx[winners]]
+    order = np.argsort(matched_other)
+    matched_ref, matched_other = matched_ref[order], matched_other[order]
+
+    slope, intercept = 1.0, float(np.median(matched_ref - matched_other))
+    if matched_other.size >= 2:
+        # Centred first: Blackrock onsets are ~1.5e9 s PTP times, and fitting
+        # those raw spends most of float64's digits on a constant.
+        x0 = float(matched_other.mean())
+        slope, b = np.polyfit(matched_other - x0, matched_ref, 1)
+        slope, intercept = float(slope), float(b - slope * x0)
+
+    match = BurstMatch(
+        offset_s=float(np.median(matched_ref - matched_other)),
         reference_matched=matched_ref,
         other_matched=matched_other,
         n_reference=int(ref_onsets.size),
         n_other=int(other_onsets.size),
-        residuals_s=residuals,
-        pulse_score=best_score,
-        runner_up_score=runner_up,
+        residuals_s=np.empty(0),
+        slope=slope,
+        intercept=intercept,
+        code_matches=int(n_win),
+        runner_up_matches=int(runner_up),
     )
+    residuals = matched_ref - match.apply(matched_other)
+    return dataclasses.replace(match, residuals_s=residuals)

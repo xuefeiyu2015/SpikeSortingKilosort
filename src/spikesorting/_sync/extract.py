@@ -1,12 +1,13 @@
 """Drive sync-edge extraction for a session (pipeline steps 2 and 4).
 
-Produces four canonical edge files, each in the folder beside the recording it
+Produces five canonical edge files, each in the folder beside the recording it
 came from -- the SpikeGLX pair under ``neuropixels_dir/kilosort4/``, the NSP pair
 under ``blackrock_dir/kilosort4/``:
 
 ===================== ==============================================
 ``npx_1hz.txt``       SpikeGLX SY-word bit 6, the 1 Hz square wave
 ``npx_burst.txt``     OneBox XA1, the 14 s coded burst
+``npx_obx_1hz.txt``   OneBox SY-word bit 6, the same 1 Hz wave on the OneBox clock
 ``blackrock_1hz.txt`` NSP ns5 channel 1, the same 1 Hz square wave
 ``blackrock_burst.txt`` NSP ns5 channel 2, the same 14 s burst
 ===================== ==============================================
@@ -14,6 +15,11 @@ under ``blackrock_dir/kilosort4/``:
 Every file uses the CatGT convention: leading-edge times in seconds from stream
 start, one per line. Downstream (``burst``, ``align``, ``tprime``) reads only
 these, so it does not care which extractor produced them.
+
+**The burst and the 1 Hz train are on different clocks.** ``npx_1hz`` is the
+probe's headstage; ``npx_burst`` is the OneBox. The OneBox records the same 1 Hz
+wave in its own SY word, which is what ``npx_obx_1hz`` is: it lets alignment put
+the burst on the probe clock before comparing it with Blackrock.
 
 SpikeGLX edges are produced twice where possible -- once by CatGT, once by the
 NumPy fallback -- and compared. Agreement is the correctness check that lets the
@@ -52,6 +58,7 @@ __all__ = [
 
 NPX_1HZ = "npx_1hz"
 NPX_BURST = "npx_burst"
+NPX_OBX_1HZ = "npx_obx_1hz"
 BR_1HZ = "blackrock_1hz"
 BR_BURST = "blackrock_burst"
 
@@ -60,6 +67,7 @@ BR_BURST = "blackrock_burst"
 EDGE_SYSTEM = {
     NPX_1HZ: "neuropixels",
     NPX_BURST: "neuropixels",
+    NPX_OBX_1HZ: "neuropixels",
     BR_1HZ: "blackrock",
     BR_BURST: "blackrock",
 }
@@ -185,8 +193,15 @@ def _run_layout(config: SessionConfig) -> spikeglx.RunLayout | None:
     return None if npx.bin_file is None else spikeglx.run_layout(npx.bin_file)
 
 
-def _catgt_specs(config: SessionConfig, layout: spikeglx.RunLayout) -> list[catgt.ExtractorSpec]:
-    """The extractors this session needs, in CatGT terms."""
+def catgt_extractors(
+    config: SessionConfig, layout: spikeglx.RunLayout
+) -> list[catgt.ExtractorSpec]:
+    """The extractors this session needs, in CatGT terms.
+
+    Public because the CatGT preprocessing pass (``pipeline.preprocess``) runs
+    them too, in the same read of the AP binary -- and has to ask for exactly
+    these, or its edges could not stand in for this module's own.
+    """
     npx = config.neuropixels
     specs = [
         catgt.digital_spec(
@@ -195,16 +210,24 @@ def _catgt_specs(config: SessionConfig, layout: spikeglx.RunLayout) -> list[catg
     ]
     # Only when the run actually has a OneBox file: asking CatGT for an -xa
     # extraction from a stream that is not there is an error, not an empty result.
+    # Its ip is the OneBox's own number, read off the file found, so CatGT reads
+    # the file the NumPy detector does; -obx is derived from these ips.
     if layout.obx is not None:
+        onebox = spikeglx.onebox_number(layout.obx) or 0
         specs.append(
             catgt.analog_spec(
                 catgt.JS_OB,
-                0,
+                onebox,
                 npx.burst_word,
                 npx.burst_threshold_v[0],
                 npx.burst_threshold_v[1],
                 npx.burst_pulse_ms,
                 label=NPX_BURST,
+            )
+        )
+        specs.append(
+            catgt.digital_spec(
+                catgt.JS_OB, onebox, -1, npx.sync_bit, npx.sync_pulse_ms, label=NPX_OBX_1HZ
             )
         )
     return specs
@@ -229,7 +252,11 @@ def _run_catgt_extraction(
         )
         return {}
 
-    specs = _catgt_specs(config, layout)
+    specs = catgt_extractors(config, layout)
+    reused = _edges_from_preprocessing(config, specs, report)
+    if reused is not None:
+        return reused
+
     args = catgt.build_extract_args(
         run_dir=layout.directory,
         run_name=layout.run_name,
@@ -251,13 +278,59 @@ def _run_catgt_extraction(
 
     catgt.run_catgt(machine.catgt_dir, args)
     produced = catgt.find_edge_files(config.paths.sync_for("neuropixels") / "catgt")
+    return _match_edge_files(produced, specs, report)
 
+
+def _edges_from_preprocessing(
+    config: SessionConfig,
+    specs: list[catgt.ExtractorSpec],
+    report: ExtractionReport,
+) -> dict[str, np.ndarray] | None:
+    """CatGT's edges from the preprocessing pass, when they answer this session.
+
+    The CatGT preprocessing pass runs these same extractors while it filters, so
+    the AP binary need not be read by CatGT a second time. Used only when its
+    record says it read *this* binary, unchanged, with *these* extractors; the
+    NumPy detector still runs and is compared against them either way.
+    """
+    from .._preprocess import provenance
+
+    if config.neuropixels.bin_file is None:
+        return None
+    record = provenance.read(config.paths.preprocessed_for("neuropixels"))
+    if not record or record.get("engine") != "catgt" or not record.get("edge_dir"):
+        return None
+    source = provenance.normalise(provenance.source_fingerprint(config.neuropixels.bin_file))
+    if record.get("source") != source:
+        report.note("CatGT edges from preprocessing not reused: the AP binary changed since")
+        return None
+    if record.get("extractors") != [spec.to_flag() for spec in specs]:
+        report.note(
+            "CatGT edges from preprocessing not reused: they were extracted with "
+            f"{record.get('extractors')}, the session now asks for "
+            f"{[spec.to_flag() for spec in specs]}"
+        )
+        return None
+    report.note(
+        f"CatGT edges from the preprocessing pass ({record['edge_dir']}); "
+        "no second CatGT read of the AP binary"
+    )
+    return _match_edge_files(catgt.find_edge_files(record["edge_dir"]), specs, report)
+
+
+def _match_edge_files(
+    produced: dict[str, Path],
+    specs: list[catgt.ExtractorSpec],
+    report: ExtractionReport,
+) -> dict[str, np.ndarray]:
+    """Each extractor's edge times, from the files CatGT wrote."""
     result: dict[str, np.ndarray] = {}
     for spec in specs:
         matches = [key for key in produced if f".{spec.kind}_" in f".{key}"]
-        if spec.kind == "xd":
+        # By stream, not by kind: the imec and the OneBox SY words are both -xd.
+        if spec.js == catgt.JS_AP:
             matches = [k for k in matches if ".ap." in k or ".imec" in k]
-        elif spec.kind == "xa":
+        elif spec.js == catgt.JS_OB:
             matches = [k for k in matches if ".obx" in k or ".ob." in k]
         if matches:
             result[spec.label] = catgt.read_edge_file(produced[matches[0]])
@@ -333,6 +406,36 @@ def extract_neuropixels_edges(
             report,
             stream=f"{obx_info.path.name} XA{npx.burst_word}",
         )
+
+        # The same 1 Hz wave on the OneBox's own clock: what maps the burst onto
+        # the probe's. Without it the burst stays on the OneBox clock.
+        if obx_info.sy_index is None:
+            report.note(
+                f"OneBox 1 Hz extraction skipped: {obx_info.path.name} has no SY word, "
+                "so the burst stays on the OneBox clock."
+            )
+        else:
+            times = edges.stream_pulse_times(
+                _sy_bit_chunks(obx_info, npx.sync_bit, chunk_bytes),
+                threshold=0.5,
+                fs=obx_info.fs,
+                duration_ms=npx.sync_pulse_ms,
+            )
+            report.edge_sets[NPX_OBX_1HZ] = _finalize(
+                NPX_OBX_1HZ,
+                times,
+                obx_info.fs,
+                catgt_times.get(NPX_OBX_1HZ),
+                sync_dir,
+                report,
+                stream=f"{obx_info.path.name} SY bit {npx.sync_bit}",
+            )
+            if times.size == 0:
+                report.note(
+                    f"No 1 Hz sync pulses found in {obx_info.path.name} SY bit "
+                    f"{npx.sync_bit}, so the burst cannot be mapped onto the probe clock "
+                    "and validation will include the OneBox-to-probe drift."
+                )
 
     return report
 

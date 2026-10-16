@@ -7,6 +7,8 @@ extracts the wrong channel.
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pytest
 
@@ -52,6 +54,24 @@ def test_build_extract_args_emits_one_stream_flag_per_type():
     assert args.count("-ob") == 1
     assert args.count("-ap") == 1
     assert "-prb=0" in args
+    assert args.count("-obx=0") == 1
+
+
+def test_obx_names_the_onebox_each_extractor_addresses():
+    # -ob says "OneBox streams"; -obx says which. It comes from the extractors'
+    # own ip, so CatGT always opens the box each one reads.
+    specs = [
+        catgt.digital_spec(catgt.JS_OB, 2, -1, 6, 500),
+        catgt.analog_spec(catgt.JS_OB, 2, 1, 1.0),
+    ]
+    assert "-obx=2" in catgt.build_extract_args("D:/data", "run", specs)
+
+
+def test_no_onebox_extractor_means_no_obx():
+    specs = [catgt.digital_spec(catgt.JS_AP, 0, -1, 6, 500)]
+    args = catgt.build_extract_args("D:/data", "run", specs)
+    assert not any(a.startswith("-obx") for a in args)
+    assert "-ob" not in args
 
 
 def test_build_extract_args_contains_no_binary_rewriting_flags():
@@ -128,3 +148,16 @@ def test_find_edge_files_keys_by_extractor(tmp_path):
 def test_catgt_script_missing_raises(tmp_path):
     with pytest.raises(FileNotFoundError, match="runit"):
         catgt.catgt_script(tmp_path)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fake runit.sh needs a POSIX shell")
+def test_run_catgt_failure_quotes_catgt_log(tmp_path):
+    # CatGT reports its errors only in CatGT.log; stdout and stderr stay empty.
+    script = tmp_path / "runit.sh"
+    script.write_text("#!/bin/sh\necho 'Error: -dest dir not found' > CatGT.log\nexit 1\n")
+    script.chmod(0o755)
+
+    with pytest.raises(RuntimeError) as error:
+        catgt.run_catgt(tmp_path, ["-dir=/data/with space"])
+    assert "-dest dir not found" in str(error.value)
+    assert '"-dir=/data/with space"' in str(error.value)  # printed as it was passed

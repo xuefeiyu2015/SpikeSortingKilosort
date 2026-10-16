@@ -12,6 +12,9 @@ exactly this, which is why the Blackrock detector writes the same format.
 written only when files are concatenated, the channel list changes, filters or
 tshift are applied, or a time range is exported. Adding any such flag to an
 extraction run would duplicate a >100 GB recording, so this wrapper never does.
+The one deliberate rewrite is the preprocessing pass, built in
+``_preprocess/catgt.py``, which reuses :func:`run_catgt` and writes to
+``<neuropixels_dir>/preprocessed/``.
 
 Reference: https://billkarsh.github.io/SpikeGLX/More_help/CatGT_ReadMe.html
 """
@@ -32,6 +35,7 @@ __all__ = [
     "read_edge_file",
     "catgt_script",
     "build_extract_args",
+    "onebox_selection",
     "run_catgt",
     "find_edge_files",
 ]
@@ -197,6 +201,7 @@ def build_extract_args(
 
     if any(spec.js in (JS_AP, JS_LF) for spec in specs):
         args.append("-prb=" + ",".join(str(p) for p in probes))
+    args.extend(onebox_selection(specs))
 
     args.extend(spec.to_flag() for spec in specs)
 
@@ -208,6 +213,18 @@ def build_extract_args(
     return args
 
 
+def onebox_selection(specs: list[ExtractorSpec]) -> list[str]:
+    """``-obx=<n,...>`` for the OneBoxes the extractors read, or nothing.
+
+    ``-ob`` says to process OneBox streams; ``-obx`` says *which* -- the
+    counterpart of ``-prb`` -- and the manual gives no default for leaving it
+    out. Derived from the extractors' own ip rather than stated beside them, so
+    the stream CatGT opens is always the one each extractor addresses.
+    """
+    boxes = sorted({spec.ip for spec in specs if spec.js == JS_OB})
+    return ["-obx=" + ",".join(str(n) for n in boxes)] if boxes else []
+
+
 def run_catgt(
     catgt_dir: str | Path,
     args: list[str],
@@ -216,7 +233,9 @@ def run_catgt(
     """Run CatGT and return the completed process.
 
     Raises ``RuntimeError`` on a non-zero exit, with CatGT's own output attached --
-    its error messages are specific and worth surfacing verbatim.
+    its error messages are specific and worth surfacing verbatim. CatGT writes
+    them to ``CatGT.log`` beside the script rather than to stdout/stderr, so the
+    end of that log is attached too; without it the error is empty.
     """
     script = catgt_script(catgt_dir)
     command = [str(script), *args]
@@ -229,14 +248,24 @@ def run_catgt(
     )
     if result.returncode != 0:
         raise RuntimeError(
-            "CatGT failed (exit {code})\ncommand: {cmd}\nstdout:\n{out}\nstderr:\n{err}".format(
+            "CatGT failed (exit {code})\ncommand: {cmd}\nstdout:\n{out}\nstderr:\n{err}\n{log}".format(
                 code=result.returncode,
-                cmd=" ".join(command),
+                cmd=subprocess.list2cmdline(command),
                 out=result.stdout,
                 err=result.stderr,
+                log=_log_tail(Path(catgt_dir) / "CatGT.log"),
             )
         )
     return result
+
+
+def _log_tail(path: Path, lines: int = 20) -> str:
+    """The last ``lines`` of CatGT's log, labelled -- or say there is none."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return f"{path.name}: not found at {path}"
+    return f"{path} (last {lines} lines):\n" + "\n".join(text[-lines:])
 
 
 def find_edge_files(dest: str | Path) -> dict[str, Path]:

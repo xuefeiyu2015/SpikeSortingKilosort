@@ -20,6 +20,7 @@ __all__ = [
     "plot_unit_page",
     "save_unit_pages",
     "plot_alignment_residuals",
+    "plot_spike_positions",
     "plot_sorting_overview",
     "save_figure",
 ]
@@ -182,6 +183,7 @@ def _unit_header(unit: dict[str, Any]) -> str:
     parts = [
         f"unit {unit.get('unit_id')}",
         *([_unit_class(unit)] if _unit_class(unit) else []),
+        *([f"KS {unit['ks_label']}"] if unit.get("ks_label") else []),
         f"ch {unit.get('channel')}",
         f"{unit.get('n_spikes', 0):,} spikes",
     ]
@@ -299,36 +301,67 @@ def plot_alignment_residuals(
     return ax
 
 
-def plot_sorting_overview(
-    firing_rates: np.ndarray,
-    amplitudes: np.ndarray | None = None,
-    contamination_pct: np.ndarray | None = None,
-    fig: Any = None,
+def plot_spike_positions(
+    xy: np.ndarray,
+    unit_of_spike: np.ndarray,
+    background_xy: np.ndarray | None = None,
+    ax: Any = None,
 ) -> Any:
-    """Session-level distributions across units."""
+    """Each spike at its estimated place on the probe, one colour per unit.
+
+    ``xy`` is ``(n_spikes, 2)`` and ``unit_of_spike`` the unit of each row;
+    ``background_xy`` (spikes of excluded clusters) goes underneath in grey.
+    Colours cycle through ``tab20`` in depth order, so units next to each other
+    on the probe get different ones.
+    """
     import matplotlib.pyplot as plt
 
-    panels = 1 + (amplitudes is not None) + (contamination_pct is not None)
+    ax = _axes(ax)
+    if background_xy is not None and len(background_xy):
+        ax.scatter(background_xy[:, 0], background_xy[:, 1], s=0.1, color="0.75",
+                   alpha=0.5, linewidths=0, rasterized=True)
+
+    xy = np.asarray(xy, dtype=np.float64)
+    unit_of_spike = np.asarray(unit_of_spike)
+    units = np.unique(unit_of_spike)
+    depth = []
+    for unit in units:
+        y = xy[unit_of_spike == unit, 1]
+        depth.append(np.nanmedian(y) if np.isfinite(y).any() else np.inf)
+    colours = plt.get_cmap("tab20")
+    for rank, unit in enumerate(units[np.argsort(depth, kind="stable")]):
+        mine = unit_of_spike == unit
+        ax.scatter(xy[mine, 0], xy[mine, 1], s=0.3, color=colours(rank % 20),
+                   alpha=0.5, linewidths=0, rasterized=True)
+    ax.set_xlabel("x (um)")
+    ax.set_ylabel("depth from tip (um)")
+    return ax
+
+
+def plot_sorting_overview(
+    xy: np.ndarray,
+    unit_of_spike: np.ndarray,
+    background_xy: np.ndarray | None = None,
+    n_total: int | None = None,
+    fig: Any = None,
+) -> Any:
+    """Where every exported unit's spikes sit on the probe: the session at a glance.
+
+    ``n_total`` is how many spikes the sorting holds, so a subsample says so in
+    the title.
+    """
+    import matplotlib.pyplot as plt
+
     if fig is None:
-        fig = plt.figure(figsize=(4 * panels, 3.2), dpi=110)
-    axes = np.atleast_1d(fig.subplots(1, panels))
-
-    axes[0].hist(np.asarray(firing_rates), bins=20, color="0.5")
-    axes[0].set_xlabel("firing rate (Hz)")
-    axes[0].set_ylabel("# units")
-
-    index = 1
-    if amplitudes is not None:
-        axes[index].hist(np.asarray(amplitudes), bins=20, color="0.5")
-        axes[index].set_xlabel("amplitude")
-        axes[index].set_ylabel("# units")
-        index += 1
-    if contamination_pct is not None:
-        axes[index].hist(np.minimum(100, np.asarray(contamination_pct)), bins=np.arange(0, 105, 5), color="0.5")
-        axes[index].axvline(10, color="black", linestyle="--", linewidth=1)
-        axes[index].set_xlabel("% contamination")
-        axes[index].set_ylabel("# units")
-
+        fig = plt.figure(figsize=(4, 8), dpi=110)
+    ax = fig.add_subplot(1, 1, 1)
+    plot_spike_positions(xy, unit_of_spike, background_xy, ax=ax)
+    shown = len(xy) + (0 if background_xy is None else len(background_xy))
+    n_units = np.unique(unit_of_spike).size
+    title = f"spike positions, {n_units} units"
+    if n_total is not None and shown < n_total:
+        title += f"\n{shown:,} of {n_total:,} spikes"
+    ax.set_title(title)
     fig.tight_layout()
     return fig
 

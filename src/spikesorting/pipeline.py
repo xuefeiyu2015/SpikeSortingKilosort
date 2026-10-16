@@ -9,7 +9,8 @@ the two acquisition systems read identically::
 
     config = load_session_config("configs/athos.yaml", "windows_rig")
 
-    sort_with_kilosort(config, "blackrock")        # pipeline 1, and all of it
+    preprocess(config, "blackrock")                # pipeline 1
+    sort_with_kilosort(config, "blackrock")
 
     extract_sync(config, "blackrock")              # pipeline 2
     extract_lfp(config, "neuropixels")
@@ -17,10 +18,11 @@ the two acquisition systems read identically::
     validate_remapping(config)
     export_results(config, "neuropixels")
 
-Sorting is Kilosort4's own ``run_kilosort`` on a flat int16 binary. SpikeGLX
-already writes one; a Blackrock ``.ns6`` is read by SpikeInterface and
-transformed into one once, beside the recording. That is SpikeInterface's only
-job here.
+Sorting is Kilosort4's own ``run_kilosort`` on a flat int16 binary that has
+already been preprocessed -- band-passed and re-referenced by CatGT or
+SpikeInterface, as the session's ``preprocess:`` block says -- so Kilosort only
+whitens. The preprocessed file is written once, beside the recording, and
+reused while it still matches the session.
 
 A session names one binary per system, so every verb works on one stream and
 everything it derives lands in one folder: ``<system>_dir/kilosort4/``, with the
@@ -60,6 +62,7 @@ from ._config import (  # noqa: F401  (re-exported: the config verb and its type
     stream_label,
 )
 from ._io import reachable
+from ._preprocess import provenance
 from ._sync import align, burst, catgt, extract
 
 log = logging.getLogger("spikesorting")
@@ -70,6 +73,7 @@ __all__ = [
     "skip_reason",
     "load_session_config",
     "setup_probe",
+    "preprocess",
     "sort_with_kilosort",
     "extract_sync",
     "extract_lfp",
@@ -111,6 +115,7 @@ def skip_reason(config: SessionConfig, verb: Any, system: str | None = None) -> 
 
     if system is not None and name in {
         "setup_probe",
+        "preprocess",
         "sort_with_kilosort",
         "extract_sync",
         "extract_lfp",
@@ -120,7 +125,7 @@ def skip_reason(config: SessionConfig, verb: Any, system: str | None = None) -> 
         if not config.has_data(system):
             return f"no {system} paths declared in the session"
 
-    if name == "sort_with_kilosort" and system is not None:
+    if name in {"preprocess", "sort_with_kilosort"} and system is not None:
         if not getattr(config, f"kilosort_on_{system}"):
             # For Blackrock this is also how a sync-only session says it has no
             # Utah array. The flag with no spike_file is refused at load, so
@@ -290,7 +295,7 @@ def _neuropixels_stream(config: SessionConfig) -> Any:
 
 
 # ----------------------------------------------------------------------------
-# Step 2: the binary Kilosort reads
+# Step 2: preprocessing, and the binary Kilosort reads
 # ----------------------------------------------------------------------------
 
 
@@ -301,39 +306,258 @@ class Binary:
     path: Path
     n_chan_bin: int
     fs: float
+    #: Whether the file was band-passed before Kilosort read it. Phy filters the
+    #: traces it shows unless ``params.py`` says this, and filtering twice
+    #: would show a band nobody sorted.
+    filtered: bool = False
 
     def summary(self) -> str:
         return f"{self.path} ({self.n_chan_bin} channels at {self.fs:g} Hz)"
 
 
-def _binary_for(config: SessionConfig, system: str) -> Binary:
-    """The file ``run_kilosort`` is pointed at, for either system.
+def preprocess(config: SessionConfig, system: str) -> Binary | None:
+    """Write the binary Kilosort reads: the recording, preprocessed. Returns it.
 
-    SpikeGLX already writes one: the AP binary is flat, sample-interleaved int16,
-    which is exactly Kilosort's own format, so nothing is converted. A Blackrock
-    ``.ns6`` is not, so it is transformed once -- see :func:`_blackrock_binary`.
+    What is done is the session's ``<system>.preprocess:`` block -- CatGT
+    (Neuropixels only) or SpikeInterface, band-pass, common reference, CatGT's
+    ``gfix``, phase shift, optionally motion correction -- and Kilosort then only
+    whitens. The file is written to ``<system>_dir/preprocessed/`` with a record
+    of what made it (``preprocess.json``), and is reused for as long as that
+    record still matches the session and the source file; anything else makes it
+    again. It is the size of the recording.
+
+    **CatGT does not fall back.** When it cannot run here -- no ``catgt_dir`` on
+    this machine, a binary not named the SpikeGLX way, CatGT failing -- this
+    raises, naming ``method: spikeinterface``. Which preprocessing a sorting had
+    is written in the session, never decided by what happened to be installed.
+
+    With CatGT the same pass extracts the sync edges ``extract_sync`` needs, so
+    the AP binary is read once for both; ``extract_sync`` picks them up from the
+    record.
+
+    Returns ``None`` when ``kilosort_on_<system>`` is false: nothing will be
+    sorted, so there is nothing to preprocess for. :func:`sort_with_kilosort`
+    calls this itself, so running it first only splits the work into two steps.
     """
+    _check(system)
+    if not getattr(config, f"sorts_{system}"):
+        return None
+    _check_input_reachable(config, system)
+    return _binary_for(config, system)
+
+
+def _job_kwargs(config: SessionConfig) -> dict[str, Any]:
+    """How SpikeInterface chunks the work on this machine."""
+    return {"n_jobs": config.machine.n_jobs, "chunk_duration": "1s", "progress_bar": True}
+
+
+def _preprocess_expected(config: SessionConfig, system: str) -> dict[str, Any]:
+    """What a preprocessed binary for this session has to have been made from.
+
+    Everything that changes the output is here -- the ``preprocess:`` block, and
+    the reader settings that decide what the recording *is* (Blackrock's gap
+    tolerance, a bare binary's stated channel count) -- plus the source file's
+    fingerprint, so a re-recorded or re-copied file is not mistaken for the old.
+    """
+    from dataclasses import asdict
+
+    spec = config.preprocess_for(system)
+    settings: dict[str, Any] = asdict(spec)
     if system == "blackrock":
-        return _blackrock_binary(config)
+        brk = config.blackrock
+        settings["reader"] = {
+            "gap_tolerance_ms": brk.gap_tolerance_ms,
+            "stream_id": brk.stream_id,
+            "allow_segments": brk.allow_segments,
+        }
+    else:
+        npx = config.neuropixels
+        settings["reader"] = {"n_chan_bin": npx.n_chan_bin, "sample_rate": npx.sample_rate}
+    return {
+        "engine": spec.method,
+        "settings": settings,
+        "source": provenance.source_fingerprint(_input_path(config, system)),
+    }
+
+
+def _stale_reasons(config: SessionConfig, system: str) -> tuple[list[str], dict | None]:
+    """Why the preprocessed binary on disk cannot be reused, and its record."""
+    directory = config.paths.preprocessed_for(system)
+    recorded = provenance.read(directory)
+    reasons = provenance.stale_reasons(recorded, _preprocess_expected(config, system))
+    if not reasons:
+        path = Path(recorded["binary"])
+        expected = int(recorded["n_chan"]) * int(recorded["n_samples"]) * 2
+        if not path.exists():
+            reasons.append(f"{path} is gone")
+        elif path.stat().st_size != expected:
+            reasons.append(f"{path} is {path.stat().st_size} bytes, not {expected}")
+    return reasons, recorded
+
+
+def _binary_from_record(record: dict[str, Any]) -> Binary:
+    return Binary(Path(record["binary"]), int(record["n_chan"]), float(record["fs"]), True)
+
+
+def _binary_for(config: SessionConfig, system: str) -> Binary:
+    """The preprocessed binary for this stream: reused if still valid, else made."""
+    reasons, recorded = _stale_reasons(config, system)
+    if not reasons:
+        log.info(
+            "reusing %s -- preprocessed by %s, still matching the session",
+            recorded["binary"], recorded["engine"],
+        )
+        return _binary_from_record(recorded)
+
+    directory = config.paths.preprocessed_for(system)
+    log.info("preprocessing %s (%s)", system, "; ".join(reasons))
+    provenance.discard(directory)
+    record = _run_preprocessing(config, system, directory)
+    record.update(_preprocess_expected(config, system))
+    provenance.write(directory, record)
+    log.info("preprocessed -> %s", record["binary"])
+    return _binary_from_record(record)
+
+
+def _run_preprocessing(config: SessionConfig, system: str, directory: Path) -> dict[str, Any]:
+    """Make the preprocessed binary. Returns what it made, for the record."""
+    from ._preprocess import si
+
+    spec = config.preprocess_for(system)
+    jobs = _job_kwargs(config)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    if system == "blackrock":
+        recording = si.build_chain(_read_blackrock(config), spec, jobs)
+        path = si.write(recording, directory / f"{config.blackrock.spike_file.stem}.bin", jobs)
+        return _record_of(recording, path, steps=_si_steps(spec))
+
+    if spec.method == "catgt":
+        return _run_catgt_preprocessing(config, directory, jobs)
+
     info = _neuropixels_stream(config)
-    return Binary(Path(info.path), int(info.n_chan), float(info.fs))
+    recording = si.build_chain(
+        si.read_neuropixels(
+            info.path, info.n_chan, info.fs, info.sy_index, _has_spikeglx_meta(config)
+        ),
+        spec,
+        jobs,
+    )
+    path = si.write(recording, directory / f"{info.path.stem}.bin", jobs)
+    return _record_of(recording, path, steps=_si_steps(spec))
 
 
-def _blackrock_binary(config: SessionConfig) -> Binary:
-    """Transform the Utah array's ``.ns6`` into a Kilosort binary, once.
+def _has_spikeglx_meta(config: SessionConfig) -> bool:
+    """Whether the binary has a ``.meta`` to read the probe and ADC offsets from."""
+    from ._io import spikeglx
 
-    SpikeInterface reads the ``.ns6`` and Kilosort's own
-    ``io.spikeinterface_to_binary`` writes it out flat -- this is the whole of
-    SpikeInterface's job in the sorting path. **Every channel is written**,
-    including any sync or analog inputs sharing the file: the probe's ``chanMap``
-    is what selects electrodes, and dropping them here would shift every contact
-    after the removed one.
+    return spikeglx.meta_path_for(config.neuropixels.bin_file).exists()
 
-    The result sits beside the recording rather than in the cache, and is reused
-    when it is already there at the expected size. It has to persist: it is what
-    the sorting's ``params.py`` points at, so Phy can only show raw traces while
-    it exists, and re-transforming an unchanged ``.ns6`` on every re-sort is
-    minutes of I/O for nothing.
+
+def _si_steps(spec: Any) -> list[str]:
+    """The SpikeInterface chain, as it will be recorded."""
+    steps = ["phase_shift"] if spec.phase_shift else []
+    steps.append(f"bandpass_filter {spec.highpass_hz:g}-{spec.lowpass_hz:g} Hz")
+    if spec.car_mode:
+        steps.append("common_reference global median (gblcar)")
+    if spec.motion:
+        steps.append(f"correct_motion preset={spec.motion}")
+    return steps
+
+
+def _record_of(recording: Any, path: Path, steps: list[str], **extra: Any) -> dict[str, Any]:
+    """What the record says about a binary SpikeInterface wrote."""
+    n_samples = sum(
+        int(recording.get_num_frames(segment_index=s))
+        for s in range(recording.get_num_segments())
+    )
+    return {
+        "binary": str(path),
+        "n_chan": int(recording.get_num_channels()),
+        "fs": float(recording.get_sampling_frequency()),
+        "n_samples": n_samples,
+        "steps": steps,
+        **extra,
+    }
+
+
+def _run_catgt_preprocessing(
+    config: SessionConfig, directory: Path, jobs: dict[str, Any]
+) -> dict[str, Any]:
+    """Filter the AP band with CatGT, extracting the sync edges in the same pass."""
+    from ._io import spikeglx
+    from ._preprocess import catgt as catgt_pre
+    from ._preprocess import si
+
+    npx = config.neuropixels
+    spec = npx.preprocess
+    layout = spikeglx.run_layout(npx.bin_file)
+    why_not = catgt_pre.catgt_unavailable(layout, config.machine.catgt_dir)
+    if why_not is not None:
+        raise RuntimeError(
+            f"neuropixels.preprocess.method is catgt, but {why_not}.\n"
+            "  Run it where CatGT is installed, or preprocess with SpikeInterface "
+            "instead by changing the session:\n"
+            "      neuropixels:\n"
+            "        preprocess:\n"
+            "          method: spikeinterface   # and gfix: null, if it is set"
+        )
+
+    extractors = extract.catgt_extractors(config, layout)
+    dest = directory / "catgt"
+    dest.mkdir(parents=True, exist_ok=True)  # CatGT refuses a -dest that does not exist
+    args = catgt_pre.build_preprocess_args(layout, spec, dest, extractors)
+    log.info("CatGT: runit %s", " ".join(args))
+    try:
+        catgt.run_catgt(config.machine.catgt_dir, args)
+    except RuntimeError as error:
+        raise RuntimeError(
+            f"{error}\n  To preprocess without CatGT, set "
+            "neuropixels.preprocess.method: spikeinterface (and gfix: null, if set)."
+        ) from None
+
+    raw = _neuropixels_stream(config)
+    out = spikeglx.stream_info(catgt_pre.find_output(dest, layout))
+    trimmed = catgt_pre.trimmed_seconds(raw.n_samples, out.n_samples, raw.fs)
+    if trimmed:
+        log.info("CatGT trimmed %.4f s off the end of %s", trimmed, raw.path.name)
+    record: dict[str, Any] = {
+        "binary": str(out.path),
+        "n_chan": out.n_chan,
+        "fs": out.fs,
+        "n_samples": out.n_samples,
+        "steps": ["CatGT " + " ".join(args)],
+        "trimmed_s": trimmed,
+        "extractors": [e.to_flag() for e in extractors],
+        "edge_dir": str(dest),
+    }
+    if spec.motion is None:
+        return record
+
+    # CatGT has no motion correction, so its output goes through SpikeInterface
+    # once more. The CatGT file stays: it is what the edges came from, and the
+    # record names both.
+    corrected = si.motion_chain(
+        si.read_neuropixels(out.path, out.n_chan, out.fs, out.sy_index, has_meta=True),
+        spec.motion,
+        jobs,
+    )
+    path = si.write(corrected, directory / f"{out.path.stem}.motion.bin", jobs)
+    return {
+        **record,
+        **_record_of(corrected, path, steps=record["steps"] + [f"correct_motion preset={spec.motion}"]),
+        "catgt_binary": str(out.path),
+    }
+
+
+def _read_blackrock(config: SessionConfig) -> Any:
+    """The Utah array's ``.ns6`` as a SpikeInterface recording, every channel.
+
+    **Every channel is kept**, including any sync or analog inputs sharing the
+    file: the probe's ``chanMap`` is what selects electrodes, and dropping them
+    here would shift every contact after the removed one. (They are filtered and
+    re-referenced along with the rest, which costs nothing -- Kilosort never
+    reads them -- but the median is taken over every channel in the file.)
     """
     spec = config.blackrock
     if spec.spike_file is None:
@@ -358,36 +582,7 @@ def _blackrock_binary(config: SessionConfig) -> Binary:
             "so state it: blackrock.allow_segments: true to concatenate them, or raise "
             "blackrock.gap_tolerance_ms if the jump really is noise."
         )
-
-    n_chan = int(recording.get_num_channels())
-    fs = float(recording.get_sampling_frequency())
-    n_bytes = n_chan * sum(
-        int(recording.get_num_frames(segment_index=s)) for s in range(n_segments)
-    ) * 2  # int16
-
-    # One level above the sorting it feeds, so re-sorting neither wipes it nor
-    # reconverts. Taken from sorted_for rather than dir_for so a session with no
-    # blackrock_dir raises OutputPaths' message naming what to set.
-    directory = config.paths.sorted_for("blackrock").parent
-    directory.mkdir(parents=True, exist_ok=True)
-    name = f"{spec.spike_file.stem}.bin"
-    path = directory / name
-
-    if path.exists() and path.stat().st_size == n_bytes:
-        log.info("reusing %s (%.1f GB) -- delete it to force a re-transform", path, n_bytes / 1e9)
-        return Binary(path, n_chan, fs)
-
-    from kilosort.io import spikeinterface_to_binary
-
-    log.info(
-        "transforming %s -> %s (%.1f GB)", spec.spike_file.name, path, n_bytes / 1e9
-    )
-    written = spikeinterface_to_binary(recording, directory, data_name=name, dtype="int16")
-    # It returns a tuple whose first element is the path; the channel count and
-    # rate come from the recording it was written from, which cannot disagree
-    # with the file and does not depend on the tuple's layout in this release.
-    written = written[0] if isinstance(written, tuple) else written
-    return Binary(Path(written), n_chan, fs)
+    return recording
 
 
 def write_nsp_time_map(config: SessionConfig, out_dir: Path, source: Path) -> Any | None:
@@ -496,6 +691,8 @@ _RESERVED = {
     "fs": "read from the .meta, or neuropixels.sample_rate",
     "data_dtype": "both systems are int16",
     "device": "the machine profile's device:",
+    "do_CAR": "<system>.preprocess.car_mode -- the common reference is taken "
+    "before Kilosort, never inside it, so Kilosort always gets do_CAR=False",
 }
 
 
@@ -517,7 +714,8 @@ def _kilosort_arguments(
     from kilosort.run_kilosort import DEFAULT_SETTINGS
 
     settings: dict[str, Any] = {"n_chan_bin": binary.n_chan_bin, "fs": binary.fs}
-    kwargs: dict[str, Any] = {}
+    # The common reference is preprocess.car_mode's job, done before this.
+    kwargs: dict[str, Any] = {"do_CAR": False}
     accepted = set(inspect.signature(run_kilosort).parameters)
 
     for key, value in config.kilosort_for(system).items():
@@ -547,19 +745,20 @@ def sort_with_kilosort(
 ) -> Any | None:
     """Sort one stream with Kilosort4. Returns a :class:`SortSummary`.
 
-    The whole of pipeline 1: resolve the channel map, name the binary, hand both
-    to Kilosort's own ``run_kilosort``, and put the results where Phy and the
+    The whole of pipeline 1: resolve the channel map, take the preprocessed
+    binary (making it first if :func:`preprocess` has not), hand both to
+    Kilosort's own ``run_kilosort``, and put the results where Phy and the
     export stages look for them. Nothing is loaded into memory here and no
     recording object is passed around -- Kilosort streams the file itself.
 
     Returns ``None`` without sorting when ``kilosort_on_<system>`` is false, the
     "extract the pulses and the LFP but do not sort" case.
 
-    There is no preprocessing step before this. Kilosort does its own on every
-    batch: it subtracts the median across channels when ``do_CAR`` is set (the
-    default), highpasses at ``highpass_cutoff`` (300 Hz), then whitens and
-    drift-corrects. Those are settings, named under ``kilosort:`` in the session
-    and resolved by :meth:`SessionConfig.kilosort_for`.
+    The band-pass and the common reference are done before this, by the
+    session's ``preprocess:`` block, so Kilosort is always given ``do_CAR=False``.
+    What it still does on every batch -- its own highpass at
+    ``highpass_cutoff``, whitening, drift correction at ``nblocks`` -- is set
+    under ``kilosort:`` and resolved by :meth:`SessionConfig.kilosort_for`.
 
     Sorting runs in the machine's ``cache_dir`` and the results are copied out,
     because Kilosort writes beside its results and a network share is both slow
@@ -573,11 +772,12 @@ def sort_with_kilosort(
     _check_input_reachable(config, system)
 
     probe = setup_probe(config, system)
-    binary = _binary_for(config, system)
     final_dir = config.paths.sorted_for(system)
 
     if dry_run:
-        return _dry_run(config, system, probe, binary, final_dir)
+        return _dry_run(config, system, probe, final_dir)
+
+    binary = _binary_for(config, system)
 
     settings, kwargs = _kilosort_arguments(config, system, binary)
 
@@ -701,11 +901,11 @@ def _repoint_params(final_dir: Path, binary: Binary) -> None:
     Kilosort wrote it.
 
     **Three lines move together, not one.** ``temp_wh.dat`` holds only the
-    probe's channels while the raw binary holds every channel in the file, and
+    probe's channels while the binary holds every channel in the file, and
     ``n_channels_dat`` is the stride Phy walks the file with -- leave it behind
     and every trace is silently sheared rather than erroring. ``hp_filtered``
-    goes with them: the raw file is not the filtered copy, so Phy applies its own
-    150 Hz pass for display.
+    goes with them, and is set either way: the binary Kilosort read is the
+    preprocessed one, already band-passed, so Phy must not filter it again.
 
     Written with forward slashes, as Kilosort writes it
     (``kilosort/io.py``: ``dat_path.resolve().as_posix()``). Phy *executes*
@@ -718,22 +918,28 @@ def _repoint_params(final_dir: Path, binary: Binary) -> None:
 
     lines = params.read_text(encoding="utf-8").splitlines(keepends=True)
     stated = _stated_dat_path(lines)
+    hp_filtered = {"hp_filtered": f"hp_filtered = {binary.filtered}\n"}
     if stated is not None and ((final_dir / stated).exists() or Path(stated).exists()):
-        return
-
-    replacements = {
-        "dat_path": f"dat_path = '{binary.path.as_posix()}'\n",
-        "n_channels_dat": f"n_channels_dat = {binary.n_chan_bin}\n",
-        "hp_filtered": "hp_filtered = False\n",
-    }
+        # The path resolves, so it stays as Kilosort wrote it. Only whether the
+        # file is already filtered is ours to say: Kilosort writes False, and a
+        # preprocessed binary would then be filtered again for display.
+        if not binary.filtered:
+            return
+        replacements = hp_filtered
+        message = "params.py: hp_filtered = %s" % binary.filtered
+    else:
+        replacements = {
+            "dat_path": f"dat_path = '{binary.path.as_posix()}'\n",
+            "n_channels_dat": f"n_channels_dat = {binary.n_chan_bin}\n",
+            **hp_filtered,
+        }
+        message = "params.py: dat_path repointed at %s (%d channels)" % (
+            binary.path, binary.n_chan_bin,
+        )
     out = [replacements.pop(_assigned_name(line), line) for line in lines]
     out.extend(replacements.values())   # keys this params.py did not carry
     params.write_text("".join(out), encoding="utf-8")
-    log.info(
-        "params.py: dat_path repointed at %s (%d channels)",
-        binary.path,
-        binary.n_chan_bin,
-    )
+    log.info(message)
 
 
 def _assigned_name(line: str) -> str:
@@ -769,14 +975,30 @@ def _dry_run(
     config: SessionConfig,
     system: str,
     probe: dict,
-    binary: Binary,
     final_dir: Path,
 ) -> dict[str, Any]:
-    """What a real run would do, without doing it. Needs no GPU."""
+    """What a real run would do, without doing it. Needs no GPU, writes nothing.
+
+    The preprocessed binary is reported as it stands: reused, or made by the
+    real run and why. Kilosort's settings are split against the binary it
+    *would* read, whose channel count is known without writing it.
+    """
     from ._probes.common import probe_summary
+
+    reasons, recorded = _stale_reasons(config, system)
+    if reasons:
+        binary = _planned_binary(config, system)
+        preprocessing = {
+            "status": "will be made: " + "; ".join(reasons),
+            "steps": _planned_steps(config, system),
+        }
+    else:
+        binary = _binary_from_record(recorded)
+        preprocessing = {"status": "reused", "steps": recorded.get("steps")}
 
     report: dict[str, Any] = {
         "probe": probe_summary(probe),
+        "preprocessing": preprocessing,
         "binary": binary.summary(),
         "results_dir": final_dir,
     }
@@ -790,6 +1012,63 @@ def _dry_run(
         # half a laptop can actually check.
         report["kilosort (unsplit -- Kilosort is not installed)"] = config.kilosort_for(system)
     return report
+
+
+def _planned_binary(config: SessionConfig, system: str) -> Binary:
+    """The binary :func:`preprocess` would write, without writing it.
+
+    CatGT keeps every channel; SpikeInterface leaves out the Neuropixels SY word.
+    Blackrock is opened (its header only) to learn the channel count.
+    """
+    spec = config.preprocess_for(system)
+    directory = config.paths.preprocessed_for(system)
+    if system == "blackrock":
+        recording = _read_blackrock(config)
+        return Binary(
+            directory / f"{config.blackrock.spike_file.stem}.bin",
+            int(recording.get_num_channels()),
+            float(recording.get_sampling_frequency()),
+            True,
+        )
+    info = _neuropixels_stream(config)
+    if spec.method == "catgt":
+        from ._io import spikeglx
+
+        layout = spikeglx.run_layout(info.path)
+        name = (
+            f"{layout.run_name}_g{layout.gate}_tcat.imec{layout.probe}.ap.bin"
+            if layout is not None else "(CatGT cannot read this binary)"
+        )
+        path = directory / "catgt" / name
+        n_chan = info.n_chan
+        if spec.motion:
+            path = path.with_suffix(".motion.bin")
+            n_chan -= info.sy_index is not None
+    else:
+        path = directory / f"{info.path.stem}.bin"
+        n_chan = info.n_chan - (info.sy_index is not None)
+    return Binary(path, int(n_chan), float(info.fs), True)
+
+
+def _planned_steps(config: SessionConfig, system: str) -> list[str]:
+    """The preprocessing a real run would do, as the record will name it."""
+    spec = config.preprocess_for(system)
+    if spec.method != "catgt":
+        return _si_steps(spec)
+    steps = [
+        f"CatGT -apfilter=butter,12,{spec.highpass_hz:g},{spec.lowpass_hz:g}"
+        + (f" -{spec.car_mode}" if spec.car_mode else "")
+        + (" -gfix=" + ",".join(f"{v:g}" for v in spec.gfix) if spec.gfix else "")
+        + ("" if spec.phase_shift else " -no_tshift")
+    ]
+    if config.machine.catgt_dir is None:
+        steps.append(
+            "WILL FAIL: this machine has no catgt_dir -- run on the rig, or set "
+            "neuropixels.preprocess.method: spikeinterface"
+        )
+    if spec.motion:
+        steps.append(f"correct_motion preset={spec.motion}")
+    return steps
 
 
 def _waveform_fields(measured: dict | None) -> dict | None:
@@ -812,6 +1091,10 @@ def _waveform_fields(measured: dict | None) -> dict | None:
 
 #: Phy's curation labels as single vs multi unit, for the figure headers.
 _UNIT_CLASS = {"good": "SU", "mua": "MU"}
+
+#: Spikes drawn in the overview's position plot. Spread evenly over the session;
+#: past this many the dots only overlap, and reading the features costs more.
+_OVERVIEW_MAX_SPIKES = 100_000
 
 
 def _unit_page_data(
@@ -858,6 +1141,7 @@ def _unit_page_data(
             "unit_id": unit_id,
             "label": label,
             "unit_class": _UNIT_CLASS.get(label, ""),
+            "ks_label": phy.ks_labels.get(unit_id, ""),
             "channel": channel,
             "n_spikes": int(times.size),
             "isi_counts": isi_counts,
@@ -969,6 +1253,9 @@ def _write_run_info(
         "fs": result.fs,
         "settings": result.settings,
         "run_kilosort_arguments": kwargs,
+        # What was done to the signal before Kilosort read it, as recorded beside
+        # the binary -- engine, settings, the steps and the source it came from.
+        "preprocessing": provenance.read(config.paths.preprocessed_for(system)),
     }
     with open(result.results_dir / "run_info.json", "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, default=str)
@@ -1135,6 +1422,40 @@ def _load_edges(config: SessionConfig, name: str) -> np.ndarray | None:
     return catgt.read_edge_file(path) if path.exists() else None
 
 
+def _burst_on_probe_clock(
+    config: SessionConfig, npx_burst: np.ndarray | None
+) -> tuple[np.ndarray | None, align.LinearMap | None]:
+    """The burst times on the probe's clock, and the map that put them there.
+
+    The burst is read off the OneBox, the 1 Hz train off the probe's headstage:
+    two crystals. The OneBox's own SY word carries the same 1 Hz wave, so pairing
+    its edges with the probe's maps one clock onto the other. Without them the
+    burst stays on the OneBox clock and is returned unchanged with ``None``.
+    """
+    if npx_burst is None or not npx_burst.size:
+        return npx_burst, None
+    npx_1hz = _load_edges(config, extract.NPX_1HZ)
+    if npx_1hz is None or not npx_1hz.size:
+        return npx_burst, None  # the caller reports the missing probe train
+    obx_1hz = _load_edges(config, extract.NPX_OBX_1HZ)
+    if obx_1hz is None or not obx_1hz.size:
+        log.warning(
+            "no OneBox 1 Hz edges (%s.txt), so the burst stays on the OneBox clock and "
+            "its comparison with Blackrock includes the OneBox-to-probe drift; "
+            "re-run extract_sync to map it",
+            extract.NPX_OBX_1HZ,
+        )
+        return npx_burst, None
+    obx_map = align.fit_same_run_map(obx_1hz, npx_1hz, config.sync_period_s)
+    log.info(
+        "burst mapped OneBox -> probe clock from %d edges: %+.2f ppm, offset %.6f s, "
+        "fit residual max %.1f us",
+        obx_map.n_points, obx_map.drift_ppm, obx_map.intercept,
+        np.abs(obx_map.residuals_s).max() * 1e6,
+    )
+    return obx_map.apply(npx_burst), obx_map
+
+
 # ----------------------------------------------------------------------------
 # Step 5: onto the Blackrock timebase
 # ----------------------------------------------------------------------------
@@ -1196,7 +1517,9 @@ def time_remapping(
     br_1hz = _load_edges(config, extract.BR_1HZ)
     npx_1hz = _load_edges(config, extract.NPX_1HZ)
     br_burst = _load_edges(config, extract.BR_BURST)
-    npx_burst = _load_edges(config, extract.NPX_BURST)
+    npx_burst, obx_map = _burst_on_probe_clock(
+        config, _load_edges(config, extract.NPX_BURST)
+    )
 
     missing = [
         name
@@ -1209,16 +1532,18 @@ def time_remapping(
         )
         return None
 
-    # 1. Coarse offset from the 14 s coded bursts.
+    # 1. Coarse map from the 14 s coded bursts, paired by code so drift cannot
+    #    pick the wrong cycle -- and a line, so it holds at both ends of hours.
     match = None
     if br_burst is not None and npx_burst is not None and br_burst.size and npx_burst.size:
         match = burst.match_bursts(br_burst, npx_burst, min_gap_s=config.burst_interval_s / 2)
         offset = match.offset_s
+        coarse = match.apply
         log.info(
-            "coarse offset %.6f s from %d matched bursts (of %d Blackrock / %d SpikeGLX), "
-            "max residual %.3f ms",
-            offset, match.n_matched, match.n_reference, match.n_other,
-            match.max_residual_s * 1e3,
+            "coarse map from %d code-matched bursts (of %d Blackrock / %d SpikeGLX; "
+            "runner-up offset had %d): %+.1f ppm, offset %.6f s, max residual %.3f ms",
+            match.n_matched, match.n_reference, match.n_other, match.runner_up_matches,
+            (match.slope - 1.0) * 1e6, offset, match.max_residual_s * 1e3,
         )
     else:
         log.warning(
@@ -1228,11 +1553,14 @@ def time_remapping(
         offset = burst.estimate_offset(br_1hz, npx_1hz, tolerance_s=0.1)
         log.info("coarse offset %.6f s from the 1 Hz trains", offset)
 
+        def coarse(times):
+            return np.asarray(times, dtype=np.float64) + offset
+
     # 2. Trim both 1 Hz trains to their overlapping window. TPrime aligns edge
     #    *sequences*, so an edge present in only one recording shifts the
     #    correspondence by whole cycles.
-    br_trim, npx_trim = align.trim_pair_to_overlap(
-        br_1hz, npx_1hz, offset, margin_s=config.sync_period_s / 4
+    br_trim, npx_trim, npx_coarse = align.trim_pair_under_map(
+        br_1hz, npx_1hz, coarse(npx_1hz), margin_s=config.sync_period_s / 4
     )
     log.info(
         "1 Hz trains trimmed to overlap: Blackrock %d -> %d, SpikeGLX %d -> %d",
@@ -1245,7 +1573,7 @@ def time_remapping(
 
     # 3. Pair the trimmed edges and fit the map (also the TPrime fallback).
     ref_idx, other_idx = burst.match_times(
-        br_trim, npx_trim, offset, tolerance_s=config.sync_period_s / 4
+        br_trim, npx_coarse, 0.0, tolerance_s=config.sync_period_s / 4
     )
     if ref_idx.size < 2:
         raise ValueError(f"only {ref_idx.size} matched 1 Hz edges; cannot fit a time map")
@@ -1263,7 +1591,7 @@ def time_remapping(
     spike_times_path = results_dir / "spike_times.npy"
     if not spike_times_path.exists():
         log.info("no sorting at %s; wrote the time map only", results_dir)
-        _save_map(aligned_dir, mapping, offset, config)
+        _save_map(aligned_dir, mapping, offset, config, obx_map)
         stamp_lfp_timebase(config, mapping)
         return TimeMap(mapping, offset, "map_only", burst_match=match)
 
@@ -1303,13 +1631,17 @@ def time_remapping(
         )
         method = "linear_fit"
 
-    _save_map(aligned_dir, mapping, offset, config)
+    _save_map(aligned_dir, mapping, offset, config, obx_map)
     stamp_lfp_timebase(config, mapping)
     return TimeMap(mapping, offset, method, aligned_path=out_path, burst_match=match)
 
 
 def _save_map(
-    aligned_dir: Path, mapping: align.LinearMap, offset: float, config: SessionConfig
+    aligned_dir: Path,
+    mapping: align.LinearMap,
+    offset: float,
+    config: SessionConfig,
+    obx_map: align.LinearMap | None = None,
 ) -> None:
     payload = {
         "session": config.session,
@@ -1321,6 +1653,16 @@ def _save_map(
         "n_points": mapping.n_points,
         "fit_max_residual_s": float(np.abs(mapping.residuals_s).max()),
         "formula": "blackrock_time = slope * spikeglx_time + intercept",
+        # Which clock the burst was on when it picked the coarse offset.
+        "burst_clock": "probe" if obx_map is not None else "onebox",
+        "onebox_to_probe": None if obx_map is None else {
+            "slope": obx_map.slope,
+            "intercept": obx_map.intercept,
+            "drift_ppm": obx_map.drift_ppm,
+            "n_points": obx_map.n_points,
+            "fit_max_residual_s": float(np.abs(obx_map.residuals_s).max()),
+            "formula": "probe_time = slope * onebox_time + intercept",
+        },
     }
     with open(Path(aligned_dir) / "time_map.json", "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
@@ -1334,6 +1676,11 @@ def validate_remapping(
     A real check precisely because the bursts were **held out** of the 1 Hz fit.
     Uncorrected clock drift of tens of ppm is 72 ms/hour at 20 ppm and fails the
     1 ms tolerance, which is the point.
+
+    The burst is recorded on the OneBox, not the probe, so it is first mapped onto
+    the probe clock by the OneBox's own 1 Hz edges. ``validation.json`` says
+    whether that happened (``burst_clock``); when it did not, the residuals
+    include the OneBox-to-probe drift as well as the alignment's error.
 
     Returns ``None`` when only one system is declared, no map has been fitted, or
     neither system recorded bursts -- in which case the 1 Hz fit residuals in
@@ -1351,7 +1698,9 @@ def validate_remapping(
         return None
 
     br_burst = _load_edges(config, extract.BR_BURST)
-    npx_burst = _load_edges(config, extract.NPX_BURST)
+    npx_burst, obx_map = _burst_on_probe_clock(
+        config, _load_edges(config, extract.NPX_BURST)
+    )
     if br_burst is None or npx_burst is None or not br_burst.size or not npx_burst.size:
         log.warning(
             "no 14 s burst edges on one or both systems, so the alignment cannot be "
@@ -1384,6 +1733,7 @@ def validate_remapping(
                 "median_residual_s": report.median_residual_s,
                 "tolerance_s": report.tolerance_s,
                 "passed": report.passed,
+                "burst_clock": "probe" if obx_map is not None else "onebox",
             },
             handle,
             indent=2,
@@ -1555,8 +1905,11 @@ def _uv_per_digit(
     """Per-channel microvolts per ADC unit, and a note on where it came from.
 
     Blackrock records the gain per channel and neo reports it. SpikeGLX keeps it
-    in the ``.meta`` beside ``binary`` -- the file the sorter read -- and
-    :func:`spikeglx.uv_per_digit` reads it from there. Anything unknown comes
+    in the ``.meta`` beside the *recording* (``neuropixels.bin_file``), and
+    :func:`spikeglx.uv_per_digit` reads it from there: the preprocessed binary
+    the sorter read keeps the ADC scale, and its rows are the recording's, in
+    order -- every one after CatGT, all but the trailing SY word after
+    SpikeInterface -- so the first ``n_chan`` gains are its gains. Anything unknown comes
     back NaN rather than 1.0 -- a NaN propagates loudly through any scaling,
     where a fabricated unit gain would quietly produce plausible, wrong
     amplitudes.
@@ -1564,11 +1917,14 @@ def _uv_per_digit(
     if system == "neuropixels":
         from ._io import spikeglx
 
-        meta_file = spikeglx.meta_path_for(binary)
+        source_bin = config.neuropixels.bin_file or binary
+        meta_file = spikeglx.meta_path_for(source_bin)
         if meta_file.exists():
             scale, source = spikeglx.uv_per_digit(spikeglx.read_meta(meta_file))
             if scale.size == n_chan:
                 return scale, f"{source}, from {meta_file.name}"
+            if scale.size == n_chan + 1:            # the SY word, left out
+                return scale[:n_chan], f"{source}, from {meta_file.name}"
             return (
                 np.full(n_chan, np.nan),
                 f"gain unknown: {meta_file.name} lists {scale.size} channels "
@@ -1576,7 +1932,7 @@ def _uv_per_digit(
             )
         return (
             np.full(n_chan, np.nan),
-            f"gain unknown: no {meta_file.name} beside the binary; snippets stay in ADC",
+            f"gain unknown: no {meta_file.name} beside the recording; snippets stay in ADC",
         )
 
     if system == "blackrock" and config.blackrock.spike_file is not None:
@@ -1906,15 +2262,8 @@ def export_results(
             title=f"{config.session} | {stream_label(system)} | {timebase} timebase",
         )
 
-        overview = plots.plot_sorting_overview(
-            table["firing_rate_hz"].to_numpy(),
-            amplitudes=table["amp_median"].to_numpy() if "amp_median" in table else None,
-            contamination_pct=(
-                table["isi_fraction"].to_numpy() * 100 if "isi_fraction" in table else None
-            ),
-        )
-        plots.save_figure(overview, figure_dir / "overview.png")
-        log.info("wrote units.pdf (%d units) + overview -> %s", len(units), figure_dir)
+        log.info("wrote units.pdf (%d units) -> %s", len(units), figure_dir)
+        _write_overview(phy, unit_ids, figure_dir / "overview.png")
         if len(units) < unit_ids.size:
             log.warning(
                 "only the first %d of %d units were plotted (max_unit_figures)",
@@ -1922,3 +2271,29 @@ def export_results(
             )
 
     return {"paths": paths, "timebase": timebase, "n_units": int(unit_ids.size)}
+
+
+def _write_overview(phy, unit_ids: np.ndarray, path: Path) -> Path | None:
+    """``overview.png``: every exported unit's spikes on the probe, noise in grey.
+
+    Skipped, with a line in the log, when the sorting has no PC features to place
+    spikes with.
+    """
+    from ._export.curated import load_spike_positions
+    from ._export.metrics import select_spikes_evenly
+    from ._plots import summary as plots
+
+    n_total = int(phy.spike_clusters.size)
+    index = select_spikes_evenly(n_total, _OVERVIEW_MAX_SPIKES)
+    xy = load_spike_positions(phy.results_dir, index)
+    if xy is None:
+        log.info("no pc_features.npy in %s; no overview.png", phy.results_dir)
+        return None
+    clusters = phy.spike_clusters[index]
+    exported = np.isin(clusters, unit_ids)
+    overview = plots.plot_sorting_overview(
+        xy[exported], clusters[exported], background_xy=xy[~exported], n_total=n_total
+    )
+    plots.save_figure(overview, path)
+    log.info("wrote %s (%d of %d spikes)", path.name, index.size, n_total)
+    return path

@@ -198,6 +198,55 @@ is already quoted, so you can paste it as it is.
 Phy writes `cluster_group.tsv`, whose labels override Kilosort's own
 `cluster_KSLabel.tsv`. Everything below reads the human labels where they exist.
 
+### If Phy fails with `FileNotFoundError` inside `kilosort4\.phy\` (Windows)
+
+```
+FileNotFoundError: [Errno 2] No such file or directory: '\\jeurissenlab.cns.nyu.edu\server\Shared\
+NPix data\...\kilosort4\.phy\phy\apps\base\TemplateMixin\get_spike_template_amplitudes\func_code.py.d4682f...'
+```
+
+This is Windows' **260-character path limit**, not a broken sorting. Phy keeps a
+cache in `.phy\` inside the sorting folder, nested several levels deep with long
+hashed filenames (~130 characters). A sorting folder on the share is already long
+— the SpikeGLX run name appears twice, once for the gate folder and once for the
+probe folder — so the cache files go past 260 characters and Windows refuses to
+create them. The error may show the server path (`\\jeurissenlab...`) even though
+you opened `Z:\...`. In the case above the full path was 291 characters, so even
+`Z:\` would only have shortened it to about 261.
+
+Fix it in one of these ways, best first:
+
+1. **Enable long paths on the machine (once, needs admin).** Python supports long
+   paths as soon as Windows allows them. In an **admin** PowerShell:
+
+   ```powershell
+   New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+   ```
+
+   Sign out and back in (or reboot). This fixes every session, including future
+   ones with long run names.
+
+2. **No admin rights: curate from a short path.** Copy the `kilosort4` folder to
+   somewhere short and open Phy there:
+
+   ```bash
+   conda activate phy
+   phy template-gui C:/phy/Tank0819/params.py
+   ```
+
+   Raw traces still load, because `dat_path` in `params.py` is an absolute path to
+   the preprocessed binary. **When you are done, copy `cluster_group.tsv` and the
+   other `cluster_*.tsv` files back** into the original `kilosort4` folder before
+   running Step 3, or the export will not see your labels.
+
+3. **Shorter folder names** for future recordings, e.g. a shorter top-level folder
+   than `Practice spike sorting`. This only helps a little: the run name, which
+   appears twice, is most of the length.
+
+Whichever you choose, **delete `kilosort4\.phy\` before reopening Phy.** It is only
+Phy's cache and is rebuilt automatically, but the failed attempt may have left it
+half-written.
+
 ## Step 3 — Time alignment and export
 
 Back in the **sorting** env — the waveform export reads the recording through

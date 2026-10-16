@@ -114,3 +114,21 @@ def test_uncorrected_drift_is_caught_by_validation():
     report = align.validate_alignment(drifting, bursts, tolerance_s=1e-3, match_tolerance_s=1.0)
     assert not report.passed
     assert report.max_residual_s > 0.05
+
+
+def test_fit_same_run_map_takes_the_onebox_clock_onto_the_probe_clock():
+    # Two streams of one run: they start together, so the edges pair with no
+    # coarse offset, and only the crystals differ.
+    probe = np.arange(0.0, 3600.0, 1.0) + 0.25
+    onebox = (probe - 0.002) / (1.0 + 30e-6)
+
+    mapping = align.fit_same_run_map(onebox, probe)
+
+    assert mapping.drift_ppm == pytest.approx(30.0, abs=1e-3)
+    assert mapping.intercept == pytest.approx(0.002, abs=1e-9)
+    assert np.allclose(mapping.apply(onebox), probe, atol=1e-9)
+
+
+def test_fit_same_run_map_refuses_trains_that_do_not_pair():
+    with pytest.raises(ValueError, match="cannot fit"):
+        align.fit_same_run_map(np.array([0.5]), np.array([0.0, 1.0]))

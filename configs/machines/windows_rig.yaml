@@ -41,3 +41,7 @@ conda_envs:
 # an install instruction -- torch comes in with kilosort, per Kilosort's own docs.
 # `check_env.py` reports the build actually present and whether it sees the GPU.
 device: "cuda"
+
+# Worker processes for SpikeInterface preprocessing (preprocess.method:
+# spikeinterface, and motion correction). Raise it on a box with cores to spare.
+n_jobs: 4
