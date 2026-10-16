@@ -1137,6 +1137,7 @@ def _unit_page_data(
             "unit_id": unit_id,
             "label": label,
             "unit_class": _UNIT_CLASS.get(label, ""),
+            "ks_label": phy.ks_labels.get(unit_id, ""),
             "channel": channel,
             "n_spikes": int(times.size),
             "isi_counts": isi_counts,

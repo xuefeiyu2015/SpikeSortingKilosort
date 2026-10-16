@@ -3,8 +3,9 @@
 Writes what an analysis copies away, beside the sorting it came from:
 
 ==================================== ============================================
-``units.csv``                        one row per unit: label, channel, counts,
-                                     rate, ISI, presence, amplitude, waveform shape
+``units.csv``                        one row per unit: label (curated), ks_label
+                                     (Kilosort's own), channel, counts, rate, ISI,
+                                     presence, amplitude, waveform shape
 ``<recording>.sorted_spikes.mat``    every spike: time, channel, unit, sample
                                      index, plus the measured mean waveforms
 ==================================== ============================================
@@ -144,6 +145,7 @@ def build_unit_table(
         row: dict[str, Any] = {
             "unit_id": unit_id,
             "label": results.labels.get(unit_id, ""),
+            "ks_label": results.ks_labels.get(unit_id, ""),
             "channel": channel,
             "template_id": template_for_unit(results, unit_id),
             "first_spike_s": float(times[0]) if times.size else float("nan"),
@@ -241,6 +243,7 @@ def export_sorted_spikes_mat(
         ),
         "Unit_No": unit_ids.astype(np.float64),
         "Label": " | ".join(str(results.labels.get(int(u), "")) for u in unit_ids),
+        "KSLabel": " | ".join(str(results.ks_labels.get(int(u), "")) for u in unit_ids),
         "n_spikes": np.array([int((results.spike_clusters == int(u)).sum()) for u in unit_ids],
                              dtype=np.float64),
         "samplingrate": float(results.fs),

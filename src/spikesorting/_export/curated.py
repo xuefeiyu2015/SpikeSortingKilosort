@@ -70,8 +70,12 @@ class PhyResults:
     #: Template index per spike. After a Phy merge a cluster spans several
     #: templates, so cluster id and template id are not interchangeable.
     spike_templates: np.ndarray | None = None
-    #: cluster id -> "good" / "mua" / "noise"; a cluster nobody labelled is absent
+    #: cluster id -> "good" / "mua" / "noise": the Phy curation where there is
+    #: one, Kilosort's own label otherwise; a cluster with neither is absent
     labels: dict[int, str] = field(default_factory=dict)
+    #: cluster id -> Kilosort's own "good" / "mua", whatever Phy says. A cluster
+    #: a Phy merge or split created is absent: Kilosort never saw it.
+    ks_labels: dict[int, str] = field(default_factory=dict)
     #: True when a human curated this folder in Phy.
     curated: bool = False
 
@@ -176,6 +180,7 @@ def load_phy_results(results_dir: str | Path, fs: float | None = None) -> PhyRes
         channel_map=maybe("channel_map.npy"),
         spike_templates=spike_templates.reshape(-1) if spike_templates is not None else None,
         labels=labels,
+        ks_labels=auto_labels,
         curated=bool(curated_labels),
     )
 

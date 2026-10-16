@@ -182,6 +182,7 @@ def _unit_header(unit: dict[str, Any]) -> str:
     parts = [
         f"unit {unit.get('unit_id')}",
         *([_unit_class(unit)] if _unit_class(unit) else []),
+        *([f"KS {unit['ks_label']}"] if unit.get("ks_label") else []),
         f"ch {unit.get('channel')}",
         f"{unit.get('n_spikes', 0):,} spikes",
     ]

@@ -40,6 +40,7 @@ def test_curated_labels_override_kilosort_labels(kilosort_results):
     assert results.labels[0] == "noise"  # human overrode "good"
     assert results.labels[1] == "good"
     assert results.labels[2] == "good"  # untouched, falls back to KSLabel
+    assert results.ks_labels == {0: "good", 1: "mua", 2: "good"}  # Kilosort's, unchanged
 
 
 def test_kilosorts_own_copy_of_cluster_group_is_not_a_curation(kilosort_results):
@@ -283,3 +284,37 @@ def test_an_unlabelled_unit_header_names_no_class():
     header = _unit_header({"unit_id": 7, "label": "", "unit_class": "", "channel": 4})
     assert header.startswith("unit 7  |  ch 4")
     assert "unsorted" not in header and "()" not in header
+    assert "KS" not in header
+
+
+def test_unit_header_shows_kilosorts_label_beside_the_curated_one():
+    from spikesorting._plots.summary import _unit_header
+
+    header = _unit_header({"unit_id": 3, "label": "good", "unit_class": "SU", "ks_label": "mua"})
+    assert "SU (good)  |  KS mua" in header
+
+
+def test_exports_keep_the_kilosort_label_beside_the_curated_one(kilosort_results, tmp_path):
+    import h5py
+
+    from spikesorting._export import final
+
+    (kilosort_results / "cluster_group.tsv").write_text(
+        "cluster_id\tgroup\n1\tgood\n", encoding="utf-8"
+    )
+    phy = curated.load_phy_results(kilosort_results)
+    table = final.build_unit_table(phy, phy.unit_ids)
+    assert table.set_index("unit_id")["label"].to_dict() == {0: "good", 1: "good", 2: "good"}
+    assert table.set_index("unit_id")["ks_label"].to_dict() == {0: "good", 1: "mua", 2: "good"}
+
+    path = final.export_sorted_spikes_mat(
+        tmp_path, phy, phy.unit_ids, None, "sorter", table, waveforms=None
+    )
+    with h5py.File(path, "r") as handle:
+        info = handle["sorted_spikes/info"]
+
+        def text(name):
+            return bytes(info[name][()].ravel().astype(np.uint8)).decode()
+
+        assert text("Label") == "good | good | good"
+        assert text("KSLabel") == "good | mua | good"
