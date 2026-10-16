@@ -17,7 +17,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-__all__ = ["PhyResults", "parse_params_py", "load_phy_results", "select_units"]
+__all__ = [
+    "PhyResults",
+    "parse_params_py",
+    "load_phy_results",
+    "select_units",
+    "load_spike_positions",
+]
 
 _PARAM_RE = re.compile(r"^\s*(\w+)\s*=\s*(.+?)\s*$")
 
@@ -198,4 +204,34 @@ def select_units(results: PhyResults) -> np.ndarray:
             if results.labels.get(int(uid), "").lower() != "noise"
         ],
         dtype=results.unit_ids.dtype,
+    )
+
+
+#: The Kilosort files a spike's position is estimated from.
+_POSITION_FILES = (
+    "pc_features.npy", "pc_feature_ind.npy", "channel_positions.npy", "spike_templates.npy",
+)
+
+
+def load_spike_positions(results_dir: str | Path, spike_index: np.ndarray) -> np.ndarray | None:
+    """x/y on the probe of the spikes at ``spike_index``, or None without the files.
+
+    ``pc_features.npy`` is spikes x PCs x channels -- most of a gigabyte for a
+    long session -- so it is memory-mapped and only the requested rows are read.
+    Positions follow the *template* each spike was fitted with, not its cluster:
+    a Phy merge changes clusters, and the features belong to the template.
+    """
+    from .metrics import compute_spike_positions
+
+    results_dir = Path(results_dir)
+    if not all((results_dir / name).exists() for name in _POSITION_FILES):
+        return None
+    index = np.asarray(spike_index, dtype=np.int64)
+    features = np.load(results_dir / "pc_features.npy", mmap_mode="r")
+    templates = np.load(results_dir / "spike_templates.npy", mmap_mode="r").reshape(-1)
+    return compute_spike_positions(
+        spike_templates=np.asarray(templates[index]),
+        pc_features=np.asarray(features[index]),
+        pc_feature_ind=np.load(results_dir / "pc_feature_ind.npy"),
+        channel_positions=np.load(results_dir / "channel_positions.npy"),
     )

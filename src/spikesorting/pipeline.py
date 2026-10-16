@@ -1092,6 +1092,10 @@ def _waveform_fields(measured: dict | None) -> dict | None:
 #: Phy's curation labels as single vs multi unit, for the figure headers.
 _UNIT_CLASS = {"good": "SU", "mua": "MU"}
 
+#: Spikes drawn in the overview's position plot. Spread evenly over the session;
+#: past this many the dots only overlap, and reading the features costs more.
+_OVERVIEW_MAX_SPIKES = 100_000
+
 
 def _unit_page_data(
     phy,
@@ -2258,15 +2262,8 @@ def export_results(
             title=f"{config.session} | {stream_label(system)} | {timebase} timebase",
         )
 
-        overview = plots.plot_sorting_overview(
-            table["firing_rate_hz"].to_numpy(),
-            amplitudes=table["amp_median"].to_numpy() if "amp_median" in table else None,
-            contamination_pct=(
-                table["isi_fraction"].to_numpy() * 100 if "isi_fraction" in table else None
-            ),
-        )
-        plots.save_figure(overview, figure_dir / "overview.png")
-        log.info("wrote units.pdf (%d units) + overview -> %s", len(units), figure_dir)
+        log.info("wrote units.pdf (%d units) -> %s", len(units), figure_dir)
+        _write_overview(phy, unit_ids, figure_dir / "overview.png")
         if len(units) < unit_ids.size:
             log.warning(
                 "only the first %d of %d units were plotted (max_unit_figures)",
@@ -2274,3 +2271,29 @@ def export_results(
             )
 
     return {"paths": paths, "timebase": timebase, "n_units": int(unit_ids.size)}
+
+
+def _write_overview(phy, unit_ids: np.ndarray, path: Path) -> Path | None:
+    """``overview.png``: every exported unit's spikes on the probe, noise in grey.
+
+    Skipped, with a line in the log, when the sorting has no PC features to place
+    spikes with.
+    """
+    from ._export.curated import load_spike_positions
+    from ._export.metrics import select_spikes_evenly
+    from ._plots import summary as plots
+
+    n_total = int(phy.spike_clusters.size)
+    index = select_spikes_evenly(n_total, _OVERVIEW_MAX_SPIKES)
+    xy = load_spike_positions(phy.results_dir, index)
+    if xy is None:
+        log.info("no pc_features.npy in %s; no overview.png", phy.results_dir)
+        return None
+    clusters = phy.spike_clusters[index]
+    exported = np.isin(clusters, unit_ids)
+    overview = plots.plot_sorting_overview(
+        xy[exported], clusters[exported], background_xy=xy[~exported], n_total=n_total
+    )
+    plots.save_figure(overview, path)
+    log.info("wrote %s (%d of %d spikes)", path.name, index.size, n_total)
+    return path

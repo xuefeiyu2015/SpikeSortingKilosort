@@ -318,3 +318,65 @@ def test_exports_keep_the_kilosort_label_beside_the_curated_one(kilosort_results
 
         assert text("Label") == "good | good | good"
         assert text("KSLabel") == "good | mua | good"
+
+
+def test_spike_position_is_the_channel_carrying_all_the_weight():
+    from spikesorting._export.metrics import compute_spike_positions
+
+    positions = np.array([[0.0, 0.0], [16.0, 20.0], [0.0, 40.0]])
+    features = np.zeros((2, 3, 2))
+    features[0, 0, 1] = 5.0                     # spike 0: all on its second channel
+    features[1, 0, :] = 3.0                     # spike 1: equal on both
+    xy = compute_spike_positions(
+        np.array([0, 1]), features, np.array([[0, 1], [1, 2]]), positions
+    )
+    assert np.allclose(xy[0], [16.0, 20.0])
+    assert np.allclose(xy[1], [8.0, 30.0])      # the midpoint of channels 1 and 2
+
+
+def test_a_spike_with_no_feature_weight_has_no_position():
+    from spikesorting._export.metrics import compute_spike_positions
+
+    xy = compute_spike_positions(
+        np.array([0]), np.zeros((1, 3, 2)), np.array([[0, 1]]), np.array([[0.0, 0.0], [0.0, 20.0]])
+    )
+    assert np.all(np.isnan(xy))
+
+
+def test_spikes_are_selected_evenly_and_repeatably():
+    from spikesorting._export.metrics import select_spikes_evenly
+
+    picked = select_spikes_evenly(1_000, 10)
+    assert picked.size == 10 and picked[0] == 0 and picked[-1] == 999
+    assert np.array_equal(picked, select_spikes_evenly(1_000, 10))
+    assert np.array_equal(select_spikes_evenly(5, 10), np.arange(5))
+    assert select_spikes_evenly(0, 10).size == 0
+
+
+def test_loaded_spike_positions_sit_on_each_units_peak_channel(kilosort_results):
+    results = curated.load_phy_results(kilosort_results)
+    index = np.arange(0, results.spike_clusters.size, 7)
+    xy = curated.load_spike_positions(kilosort_results, index)
+    peak_depth = {0: 40.0, 1: 100.0, 2: 140.0}  # peak channels 2, 5, 7 at 20 um pitch
+    expected = np.array([peak_depth[int(c)] for c in results.spike_clusters[index]])
+    assert np.allclose(xy[:, 1], expected) and np.allclose(xy[:, 0], 0.0)
+
+
+def test_spike_positions_need_the_pc_features(kilosort_results):
+    (kilosort_results / "pc_features.npy").unlink()
+    assert curated.load_spike_positions(kilosort_results, np.arange(3)) is None
+
+
+def test_the_overview_is_one_probe_axis_with_a_layer_per_unit():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from spikesorting._plots.summary import plot_sorting_overview
+
+    xy = np.column_stack([np.zeros(6), [0, 0, 20, 20, 40, 40]]).astype(float)
+    fig = plot_sorting_overview(
+        xy, np.array([3, 3, 7, 7, 9, 9]), background_xy=np.zeros((2, 2)), n_total=100
+    )
+    (ax,) = fig.axes
+    assert len(ax.collections) == 1 + 3          # grey noise, then one per unit
+    assert "3 units" in ax.get_title() and "8 of 100 spikes" in ax.get_title()

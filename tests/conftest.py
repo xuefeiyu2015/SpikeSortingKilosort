@@ -199,6 +199,22 @@ def kilosort_results(tmp_path) -> Path:
     np.save(results_dir / "templates.npy", templates)
     np.save(results_dir / "channel_map.npy", np.arange(n_chan, dtype=np.int32))
 
+    # Sites in one column 20 um apart. Each template spans four channels with its
+    # peak first, and its spikes' first PC sits on the peak alone, so every spike
+    # is placed exactly on its peak channel.
+    np.save(
+        results_dir / "channel_positions.npy",
+        np.column_stack([np.zeros(n_chan), 20.0 * np.arange(n_chan)]).astype(np.float32),
+    )
+    feature_ind = np.array(
+        [[c, (c + 1) % n_chan, (c + 2) % n_chan, (c + 3) % n_chan] for c in peak_channels],
+        dtype=np.int32,
+    )
+    np.save(results_dir / "pc_feature_ind.npy", feature_ind)
+    features = np.zeros((spike_samples.size, 3, 4), dtype=np.float32)
+    features[:, 0, 0] = rng.normal(10, 1, size=spike_samples.size)
+    np.save(results_dir / "pc_features.npy", features)
+
     (results_dir / "params.py").write_text(
         "dat_path = 'recording.bin'\n"
         "n_channels_dat = 8\n"

@@ -401,6 +401,13 @@ def test_export_results_reads_those_settings_rather_than_arguments(
     figures = sorted(p.name for p in session.paths.figures_for("neuropixels").iterdir())
     assert figures == ["overview.png", "units.pdf"]
 
+    # A sorting without PC features cannot place spikes: no overview, the rest stands.
+    shutil.rmtree(session.paths.figures_for("neuropixels"))
+    (sorted_dir / "pc_features.npy").unlink()
+    ss.export_results(cfg.with_overrides(session, export_figures=True), "neuropixels")
+    figures = sorted(p.name for p in session.paths.figures_for("neuropixels").iterdir())
+    assert figures == ["units.pdf"]
+
 
 def test_a_system_that_is_not_sorted_needs_no_probe_and_no_recording(tmp_path):
     # "Extract the pulses, do not sort" is a whole session shape -- the 2-probe
