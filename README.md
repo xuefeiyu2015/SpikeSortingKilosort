@@ -40,23 +40,40 @@ Three notebooks sit alongside the steps below, in `notebooks/`:
 nothing but your time, and it is the cheapest place to catch a dead bank of
 channels or a drift assumption that does not hold.
 
+**Recommended: SpikeGLX's File Viewer.** For Neuropixels, look at the raw
+signal in SpikeGLX itself — **File → Open File Viewer**, then pick the
+`.ap.bin`. It reads the `.meta` beside it, so the channel map, gains and SY
+channel are the ones the recording actually used, and it needs no probe file,
+no GPU and no conda env.
+
+Look at:
+
+- **bad channels** — flat, saturated or noisy rows to list in `bad_channels`.
+  Turn on the 300 Hz high-pass and the CAR option in the viewer's filter
+  controls, so a noisy channel stands out against its neighbours.
+- **the CAR effect** — compare the traces with and without CAR to choose
+  `car_mode` in the `preprocess:` block.
+- **the sync channel** — the SY row should show the 1 Hz square wave; the
+  OneBox (`.obx.bin`) the same, plus the 14 s burst on XA1.
+- **the LF band** — open the `.lf.bin` the same way.
+
+Viewer help: SpikeGLX → Help, or <https://billkarsh.github.io/SpikeGLX/>.
+
+**Optional: the Kilosort4 GUI**, for what SpikeGLX cannot show — Kilosort's own
+whitened traces and its drift map, i.e. whether drift justifies `nblocks: 1`
+(Neuropixels) or none at all (`nblocks: 0`, the Utah array — see the note in
+Step 1). It is also the way to look at a Blackrock `.ns6`, which SpikeGLX does
+not open.
+
 ```bash
 conda activate kilosort4
 python -m kilosort              # the Kilosort4 GUI
 ```
 
-Load the binary and the probe file, and look at:
-
-- **bad channels** — flat, saturated or noisy rows to list in `bad_channels`
-- **the whitening / CAR effect** — the GUI shows raw, filtered and whitened
-  traces side by side, which is the only honest way to decide `do_CAR`
-- **drift** — whether the drift map justifies `nblocks: 1` (Neuropixels) or none
-  at all (`nblocks: 0`, the Utah array — see the note in Step 1)
-
 GUI guide: <https://kilosort.readthedocs.io/en/latest/gui_guide.html>
 
-You *can* sort from the GUI too. Don't — the scripts below batch, log, and record
-what they did in a session file you can read back six months later.
+You *can* sort from the Kilosort GUI too. Don't — the scripts below batch, log,
+and record what they did in a session file you can read back six months later.
 
 **Write what you learned into the session YAML.** These are the
 keys it answers:
@@ -313,7 +330,7 @@ python -m pip install kilosort[gui]
 
 Python **3.10 or newer**, because this repo requires it (Kilosort's own docs say
 3.9, which is fine for Kilosort alone but too old here). The `[gui]` extra is what
-makes `python -m kilosort` — the GUI in Step 0 — work; drop it if you will never
+makes `python -m kilosort` — the optional GUI in Step 0 — work; drop it if you will never
 open it.
 
 **Then check the GPU, before anything else.** `torch` arrives as a Kilosort
