@@ -54,7 +54,7 @@ Look at:
 - **the CAR effect** — compare the traces with and without CAR to choose
   `car_mode` in the `preprocess:` block.
 - **the sync channel** — the SY row should show the 1 Hz square wave; the
-  OneBox (`.obx.bin`) the same, plus the 14 s burst on XA1.
+  OneBox (`.obx.bin`) the same, plus the 14 s burst on XA0.
 - **the LF band** — open the `.lf.bin` the same way.
 
 Viewer help: SpikeGLX → Help, or <https://billkarsh.github.io/SpikeGLX/>.

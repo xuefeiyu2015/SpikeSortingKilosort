@@ -471,12 +471,20 @@ class NeuropixelsSpec:
     #: High duration of the 1 Hz square wave, in ms (1 s period, 50% duty).
     #: A CatGT ``-xd`` argument.
     sync_pulse_ms: int = 500
-    #: Word index of the XA1 analog input in the obx stream (14 s coded burst).
-    burst_word: int = 1
+    #: Word index of the XA0 analog input in the obx stream (14 s coded burst) --
+    #: the OneBox's first input. A row in the .obx.bin, so it equals the XA number
+    #: only while the OneBox saves every XA channel.
+    burst_word: int = 0
     #: CatGT -xa thresholds in volts: (primary, secondary). Secondary 0 disables it.
     burst_threshold_v: tuple[float, float] = (1.0, 0.0)
     #: Expected burst pulse width in ms; 0 accepts any width.
     burst_pulse_ms: int = 0
+    #: What is wired into the OneBox's other XA inputs, as ``{label: XA number}``
+    #: -- ``{eye_x: 1, eye_y: 2, pupil: 3, photodiode: 4}``. Only names them:
+    #: ``extract_analog`` exports *every* XA input the file saved, labelling an
+    #: unnamed one ``XA<n>`` and the burst's ``sync_burst``. Labels become MATLAB
+    #: field names, so they must be identifiers.
+    analog_channels: dict[str, int] = field(default_factory=dict)
     #: Probe JSON from make_probe.py, used when the binary has no ``.meta`` to
     #: build the map from. The .meta wins where it exists: it records which sites
     #: were actually active, which a file built from another run cannot know.
@@ -537,9 +545,13 @@ class NeuropixelsSpec:
             sample_rate=float(rate) if rate is not None else None,
             sync_bit=int(data.get("sync_bit", 6)),
             sync_pulse_ms=int(data.get("sync_pulse_ms", 500)),
-            burst_word=int(data.get("burst_word", 1)),
+            burst_word=int(data.get("burst_word", 0)),
             burst_threshold_v=(float(thresh[0]), float(thresh[1])),
             burst_pulse_ms=int(data.get("burst_pulse_ms", 0)),
+            analog_channels={
+                str(name): int(number)
+                for name, number in (data.get("analog_channels") or {}).items()
+            },
             probe_file=_as_config_path(data.get("probe_file")),
             bin_files=_as_binaries(data.get("bin_files")),
             # YAML gives `1:` as an int and `"1":` as a string; both mean probe 1.
@@ -706,6 +718,12 @@ class SessionConfig:
     #: (-> 1250 Hz) is safe against a band hardware-limited to ~500 Hz and
     #: anything above it aliases.
     lfp_decimate: int = 1
+    #: Whether to export the OneBox's analog inputs (eye, pupil, photodiode, the
+    #: burst) on Blackrock time. Off unless asked for, like ``export_lfp``: at
+    #: ``analog_decimate: 1`` it is ~0.7 GB/hour for twelve inputs.
+    export_analog: bool = False
+    #: Stride for that export: a plain stride with no anti-alias filter.
+    analog_decimate: int = 1
     #: Whether the export stage draws per-unit and overview figures.
     export_figures: bool = True
     #: Period of the fine-alignment square wave, in seconds. TPrime -syncperiod.
@@ -1088,6 +1106,8 @@ _SESSION_KEYS = frozenset({
     "kilosort_on_blackrock",
     "export_lfp",
     "lfp_decimate",
+    "export_analog",
+    "analog_decimate",
     "export_figures",
     "sync_period_s",
     "burst_interval_s",
@@ -1275,6 +1295,8 @@ def load_session_config(
         ),
         export_lfp=bool(data.get("export_lfp", False)),
         lfp_decimate=int(data.get("lfp_decimate", 1)),
+        export_analog=bool(data.get("export_analog", False)),
+        analog_decimate=int(data.get("analog_decimate", 1)),
         export_figures=bool(data.get("export_figures", True)),
         sync_period_s=float(data.get("sync_period_s", 1.0)),
         burst_interval_s=float(data.get("burst_interval_s", 14.0)),
@@ -1289,6 +1311,7 @@ def load_session_config(
     _reject_bad_probe_list(config, session_path)
     _reject_bad_preprocess(config, session_path)
     _reject_sorting_nothing(config, data, session_path)
+    _reject_bad_analog_channels(config, session_path)
     _reject_colliding_system_dirs(config, session_path)
     return config
 
@@ -1374,6 +1397,43 @@ def _reject_bad_preprocess(config: SessionConfig, path: Path) -> None:
                             f"Kilosort, but kilosort nblocks{tag} is {nblocks}, so "
                             "it would be corrected twice. Set nblocks: 0."
                         )
+
+
+def _reject_bad_analog_channels(config: SessionConfig, path: Path) -> None:
+    """Refuse an ``analog_channels`` map that cannot describe the wiring.
+
+    Checked at load, before an hour of reading the OneBox file: a label that is
+    not a MATLAB identifier, two labels on one input, or a label on the input
+    the 14 s burst arrives on -- that one is the sync signal, and naming it
+    ``eye_x`` would mean the burst detector and the eye export disagree about
+    what is wired where. Whether each input was actually *saved* can only be
+    answered by the ``.obx.meta``, so ``export_onebox_analog`` checks that.
+    """
+    npx = config.neuropixels
+    named = npx.analog_channels
+    if config.analog_decimate < 1:
+        raise ValueError(f"{path}: analog_decimate must be >= 1, got {config.analog_decimate}")
+    for name, number in named.items():
+        if not re.match(r"^[A-Za-z][A-Za-z0-9_]{0,62}$", name):
+            raise ValueError(
+                f"{path}: neuropixels.analog_channels label {name!r} is not a MATLAB "
+                "identifier (a letter, then letters, digits or _)"
+            )
+        if number < 0:
+            raise ValueError(f"{path}: neuropixels.analog_channels.{name} is XA{number}")
+        if number == npx.burst_word:
+            raise ValueError(
+                f"{path}: neuropixels.analog_channels.{name} is XA{number}, which is "
+                f"burst_word -- the input carrying the 14 s sync burst. It is "
+                "exported as 'sync_burst'; name a different input."
+            )
+    numbers = list(named.values())
+    shared = sorted({n for n in numbers if numbers.count(n) > 1})
+    if shared:
+        raise ValueError(
+            f"{path}: neuropixels.analog_channels names "
+            + ", ".join(f"XA{n}" for n in shared) + " more than once"
+        )
 
 
 def _reject_sorting_nothing(

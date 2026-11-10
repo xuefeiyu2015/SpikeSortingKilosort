@@ -286,6 +286,7 @@ def test_the_utah_only_template_differs_only_by_the_missing_probe():
         "neuropixels_dir",
         "kilosort_on_neuropixels",
         "kilosort_by_system",
+        "export_analog",      # the OneBox's inputs; no SpikeGLX run, no OneBox
     }
     differing = [
         f
@@ -1510,3 +1511,50 @@ def test_every_tracked_config_uses_only_real_settings(config):
     # The top-level key set is the one part of the check written by hand, so it
     # is pinned against the files that have to keep loading.
     cfg.load_session_config(CONFIG_DIR / config, "windows_rig", CONFIG_DIR)
+
+
+# ----------------------------------------------------------------------------
+# OneBox analog inputs
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name", ["session_template_1probe.yaml", "session_template_2probes.yaml",
+             "session_template_utah_probe.yaml"],
+)
+def test_every_template_with_a_onebox_states_the_rig_wiring(name):
+    # XA0 is the burst; the four behavioural signals follow it. One wiring, so
+    # a template that disagrees with the others is a typo, not a choice.
+    session = cfg.load_session_config(CONFIG_DIR / name, "windows_rig", CONFIG_DIR)
+    assert session.neuropixels.burst_word == 0
+    assert session.neuropixels.analog_channels == {
+        "eye_x": 1, "eye_y": 2, "pupil": 3, "photodiode": 4,
+    }
+    assert session.export_analog is True
+    assert session.analog_decimate == 1
+
+
+@pytest.mark.parametrize(
+    "channels, message",
+    [
+        ("{eye_x: 0}", "burst_word"),                 # XA0 is the sync burst
+        ("{eye_x: 1, eye_y: 1}", "more than once"),
+        ("{'eye x': 1}", "MATLAB"),
+        ("{eye_x: -1}", "XA-1"),
+    ],
+)
+def test_an_analog_map_that_cannot_describe_the_wiring_is_refused(tmp_path, channels, message):
+    with pytest.raises(ValueError, match=message):
+        _load_session(
+            tmp_path,
+            "neuropixels:\n  bin_file: '/a/run_g0_t0.imec0.ap.bin'\n"
+            f"  analog_channels: {channels}\n",
+        )
+
+
+def test_analog_decimate_below_one_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="analog_decimate"):
+        _load_session(
+            tmp_path,
+            "analog_decimate: 0\nneuropixels:\n  bin_file: '/a/run_g0_t0.imec0.ap.bin'\n",
+        )

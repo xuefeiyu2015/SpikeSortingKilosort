@@ -6,7 +6,7 @@ under ``blackrock_dir/kilosort4/``:
 
 ===================== ==============================================
 ``npx_1hz.txt``       SpikeGLX SY-word bit 6, the 1 Hz square wave
-``npx_burst.txt``     OneBox XA1, the 14 s coded burst
+``npx_burst.txt``     OneBox XA0, the 14 s coded burst
 ``npx_obx_1hz.txt``   OneBox SY-word bit 6, the same 1 Hz wave on the OneBox clock
 ``blackrock_1hz.txt`` NSP ns5 channel 1, the same 1 Hz square wave
 ``blackrock_burst.txt`` NSP ns5 channel 2, the same 14 s burst

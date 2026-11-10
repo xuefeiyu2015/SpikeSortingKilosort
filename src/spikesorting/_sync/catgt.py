@@ -112,7 +112,7 @@ def analog_spec(
     millisec: float = 0,
     label: str = "",
 ) -> ExtractorSpec:
-    """Analog extractor, e.g. the 14 s coded burst on OneBox XA1."""
+    """Analog extractor, e.g. the 14 s coded burst on OneBox XA0."""
     return ExtractorSpec(
         "xa", js, ip, word, thresh1_v=thresh1_v, thresh2_v=thresh2_v, millisec=millisec, label=label
     )

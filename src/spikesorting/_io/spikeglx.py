@@ -42,6 +42,9 @@ __all__ = [
     "parse_geom_map",
     "parse_geom_header",
     "export_lfp",
+    "onebox_xa_numbers",
+    "analog_channel_labels",
+    "export_onebox_analog",
 ]
 
 #: Sample-rate meta key per stream type.
@@ -685,6 +688,174 @@ def export_lfp(
                     "is 'blackrock' (NaN when no time map had been fitted yet). "
                     "microvolts = value * uv_per_digit, per channel; NaN "
                     "where the meta states no gain (and on the SY word)"
+                ),
+            }
+        },
+    )
+    return out_path
+
+
+# ----------------------------------------------------------------------------
+# OneBox analog inputs (eye, pupil, photodiode, the sync burst)
+# ----------------------------------------------------------------------------
+
+#: Label for the XA input carrying the 14 s burst, unless the session names it.
+SYNC_BURST_LABEL = "sync_burst"
+_MATLAB_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,62}$")
+
+
+def onebox_xa_numbers(meta: dict[str, str], n_saved: int) -> np.ndarray:
+    """XA number of each analog row in a ``.obx.bin``: row ``i`` is ``XA<out[i]>``.
+
+    A OneBox saves its XA inputs first, then the XD word, then SY, so the analog
+    rows are the first ``snsXaDwSy[0]`` of the file. Which XA each one is comes
+    from ``snsSaveChanSubset``: the rows equal the XA numbers only while every
+    input is saved, so ``XA3`` is looked up rather than assumed to be row 3.
+    Pure.
+    """
+    counts = meta.get("snsXaDwSy")
+    if not counts:
+        raise ValueError(
+            "the .obx.meta has no snsXaDwSy, so which rows are XA inputs is unknown"
+        )
+    n_xa = int(counts.split(",")[0])
+    return _saved_channels(meta, n_saved)[:n_xa].astype(np.int64)
+
+
+def analog_channel_labels(
+    xa: np.ndarray, named: dict[str, int], burst_row: int | None = None
+) -> list[str]:
+    """One MATLAB-safe label per analog row, in row order. Pure.
+
+    ``named`` maps a label to an XA number (``{"eye_x": 1}``). An unnamed row is
+    ``XA<n>``, except the one carrying the 14 s burst (row ``burst_row``, the
+    CatGT word index), which is ``sync_burst``. A named input the file did not
+    save raises: an eye trace that is silently absent reads as "no eye data".
+    """
+    xa = [int(x) for x in np.asarray(xa).ravel()]
+    labels = [f"XA{n}" for n in xa]
+    if burst_row is not None and 0 <= burst_row < len(labels):
+        labels[burst_row] = SYNC_BURST_LABEL
+    for name, number in named.items():
+        if not _MATLAB_NAME.match(name):
+            raise ValueError(
+                f"analog channel name {name!r} is not a MATLAB identifier "
+                "(a letter, then letters, digits or _; at most 63 characters)"
+            )
+        if int(number) not in xa:
+            raise ValueError(
+                f"analog channel {name!r} is XA{number}, which this OneBox file does "
+                f"not contain (saved: {', '.join(f'XA{n}' for n in xa) or 'none'})"
+            )
+        labels[xa.index(int(number))] = name
+    duplicated = sorted({label for label in labels if labels.count(label) > 1})
+    if duplicated:
+        raise ValueError(f"analog channel labels collide: {', '.join(duplicated)}")
+    return labels
+
+
+def export_onebox_analog(
+    obx_bin: str | Path,
+    out_dir: str | Path,
+    named: dict[str, int] | None = None,
+    burst_row: int | None = None,
+    decimate: int = 1,
+    chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+) -> Path:
+    """Write every XA input of a OneBox file to ``out_dir`` as one v7.3 ``.mat``.
+
+    The struct is ``analog``, laid out like :func:`export_lfp`'s ``lfp`` so the
+    two read the same way: ``data`` is int16, **nChan x nSamples in MATLAB**,
+    one row per XA input; ``v_per_digit`` scales a row to volts. ``index`` maps
+    each label to its 1-based row, so ``a.data(a.index.eye_x, :)`` is the eye
+    trace whatever order the inputs were saved in.
+
+    Read sequentially, a chunk of whole rows at a time -- the analog inputs are
+    interleaved with XD and SY, so a column costs the file either way, and a
+    memmap would fetch it as scattered page faults over the share. The chunk is
+    a whole number of strides, so decimation stays anchored to sample 0.
+
+    The axis written is the OneBox's own (``timebase: "onebox"``):
+    :func:`spikesorting.pipeline.stamp_analog_timebase` fills in the Blackrock
+    one from ``time_map.json["onebox_to_blackrock"]`` without re-reading samples.
+    Decimation is a plain stride with no anti-alias filter.
+    """
+    from .matlab import Chunked, write_mat
+
+    if decimate < 1:
+        raise ValueError("decimate must be >= 1")
+    info = stream_info(obx_bin)
+    if info.stream_type != "obx":
+        raise ValueError(f"{info.path.name} is not a OneBox (.obx.bin) stream")
+
+    xa = onebox_xa_numbers(info.meta, info.n_chan)
+    if xa.size == 0:
+        raise ValueError(f"{info.path.name} saved no XA inputs")
+    labels = analog_channel_labels(xa, named or {}, burst_row)
+    n_xa = int(xa.size)
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{info.path.stem}.analog.mat"
+
+    n_out = (info.n_samples + decimate - 1) // decimate
+    row_bytes = info.n_chan * 2
+    rows_per_chunk = max(decimate, (chunk_bytes // row_bytes) // decimate * decimate)
+
+    def fill(dataset) -> None:
+        written = 0
+        with open(info.path, "rb") as handle:
+            for start in range(0, info.n_samples, rows_per_chunk):
+                stop = min(start + rows_per_chunk, info.n_samples)
+                raw = handle.read((stop - start) * row_bytes)
+                block = np.frombuffer(raw, dtype=np.int16).reshape(-1, info.n_chan)
+                block = block[::decimate, :n_xa]
+                dataset[written : written + block.shape[0], :] = block
+                written += block.shape[0]
+        if written != n_out:
+            raise RuntimeError(
+                f"wrote {written} samples but {info.path.name} implies {n_out}"
+            )
+
+    range_key, max_key = _SCALE_KEYS["obx"]
+    v_per_digit = float(info.meta.get(range_key, "nan")) / float(info.meta.get(max_key, "nan"))
+    nan = float("nan")
+
+    write_mat(
+        out_path,
+        {
+            "analog": {
+                "data": Chunked(
+                    shape=(n_out, n_xa),
+                    dtype=np.int16,
+                    fill=fill,
+                    chunks=(min(65536, n_out), n_xa),
+                ),
+                "fs": info.fs / decimate,
+                "t0": 0.0,
+                "timebase": "onebox",
+                "fs_blackrock": nan,
+                "t0_blackrock": nan,
+                "blackrock_slope": nan,
+                "blackrock_intercept": nan,
+                "decimate": float(decimate),
+                "n_samples": float(n_out),
+                "n_chan": float(n_xa),
+                "xa": xa.astype(np.float64),
+                "names": ",".join(labels),
+                "index": {label: float(row + 1) for row, label in enumerate(labels)},
+                "v_per_digit": np.full(n_xa, v_per_digit),
+                "ai_range_max": float(info.meta.get(range_key, "nan")),
+                "max_int": float(info.meta.get(max_key, "nan")),
+                "source": str(info.path),
+                "note": (
+                    "data is int16, nChan x nSamples in MATLAB, one row per OneBox "
+                    "XA input (xa gives which; index.<name> gives the 1-based row). "
+                    "volts = double(value) * v_per_digit. Sample k (0-based) is at "
+                    "t0 + k/fs on the OneBox clock, and at t0_blackrock + "
+                    "k/fs_blackrock on Blackrock's NSP clock when timebase is "
+                    "'blackrock' (NaN until a time map with onebox_to_blackrock "
+                    "has been fitted)."
                 ),
             }
         },

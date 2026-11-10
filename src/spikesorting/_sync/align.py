@@ -195,6 +195,22 @@ def fit_same_run_map(
     return fit_linear_map(other[other_idx], reference[ref_idx])
 
 
+def compose_linear_maps(outer: LinearMap, inner: LinearMap) -> LinearMap:
+    """``outer(inner(t))`` as one map: inner's clock straight onto outer's reference.
+
+    Two lines compose to a line, so the OneBox -> probe fit followed by the
+    probe -> Blackrock fit is ``blackrock = (s_o * s_i) * t + (s_o * i_i + i_o)``.
+    There is no fit of its own, so ``residuals_s`` is empty; ``n_points`` is the
+    smaller of the two, the fewer edges either step rests on.
+    """
+    return LinearMap(
+        slope=float(outer.slope * inner.slope),
+        intercept=float(outer.slope * inner.intercept + outer.intercept),
+        n_points=int(min(outer.n_points, inner.n_points)),
+        residuals_s=np.empty(0),
+    )
+
+
 def apply_linear_map(times_s: np.ndarray, mapping: LinearMap) -> np.ndarray:
     """Map times onto the reference timebase."""
     return mapping.slope * np.asarray(times_s, dtype=np.float64) + mapping.intercept

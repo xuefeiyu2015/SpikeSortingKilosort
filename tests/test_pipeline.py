@@ -1439,6 +1439,15 @@ def test_the_burst_is_mapped_off_the_onebox_clock_before_validation(tmp_path):
     validation = json.loads((session.paths.aligned / "validation.json").read_text())
     assert validation["burst_clock"] == "probe"
 
+    # The composed map takes a OneBox time -- an eye or photodiode sample --
+    # straight onto Blackrock time: here the planted burst, recorded on the OneBox.
+    composed = time_map["onebox_to_blackrock"]
+    assert composed["formula"] == "blackrock_time = slope * onebox_time + intercept"
+    obx_burst = np.loadtxt(session.paths.sync_for("neuropixels") / "npx_burst.txt")
+    br_burst = np.loadtxt(session.paths.sync_for("blackrock") / "blackrock_burst.txt")
+    mapped = composed["slope"] * obx_burst + composed["intercept"]
+    assert np.abs(mapped - br_burst).max() < 1e-5
+
 
 def test_without_the_onebox_1hz_wave_the_onebox_drift_fails_validation(tmp_path):
     # The bug this pins: the probe's map applied to OneBox-clock burst times.
@@ -1455,8 +1464,118 @@ def test_without_the_onebox_1hz_wave_the_onebox_drift_fails_validation(tmp_path)
     time_map = json.loads((session.paths.aligned / "time_map.json").read_text())
     assert time_map["burst_clock"] == "onebox"
     assert time_map["onebox_to_probe"] is None
+    assert time_map["onebox_to_blackrock"] is None   # no OneBox fit, nothing to compose
     validation = json.loads((session.paths.aligned / "validation.json").read_text())
     assert validation["burst_clock"] == "onebox"
+
+
+def test_time_map_states_the_sample_rate_each_clock_counts_seconds_at(tmp_path):
+    # A OneBox time is sample / obSampRate. Writing the measured rate out is what
+    # stops an analog channel being converted at the nominal 30 kHz by hand.
+    from conftest import spikeglx_run
+
+    binary = spikeglx_run(tmp_path / "npx", obx_phase=0.3)[0]
+    for path, key, rate in (
+        (binary.with_suffix(".meta"), "imSampRate", "30000.1234"),
+        (next(binary.parents[1].glob("*.obx.meta")), "obSampRate", "29999.8765"),
+    ):
+        path.write_text(
+            path.read_text().replace(f"{key}=30000", f"{key}={rate}"), encoding="utf-8"
+        )
+    session = _session(tmp_path, f"neuropixels:\n  bin_file: '{binary}'\n")
+
+    clocks = pipeline._clock_definitions(session)
+
+    assert clocks["spikeglx_time"]["sample_rate_hz"] == pytest.approx(30000.1234)
+    assert clocks["onebox_time"]["sample_rate_hz"] == pytest.approx(29999.8765)
+    assert clocks["onebox_time"]["file"].endswith(".obx0.obx.bin")
+    assert "NSP" in clocks["blackrock_time"]["definition"]
+
+
+def test_a_missing_binary_leaves_the_rate_null_rather_than_losing_the_map(tmp_path):
+    session = _session(tmp_path)                 # bin_file '/a/x.bin' does not exist
+
+    clocks = pipeline._clock_definitions(session)
+
+    assert clocks["spikeglx_time"]["sample_rate_hz"] is None
+    assert clocks["onebox_time"] is None         # no run layout, so no OneBox
+
+
+def _analog_session(tmp_path):
+    """A session over a real SpikeGLX run folder whose OneBox has XA0, XA1, SY."""
+    from conftest import spikeglx_run
+
+    binary = spikeglx_run(tmp_path / "npx", obx_phase=0.3)[0]
+    return _session(
+        tmp_path,
+        "export_analog: true\n"
+        f"neuropixels:\n  bin_file: '{binary}'\n  analog_channels: {{eye_x: 1}}\n",
+    )
+
+
+def _analog_fields(path):
+    import h5py
+
+    with h5py.File(path, "r") as handle:
+        a = handle["analog"]
+        return {
+            "timebase": bytes(a["timebase"][()].ravel().astype(np.uint8)).decode(),
+            "names": bytes(a["names"][()].ravel().astype(np.uint8)).decode(),
+            "fs": float(a["fs"][()].ravel()[0]),
+            "t0_blackrock": float(a["t0_blackrock"][()].ravel()[0]),
+            "fs_blackrock": float(a["fs_blackrock"][()].ravel()[0]),
+        }
+
+
+def test_the_onebox_analog_export_is_stamped_with_onebox_to_blackrock(tmp_path):
+    # Exported straight after the recording, before any map: OneBox clock.
+    session = _analog_session(tmp_path)
+    path = ss.extract_analog(session, "neuropixels")
+
+    assert path.parent == session.paths.export_for("neuropixels")
+    before = _analog_fields(path)
+    assert before["timebase"] == "onebox"
+    assert before["names"] == "sync_burst,eye_x"
+    assert np.isnan(before["t0_blackrock"])
+
+    # time_remapping fits the map and stamps it in, samples untouched.
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+
+    composed = json.loads(
+        (session.paths.aligned / "time_map.json").read_text()
+    )["onebox_to_blackrock"]
+    after = _analog_fields(path)
+    assert after["timebase"] == "blackrock"
+    assert after["t0_blackrock"] == pytest.approx(composed["intercept"])
+    assert after["fs_blackrock"] == pytest.approx(after["fs"] / composed["slope"])
+
+    # A re-export after alignment is stamped at once rather than left on the
+    # OneBox clock until time_remapping runs again.
+    path.unlink()
+    assert _analog_fields(ss.extract_analog(session, "neuropixels"))["timebase"] == "blackrock"
+
+
+def test_without_a_onebox_1hz_fit_the_analog_export_stays_on_the_onebox_clock(tmp_path):
+    session = _analog_session(tmp_path)
+    path = ss.extract_analog(session, "neuropixels")
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=False)
+
+    ss.time_remapping(session, "neuropixels")
+
+    # Stamping it with the probe's map would be off by the OneBox's own drift.
+    assert _analog_fields(path)["timebase"] == "onebox"
+
+
+def test_the_analog_export_says_why_it_did_not_run(tmp_path):
+    session = _session(tmp_path)                      # export_analog unstated
+    assert ss.extract_analog(session, "neuropixels") is None
+    assert ss.skip_reason(session, ss.extract_analog, "neuropixels") == "export_analog is false"
+    assert "Blackrock" in ss.skip_reason(session, ss.extract_analog, "blackrock")
+
+    asked = _session(tmp_path, "export_analog: true\n")   # '/a/x.bin': no run, no OneBox
+    assert ss.extract_analog(asked, "neuropixels") is None
+    assert "OneBox" in ss.skip_reason(asked, ss.extract_analog, "neuropixels")
 
 
 def test_two_probes_are_each_fitted_onto_blackrock_time_on_their_own(tmp_path):

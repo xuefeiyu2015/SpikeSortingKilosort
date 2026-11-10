@@ -77,11 +77,13 @@ __all__ = [
     "sort_with_kilosort",
     "extract_sync",
     "extract_lfp",
+    "extract_analog",
     "time_remapping",
     "validate_remapping",
     "export_results",
     "export_waveforms",
     "stamp_lfp_timebase",
+    "stamp_analog_timebase",
     "Binary",
     "SortSummary",
     "TimeMap",
@@ -119,6 +121,7 @@ def skip_reason(config: SessionConfig, verb: Any, system: str | None = None) -> 
         "sort_with_kilosort",
         "extract_sync",
         "extract_lfp",
+        "extract_analog",
         "export_results",
         "export_waveforms",
     }:
@@ -137,6 +140,14 @@ def skip_reason(config: SessionConfig, verb: Any, system: str | None = None) -> 
             return "Blackrock LFPs are saved separately by Central"
         if not config.export_lfp:
             return "export_lfp is false"
+
+    if name == "extract_analog":
+        if system == "blackrock":
+            return "Blackrock's analog inputs are already on its own clock"
+        if not config.export_analog:
+            return "export_analog is false"
+        if _onebox_binary(config) is None:
+            return "no OneBox (.obx.bin) in this SpikeGLX run"
 
     if name in {"time_remapping", "validate_remapping"} and not config.aligns_systems:
         return "only one system declared, so there is nothing to align against"
@@ -1330,6 +1341,139 @@ def extract_lfp(config: SessionConfig, system: str) -> Path | None:
     return path
 
 
+def extract_analog(config: SessionConfig, system: str) -> Path | None:
+    """Export the OneBox's analog inputs. Returns the path written, or ``None``.
+
+    Every XA input the OneBox saved goes out -- eye, pupil, photodiode, whatever
+    else is wired, and the 14 s burst itself as ``sync_burst`` -- labelled from
+    ``neuropixels.analog_channels``. Runs when the session says
+    ``export_analog: true``, at the ``analog_decimate`` stride.
+
+    The samples are written on the OneBox's own clock. Blackrock time comes from
+    ``time_map.json["onebox_to_blackrock"]`` -- the OneBox -> probe fit composed
+    with probe -> Blackrock, the same chain the held-out burst validates -- and
+    is stamped in now if that map exists, or by ``time_remapping`` when it runs.
+
+    One OneBox per run, so a session covering two probes exports it once: the
+    exporting driver calls this with the first probe's config, and it lands in
+    that probe's ``export/``.
+    """
+    _check(system)
+    if system == "blackrock" or not config.has_data("neuropixels"):
+        return None
+    if not config.export_analog:
+        return None
+    obx = _onebox_binary(config)
+    if obx is None:
+        return None
+
+    from ._io import spikeglx
+
+    probe = spikeglx.check_reachable(obx)
+    log.info("%s: %s", obx.name, probe.summary())
+    npx = config.neuropixels
+    path = spikeglx.export_onebox_analog(
+        obx,
+        config.paths.export_for("neuropixels"),
+        named=npx.analog_channels,
+        burst_row=npx.burst_word,
+        decimate=config.analog_decimate,
+    )
+    log.info(
+        "wrote %s%s", path,
+        f" (decimated {config.analog_decimate}x)" if config.analog_decimate > 1 else "",
+    )
+
+    onebox_map = _fitted_onebox_map(config)
+    if onebox_map is not None:
+        stamp_analog_timebase(config, onebox_map)
+    else:
+        log.info("no onebox_to_blackrock map yet; time_remapping will stamp it")
+    return path
+
+
+def _onebox_binary(config: SessionConfig) -> Path | None:
+    """The run's OneBox file, found beside the AP binary's gate folder."""
+    from ._io import spikeglx
+
+    npx = config.neuropixels
+    layout = spikeglx.run_layout(npx.bin_file) if npx.bin_file is not None else None
+    return layout.obx if layout is not None else None
+
+
+def _fitted_onebox_map(config: SessionConfig) -> align.LinearMap | None:
+    """``onebox_to_blackrock`` from this probe's ``time_map.json``, if there is one."""
+    map_path = config.paths.aligned / "time_map.json"
+    if not map_path.exists():
+        return None
+    with open(map_path, "r", encoding="utf-8") as handle:
+        composed = json.load(handle).get("onebox_to_blackrock")
+    if not composed:
+        return None
+    return align.LinearMap(
+        slope=float(composed["slope"]),
+        intercept=float(composed["intercept"]),
+        n_points=0,
+        residuals_s=np.empty(0),
+    )
+
+
+def _stamp_exports(
+    config: SessionConfig,
+    mapping: align.LinearMap,
+    obx_map: align.LinearMap | None,
+) -> None:
+    """Put Blackrock time into every export written before the map existed."""
+    stamp_lfp_timebase(config, mapping)
+    if obx_map is not None:
+        stamp_analog_timebase(config, align.compose_linear_maps(mapping, obx_map))
+    elif list(config.paths.export_for("neuropixels").glob("*.analog.mat")):
+        log.warning(
+            "the OneBox analog export stays on the OneBox clock: no OneBox 1 Hz "
+            "edges to map it with (re-run extract_sync)"
+        )
+
+
+def stamp_analog_timebase(
+    config: SessionConfig, onebox_map: align.LinearMap
+) -> Path | None:
+    """Put the OneBox -> Blackrock map into an analog export. Samples untouched.
+
+    The same rewrite :func:`stamp_lfp_timebase` does, with the composed
+    ``onebox_to_blackrock`` map: ``t_blackrock(k) = slope * (k / fs) +
+    intercept``, a uniform axis at rate ``fs / slope`` starting at the intercept.
+    Returns the file it stamped, or ``None`` when there is no analog export.
+    """
+    from ._io.matlab import update_mat
+
+    export_dir = config.paths.export_for("neuropixels")
+    exports = sorted(export_dir.glob("*.analog.mat")) if export_dir.exists() else []
+    if not exports:
+        return None
+
+    import h5py
+
+    stamped = None
+    for path in exports:
+        with h5py.File(path, "r") as handle:
+            fs = float(np.asarray(handle["analog/fs"][()]).ravel()[0])
+        update_mat(path, {"analog": _blackrock_axis(fs, onebox_map)})
+        log.info("stamped the Blackrock timebase into %s", path.name)
+        stamped = path
+    return stamped
+
+
+def _blackrock_axis(fs: float, mapping: align.LinearMap) -> dict[str, Any]:
+    """The fields that put a uniformly sampled export on Blackrock time. Pure."""
+    return {
+        "timebase": "blackrock",
+        "fs_blackrock": fs / mapping.slope,
+        "t0_blackrock": mapping.intercept,
+        "blackrock_slope": mapping.slope,
+        "blackrock_intercept": mapping.intercept,
+    }
+
+
 def _lf_binary(config: SessionConfig) -> Path | None:
     """The LF binary to export: the one named, else the AP file's own sibling.
 
@@ -1592,7 +1736,7 @@ def time_remapping(
     if not spike_times_path.exists():
         log.info("no sorting at %s; wrote the time map only", results_dir)
         _save_map(aligned_dir, mapping, offset, config, obx_map)
-        stamp_lfp_timebase(config, mapping)
+        _stamp_exports(config, mapping, obx_map)
         return TimeMap(mapping, offset, "map_only", burst_match=match)
 
     from ._export.curated import parse_params_py
@@ -1632,7 +1776,7 @@ def time_remapping(
         method = "linear_fit"
 
     _save_map(aligned_dir, mapping, offset, config, obx_map)
-    stamp_lfp_timebase(config, mapping)
+    _stamp_exports(config, mapping, obx_map)
     return TimeMap(mapping, offset, method, aligned_path=out_path, burst_match=match)
 
 
@@ -1643,6 +1787,7 @@ def _save_map(
     config: SessionConfig,
     obx_map: align.LinearMap | None = None,
 ) -> None:
+    obx_to_br = None if obx_map is None else align.compose_linear_maps(mapping, obx_map)
     payload = {
         "session": config.session,
         "reference_timebase": "blackrock",
@@ -1663,9 +1808,59 @@ def _save_map(
             "fit_max_residual_s": float(np.abs(obx_map.residuals_s).max()),
             "formula": "probe_time = slope * onebox_time + intercept",
         },
+        # The two fits above composed: what a OneBox analog channel (eye, pupil,
+        # photodiode) needs to land on Blackrock time. It is the exact chain the
+        # held-out burst travels in validate_remapping, so validation.json is its
+        # quality check.
+        "onebox_to_blackrock": None if obx_to_br is None else {
+            "slope": obx_to_br.slope,
+            "intercept": obx_to_br.intercept,
+            "drift_ppm": obx_to_br.drift_ppm,
+            "formula": "blackrock_time = slope * onebox_time + intercept",
+            "validated_by": "validation.json",
+        },
+        "clocks": _clock_definitions(config),
     }
     with open(Path(aligned_dir) / "time_map.json", "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
+
+
+def _clock_definitions(config: SessionConfig) -> dict[str, Any]:
+    """What each ``*_time`` in ``time_map.json`` means, so it can be applied by hand.
+
+    A SpikeGLX time is ``sample / rate`` from the stream's first sample, with the
+    rate the stream's own ``.meta`` states -- the one the edge extraction used.
+    Converting samples at any other rate (the nominal 30 kHz, say) reintroduces a
+    ppm-level drift in exactly the place the map exists to remove it, so the rate
+    is written out. Reading it touches only the ``.meta``; an unreadable one
+    leaves ``sample_rate_hz`` null rather than stopping the map being saved.
+    """
+    from ._io import spikeglx
+
+    def stream(path: Path | None, n_chan=None, fs=None) -> dict[str, Any] | None:
+        if path is None:
+            return None
+        record: dict[str, Any] = {
+            "definition": "seconds = sample_index / sample_rate_hz, from the file's first sample",
+            "file": str(path),
+            "sample_rate_hz": None,
+        }
+        try:
+            record["sample_rate_hz"] = spikeglx.stream_info(path, n_chan, fs).fs
+        except (OSError, ValueError) as err:
+            log.warning("time_map.json: no sample rate for %s (%s)", Path(path).name, err)
+        return record
+
+    npx = config.neuropixels
+    layout = spikeglx.run_layout(npx.bin_file) if npx.bin_file is not None else None
+    return {
+        "blackrock_time": {
+            "definition": "seconds on the NSP PTP clock -- the axis of the .nev "
+            "markers and Blackrock's own analog channels (see nsp_time_map.json)",
+        },
+        "spikeglx_time": stream(npx.bin_file, npx.n_chan_bin, npx.sample_rate),
+        "onebox_time": stream(layout.obx if layout is not None else None),
+    }
 
 
 def validate_remapping(

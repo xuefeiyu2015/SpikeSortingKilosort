@@ -507,3 +507,91 @@ def test_export_lfp_carries_the_lf_gain_when_the_meta_states_it(tmp_path):
         uv = handle["lfp/uv_per_digit"][()].ravel()
     assert uv[:2] == pytest.approx([4.6875, 4.6875])
     assert np.isnan(uv[2])
+
+
+# ----------------------------------------------------------------------------
+# OneBox analog inputs
+# ----------------------------------------------------------------------------
+
+
+def _onebox_file(root: Path, data: np.ndarray, extra_meta: str = "") -> Path:
+    """A ``.obx.bin`` holding ``data`` (rows x channels), XA inputs then XD, SY."""
+    n_chan = data.shape[1]
+    path = root / "run_g0" / "run_g0_t0.obx0.obx.bin"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(np.ascontiguousarray(data, dtype=np.int16).tobytes())
+    path.with_suffix(".meta").write_text(
+        f"nSavedChans={n_chan}\nobSampRate=30000\ntypeThis=obx\n"
+        f"snsXaDwSy={n_chan - 2},1,1\nobAiRangeMax=5\nobMaxInt=32768\n" + extra_meta,
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_the_xa_rows_are_the_first_of_the_file_and_numbered_from_the_meta():
+    assert spikeglx.onebox_xa_numbers({"snsXaDwSy": "4,1,1"}, 6).tolist() == [0, 1, 2, 3]
+    # XA1 not saved: row 1 is XA2, and only the subset says so.
+    meta = {"snsXaDwSy": "3,1,1", "snsSaveChanSubset": "0,2:3,12:13"}
+    assert spikeglx.onebox_xa_numbers(meta, 5).tolist() == [0, 2, 3]
+
+
+def test_a_onebox_meta_without_channel_counts_is_refused():
+    with pytest.raises(ValueError, match="snsXaDwSy"):
+        spikeglx.onebox_xa_numbers({}, 6)
+
+
+def test_analog_labels_name_the_wired_inputs_and_the_burst():
+    labels = spikeglx.analog_channel_labels(
+        np.array([0, 1, 2, 3, 4, 5]),
+        {"eye_x": 1, "eye_y": 2, "pupil": 3, "photodiode": 4},
+        burst_row=0,
+    )
+    assert labels == ["sync_burst", "eye_x", "eye_y", "pupil", "photodiode", "XA5"]
+
+
+def test_a_named_input_the_file_did_not_save_is_refused():
+    # Silently absent eye data reads as "the monkey never looked"; refuse instead.
+    with pytest.raises(ValueError, match="XA4.*does not contain"):
+        spikeglx.analog_channel_labels(np.array([0, 1, 2]), {"photodiode": 4})
+
+
+@pytest.mark.parametrize("named", [{"eye x": 1}, {"1eye": 1}, {"XA2": 1}])
+def test_analog_labels_must_be_matlab_names_and_must_not_collide(named):
+    with pytest.raises(ValueError):
+        spikeglx.analog_channel_labels(np.array([0, 1, 2]), named)
+
+
+def test_the_analog_export_writes_every_xa_input_decimated_across_chunks(tmp_path):
+    import h5py
+
+    n = 100
+    data = np.zeros((n, 6), dtype=np.int16)
+    for xa in range(4):
+        data[:, xa] = xa * 1000 + np.arange(n)
+    data[:, 4] = -7                                  # XD word: must not be exported
+    data[:, 5] = -9                                  # SY word: nor this
+    obx = _onebox_file(tmp_path, data)
+
+    # A chunk of 7 rows rounds down to 6, a whole number of strides, so the
+    # stride grid stays anchored to sample 0 across every chunk boundary.
+    path = spikeglx.export_onebox_analog(
+        obx, tmp_path / "out", named={"eye_x": 1, "photodiode": 3},
+        burst_row=0, decimate=3, chunk_bytes=6 * 2 * 7,
+    )
+
+    assert path.name == "run_g0_t0.obx0.obx.analog.mat"
+    with h5py.File(path, "r") as handle:
+        a = handle["analog"]
+        stored = a["data"][()]
+        assert stored.dtype == np.int16
+        assert stored.shape == (34, 4)               # MATLAB 4 x 34
+        assert np.array_equal(stored, data[::3, :4])
+        assert a["fs"][()].ravel()[0] == pytest.approx(10000.0)
+        assert a["xa"][()].ravel().tolist() == [0, 1, 2, 3]
+        names = bytes(a["names"][()].ravel().astype(np.uint8)).decode()
+        assert names == "sync_burst,eye_x,XA2,photodiode"
+        assert a["index/photodiode"][()].ravel()[0] == 4      # 1-based row
+        assert a["v_per_digit"][()].ravel() == pytest.approx(np.full(4, 5 / 32768))
+        timebase = bytes(a["timebase"][()].ravel().astype(np.uint8)).decode()
+        assert timebase == "onebox"
+        assert np.isnan(a["t0_blackrock"][()].ravel()[0])

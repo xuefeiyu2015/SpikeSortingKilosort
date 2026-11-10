@@ -32,6 +32,8 @@ kilosort_on_blackrock: true
 
 export_lfp: false      # LF-band copy, ~7 GB/hour at 385 channels -- see "LFP"
 lfp_decimate: 1        # stride for it; 2 is safe, more aliases
+export_analog: true    # OneBox XA inputs (eye, pupil, photodiode) on Blackrock time -- see "OneBox analog"
+analog_decimate: 1     # stride for it; plain, no anti-alias filter
 export_figures: true   # per-unit and overview PNGs at export time
 
 # ---------- edit for this session ----------
@@ -133,6 +135,11 @@ neuropixels:
   # read back off this filename -- see "Where the SpikeGLX run went".
   bin_file: "{neuropixels_dir}/Athos_2026_08_13_g0_t0.imec0.ap.bin"
   lf_file: null          # only when the LF band is not beside the AP one
+  analog_channels:       # what is wired into the OneBox XA inputs -- see "OneBox analog"
+    eye_x: 1             # (XA0 is the 14 s burst -- burst_word -- exported as sync_burst)
+    eye_y: 2
+    pupil: 3
+    photodiode: 4        # fixation-point onset
   preprocess:            # done before Kilosort, which then only whitens -- see "Preprocessing"
     method: catgt        # catgt | spikeinterface. CatGT that cannot run stops; it never switches
     highpass_hz: 300     # band-pass, Hz: CatGT -apfilter=butter,12,lo,hi
@@ -203,7 +210,7 @@ neuropixels:
   n_chan_bin: null       # read from the .meta
   sync_bit: 6            # SY-word bit carrying the 1 Hz wave (SpikeGLX default)
   sync_pulse_ms: 500     # its high duration; a CatGT -xd argument
-  burst_word: 1          # XA input on the OneBox carrying the 14 s burst
+  burst_word: 0          # XA input on the OneBox carrying the 14 s burst (XA0)
   burst_threshold_v: [1.0, 0.0]   # CatGT -xa volts (primary, secondary)
   burst_pulse_ms: 0      # expected burst width in ms; 0 accepts any
   waveforms:             # the mean-waveform export -- see "Waveforms"
@@ -268,6 +275,18 @@ kilosort: {}
 #   Decimation is a plain stride with no anti-alias filter. The LF band is
 #   hardware-limited to ~500 Hz at 2500 Hz sampling, so 2 (-> 1250 Hz) is safe
 #   and anything above it aliases.
+#
+# OneBox analog
+#   export_analog writes every XA input the OneBox saved to
+#   export/<run>.obx0.obx.analog.mat -- the ones named in analog_channels under
+#   those names, the 14 s burst as sync_burst, the rest as XA<n>. In MATLAB:
+#     a = load(f).analog;  eye_x = double(a.data(a.index.eye_x, :)) * a.v_per_digit(1);
+#     t = a.t0_blackrock + (0:a.n_samples-1) / a.fs_blackrock;   % NSP clock, s
+#   The samples are on the OneBox clock; Blackrock time is time_map.json's
+#   onebox_to_blackrock, stamped in once time_remapping has run. It is the
+#   chain the held-out burst travels, so validation.json is its check.
+#   ~0.7 GB/hour at analog_decimate: 1 for twelve inputs; the stride has no
+#   anti-alias filter, so keep it where the photodiode edge still resolves.
 #
 # Which systems recorded
 #   Derived from whether a block declares paths, not from a flag. To say a system

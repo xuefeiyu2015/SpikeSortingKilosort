@@ -11,6 +11,9 @@
                          Extraction only -- it goes out on the probe's own clock,
                          and time_remapping stamps the Blackrock axis into it
                          afterwards without re-reading the samples.
+    analog               every OneBox XA input (eye, pupil, photodiode, the
+                         burst), when export_analog: true. Same as the LFP: on
+                         the OneBox clock, stamped with onebox_to_blackrock.
     time_remapping       coarse offset from the 14 s bursts, then a fine fit on
                          the 1 Hz train, onto Blackrock time. Blackrock is the
                          reference timebase; this maps onto it, never the reverse.
@@ -118,6 +121,13 @@ def main() -> int:
     # Extraction first: everything below reads the edge files it writes.
     per_stream(ss.extract_sync)
     per_stream(ss.extract_lfp)
+
+    # The OneBox's analog inputs (eye, pupil, photodiode, ...). One OneBox per
+    # run, so once, with the first probe's config: its export/ holds the file
+    # and its time_map.json stamps Blackrock time into it.
+    first_label, first_config = next(per_probe_config())
+    run(ss.extract_analog, first_config, "neuropixels",
+        system="neuropixels", label=first_label, config=first_config)
 
     # Blackrock is the reference timebase, so it is what the other system is
     # mapped *onto* rather than a system to remap. Each probe gets its own fit:

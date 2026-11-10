@@ -129,6 +129,19 @@ def test_fit_same_run_map_takes_the_onebox_clock_onto_the_probe_clock():
     assert np.allclose(mapping.apply(onebox), probe, atol=1e-9)
 
 
+def test_compose_linear_maps_is_inner_then_outer():
+    # OneBox -> probe, then probe -> Blackrock: one line for a OneBox analog trace.
+    inner = align.LinearMap(1.0 + 30e-6, 0.002, 3600, np.empty(0))
+    outer = align.LinearMap(1.0 + 50e-6, 12.3456, 10800, np.empty(0))
+    t = np.linspace(0.0, 10800.0, 7)
+
+    composed = align.compose_linear_maps(outer, inner)
+
+    assert np.allclose(composed.apply(t), outer.apply(inner.apply(t)), rtol=0, atol=1e-9)
+    assert composed.drift_ppm == pytest.approx(80.0015, abs=1e-3)
+    assert composed.n_points == 3600
+
+
 def test_fit_same_run_map_refuses_trains_that_do_not_pair():
     with pytest.raises(ValueError, match="cannot fit"):
         align.fit_same_run_map(np.array([0.5]), np.array([0.0, 1.0]))
