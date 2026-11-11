@@ -269,7 +269,7 @@ def _run_catgt_extraction(
         dest=config.paths.sync_for("neuropixels") / "catgt",
         folders=layout.folders,
     )
-    report.catgt_commands.append("runit " + " ".join(args))
+    report.catgt_commands.append("CatGT " + " ".join(args))
 
     if not machine.has_catgt:
         report.note(

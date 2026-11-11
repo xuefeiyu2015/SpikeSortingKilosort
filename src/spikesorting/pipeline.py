@@ -530,7 +530,13 @@ def _run_catgt_preprocessing(
     dest = directory / "catgt"
     dest.mkdir(parents=True, exist_ok=True)  # CatGT refuses a -dest that does not exist
     args = catgt_pre.build_preprocess_args(layout, spec, dest, extractors)
-    log.info("CatGT: runit %s", " ".join(args))
+    launcher = catgt.catgt_script(config.machine.catgt_dir)
+    log.info("CatGT: %s %s", launcher.name, " ".join(args))
+    # CatGT prints nothing while it works; a long silence here is normal.
+    log.info(
+        "CatGT is silent while it works (expect minutes per hour of recording); "
+        "progress: %s", Path(config.machine.catgt_dir) / "CatGT.log",
+    )
     try:
         catgt.run_catgt(config.machine.catgt_dir, args)
     except RuntimeError as error:

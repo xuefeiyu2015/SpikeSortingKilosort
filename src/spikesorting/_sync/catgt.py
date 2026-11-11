@@ -146,14 +146,23 @@ def read_edge_file(path: str | Path) -> np.ndarray:
     return np.asarray([float(token) for token in text], dtype=np.float64)
 
 
+#: What to launch, in order. ``CatGT.exe`` first: on Windows ``runit.bat`` only
+#: forwards its arguments to it, and going through ``cmd.exe`` costs a run its
+#: Ctrl+C -- cmd answers one with "Terminate batch job (Y/N)?", asked into the
+#: output this wrapper captures, so the run waits forever for a reply nobody can
+#: see. ``runit.sh`` is kept on Linux, where it sets the library path CatGT
+#: needs; ``runit.bat`` only if the executable itself is missing.
+_LAUNCHERS = ("CatGT.exe", "runit.sh", "runit.bat")
+
+
 def catgt_script(catgt_dir: str | Path) -> Path:
-    """Locate ``runit.bat`` (Windows) or ``runit.sh`` (Linux) inside ``catgt_dir``."""
+    """What to run inside ``catgt_dir``: ``CatGT.exe``, else ``runit.sh``/``.bat``."""
     catgt_dir = Path(catgt_dir)
-    for name in ("runit.bat", "runit.sh"):
+    for name in _LAUNCHERS:
         candidate = catgt_dir / name
         if candidate.exists():
             return candidate
-    raise FileNotFoundError(f"no runit.bat or runit.sh in {catgt_dir}")
+    raise FileNotFoundError(f"no CatGT.exe, runit.sh or runit.bat in {catgt_dir}")
 
 
 #: RunLayout.folders -> the CatGT flag that tells it where the files are.
@@ -242,6 +251,9 @@ def run_catgt(
     result = subprocess.run(
         command,
         cwd=str(Path(catgt_dir)),
+        # Nothing to read from: whatever is launched can never sit waiting on a
+        # keyboard whose prompt went into the captured output, unseen.
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         timeout=timeout_s,
