@@ -272,8 +272,7 @@ def test_the_utah_only_template_differs_only_by_the_missing_probe():
 
     # So there is nothing to align to, and the cross-system stages skip.
     assert utah.aligns_systems is False
-    # ...and the time map has nowhere but the Blackrock folder to live, which is
-    # where it would have gone anyway.
+    # ...and with no Neuropixels sorting to map, the path names the Blackrock folder.
     assert utah.paths.aligned == utah.paths.sorted_for("blackrock")
 
     # The array half is untouched -- except the .ns2 behaviour channels, which
@@ -376,11 +375,10 @@ def test_a_binary_whose_name_carries_no_probe_falls_back_to_its_position(tmp_pat
     assert session.for_probe(1).neuropixels.bin_file.name == "right.bin"
 
 
-def test_each_probe_gets_its_own_time_map_under_the_blackrock_folder(tmp_path):
-    # Both probes are fitted onto the SAME Blackrock recording, so `aligned` is
-    # the one path a probe list can make collide -- one time_map.json, written
-    # twice, the second winning. Each probe has its own oscillator and SY word,
-    # so those are genuinely different maps.
+def test_each_probe_gets_its_own_time_map_beside_its_own_sorting(tmp_path):
+    # Both probes are fitted onto the SAME Blackrock recording, but each has its
+    # own oscillator and SY word, so the maps genuinely differ. Each lands in its
+    # own probe's folder, which already keeps them apart.
     path = tmp_path / "two.yaml"
     path.write_text(
         'blackrock_dir: "Y:/br"\n'
@@ -393,9 +391,11 @@ def test_each_probe_gets_its_own_time_map_under_the_blackrock_folder(tmp_path):
     a, b = (config for _, config in session.per_probe())
 
     assert a.paths.aligned != b.paths.aligned
-    assert a.paths.aligned.name == "imec0" and b.paths.aligned.name == "imec1"
-    # Still under Blackrock, which is the reference timebase.
-    assert a.paths.aligned.parent == session.paths.sorted_br
+    assert a.paths.aligned == a.paths.sorted_for("neuropixels")
+    assert b.paths.aligned == b.paths.sorted_for("neuropixels")
+    assert "imec0" in str(a.paths.aligned) and "imec1" in str(b.paths.aligned)
+    # Nothing of either probe's lands in the Blackrock folder.
+    assert session.paths.sorted_br not in a.paths.aligned.parents
 
 
 def test_a_session_naming_one_binary_projects_to_itself(tmp_path):
@@ -512,7 +512,7 @@ def test_by_probe_takes_kilosort_and_nothing_else(tmp_path):
 def test_output_paths_are_derived_from_each_systems_directory(tmp_path):
     paths = cfg.OutputPaths(tmp_path / "br", tmp_path / "np")
     assert paths.sync_for("blackrock").parent == tmp_path / "br"
-    assert paths.aligned.parent == tmp_path / "br"
+    assert paths.aligned.parent == tmp_path / "np"
     (tmp_path / "br").mkdir(), (tmp_path / "np").mkdir()   # the recordings' folders
     paths.mkdirs()
     assert all(p.exists() for p in paths.all())
@@ -548,14 +548,14 @@ def test_everything_from_one_system_lands_in_one_folder(tmp_path):
     assert "imec0" not in str(paths.sorted_for("neuropixels"))
 
 
-def test_the_time_map_goes_under_the_reference_timebase(tmp_path):
-    # Cross-system output is owned by neither sorting, so it goes to Blackrock's
-    # folder -- Blackrock is the axis everything is mapped onto.
+def test_the_time_map_goes_beside_the_sorting_it_maps(tmp_path):
+    # The map turns Neuropixels times into Blackrock time, so it belongs to the
+    # Neuropixels sorting: a local sorting stays local, whatever share Blackrock
+    # is on.
     paths = cfg.OutputPaths(tmp_path / "br", tmp_path / "np")
-    assert paths.aligned == paths.sorted_for("blackrock")
+    assert paths.aligned == paths.sorted_for("neuropixels")
 
-    # ...and falls back to the only system that recorded, so a Neuropixels-only
-    # session still has somewhere to write.
+    # ...and the same for a Neuropixels-only session.
     npx_only = cfg.OutputPaths(neuropixels_dir=tmp_path / "np")
     assert npx_only.aligned == npx_only.sorted_for("neuropixels")
 
@@ -779,12 +779,13 @@ def test_sync_edges_follow_the_system_they_came_from(tmp_path):
     )
 
 
-def test_cross_system_output_goes_under_the_reference_timebase(tmp_path):
-    # Blackrock is the reference timebase, so the alignment that maps everything
-    # onto it belongs beside the Blackrock recording.
+def test_the_time_map_stays_off_the_blackrock_share(tmp_path):
+    # Blackrock is on the server, the Neuropixels sorting is not: the map that
+    # belongs to the sorting goes where the sorting is.
     session = cfg.load_session_config(_write_session(tmp_path, _TWO_SYSTEMS), "windows_rig", CONFIG_DIR)
 
-    assert str(session.paths.aligned) == "Z:/server/Monkey Athos/2026-08-13/kilosort4"
+    assert session.paths.aligned == session.paths.sorted_for("neuropixels")
+    assert not str(session.paths.aligned).startswith("Z:/server")
 
 
 def test_cross_system_output_falls_back_when_blackrock_never_recorded(tmp_path):

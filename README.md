@@ -290,7 +290,8 @@ python run_exporting_pipeline.py --config session_Porthos_1probe
 
 ```
 <system>_dir/kilosort4/                 the sorting (Kilosort's own layout)
-                                        edge files, nsp_time_map.json, time_map.json
+                                        edge files, nsp_time_map.json
+                                        time_map.json (Neuropixels: its map onto Blackrock time)
                        export/
                            figures/                     units.pdf (a row per unit), overview.png
                            sorting_summary_info.json    what ran, on what, from where

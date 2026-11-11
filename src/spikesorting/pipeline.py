@@ -1661,13 +1661,10 @@ def _burst_on_probe_clock(
     its edges with the probe's maps one clock onto the other. Without them the
     burst stays on the OneBox clock and is returned unchanged with ``None``.
     """
+    obx_map = _onebox_to_probe(config)
     if npx_burst is None or not npx_burst.size:
-        return npx_burst, None
-    npx_1hz = _load_edges(config, extract.NPX_1HZ)
-    if npx_1hz is None or not npx_1hz.size:
-        return npx_burst, None  # the caller reports the missing probe train
-    obx_1hz = _load_edges(config, extract.NPX_OBX_1HZ)
-    if obx_1hz is None or not obx_1hz.size:
+        return npx_burst, obx_map
+    if obx_map is None:
         log.warning(
             "no OneBox 1 Hz edges (%s.txt), so the burst stays on the OneBox clock and "
             "its comparison with Blackrock includes the OneBox-to-probe drift; "
@@ -1675,14 +1672,27 @@ def _burst_on_probe_clock(
             extract.NPX_OBX_1HZ,
         )
         return npx_burst, None
+    return obx_map.apply(npx_burst), obx_map
+
+
+def _onebox_to_probe(config: SessionConfig) -> align.LinearMap | None:
+    """The OneBox -> probe fit from the two SY 1 Hz trains, or None without them.
+
+    Fitted whether or not there is a burst: the OneBox analog channels need it
+    to reach Blackrock time, and so does the photodiode/eye cycle fallback.
+    """
+    npx_1hz = _load_edges(config, extract.NPX_1HZ)
+    obx_1hz = _load_edges(config, extract.NPX_OBX_1HZ)
+    if npx_1hz is None or not npx_1hz.size or obx_1hz is None or not obx_1hz.size:
+        return None
     obx_map = align.fit_same_run_map(obx_1hz, npx_1hz, config.sync_period_s)
     log.info(
-        "burst mapped OneBox -> probe clock from %d edges: %+.2f ppm, offset %.6f s, "
+        "OneBox -> probe clock from %d edges: %+.2f ppm, offset %.6f s, "
         "fit residual max %.1f us",
         obx_map.n_points, obx_map.drift_ppm, obx_map.intercept,
         np.abs(obx_map.residuals_s).max() * 1e6,
     )
-    return obx_map.apply(npx_burst), obx_map
+    return obx_map
 
 
 # ----------------------------------------------------------------------------
@@ -1720,11 +1730,11 @@ def time_remapping(
     onto it, never the reverse.
 
     One map per probe. Each probe has its own oscillator and its own SY word, so
-    one probe's fit says nothing about another's -- which is why a session
-    covering several writes each into its own ``<blackrock_dir>/<sorter>/imec<n>/``
-    rather than one shared folder. Nothing here knows about that: it is handed a
-    config already projected onto one probe, and ``paths.aligned`` is where that
-    probe's map goes.
+    one probe's fit says nothing about another's. Each map goes beside its own
+    sorting (``paths.aligned``, the probe's ``<neuropixels_dir>/<sorter>/``), so a
+    local sorting stays local; only Blackrock's edge files are read from its
+    folder. Nothing here knows about probes: it is handed a config already
+    projected onto one.
 
     Coarse offset from the 14 s coded bursts first: their onsets alone are
     periodic and ambiguous, so the full pulse trains are matched on the coded
@@ -1774,40 +1784,38 @@ def time_remapping(
             match.n_matched, match.n_reference, match.n_other, match.runner_up_matches,
             (match.slope - 1.0) * 1e6, offset, match.max_residual_s * 1e3,
         )
+        cycles_from = "burst"
     else:
         log.warning(
-            "no burst edges on one or both systems; falling back to a 1 Hz-only offset "
-            "estimate, which cannot resolve whole-cycle ambiguity"
+            "no burst edges on one or both systems; the 1 Hz alone cannot tell "
+            "which cycle pairs with which -- trying the photodiode, then the eye"
         )
         offset = burst.estimate_offset(br_1hz, npx_1hz, tolerance_s=0.1)
         log.info("coarse offset %.6f s from the 1 Hz trains", offset)
+        # The provisional line has the drift right and the cycle possibly wrong;
+        # the correction is a whole number of periods added to it.
+        provisional = _fit_1hz(config, br_1hz, npx_1hz, offset)[2]
+        vote, cycles_from = _cycle_from_behaviour(config, provisional, obx_map)
+        shift = 0.0
+        if vote is not None:
+            shift = vote.shift_s
+            offset += shift
+            log.info("cycle picked by the %s: %s", cycles_from, vote.summary())
+        else:
+            log.warning(
+                "%s; the map may be off by whole seconds and cannot be validated",
+                cycles_from,
+            )
+            cycles_from = "1hz_only"
 
         def coarse(times):
-            return np.asarray(times, dtype=np.float64) + offset
+            return provisional.apply(times) + shift
 
-    # 2. Trim both 1 Hz trains to their overlapping window. TPrime aligns edge
-    #    *sequences*, so an edge present in only one recording shifts the
-    #    correspondence by whole cycles.
-    br_trim, npx_trim, npx_coarse = align.trim_pair_under_map(
-        br_1hz, npx_1hz, coarse(npx_1hz), margin_s=config.sync_period_s / 4
-    )
-    log.info(
-        "1 Hz trains trimmed to overlap: Blackrock %d -> %d, SpikeGLX %d -> %d",
-        br_1hz.size, br_trim.size, npx_1hz.size, npx_trim.size,
-    )
+    br_trim, npx_trim, mapping = _fit_1hz(config, br_1hz, npx_1hz, coarse)
     aligned_dir = config.paths.aligned
     aligned_dir.mkdir(parents=True, exist_ok=True)
     br_trim_path = catgt.write_edge_file(aligned_dir / "blackrock_1hz_trimmed.txt", br_trim)
     npx_trim_path = catgt.write_edge_file(aligned_dir / "npx_1hz_trimmed.txt", npx_trim)
-
-    # 3. Pair the trimmed edges and fit the map (also the TPrime fallback).
-    ref_idx, other_idx = burst.match_times(
-        br_trim, npx_coarse, 0.0, tolerance_s=config.sync_period_s / 4
-    )
-    if ref_idx.size < 2:
-        raise ValueError(f"only {ref_idx.size} matched 1 Hz edges; cannot fit a time map")
-
-    mapping = align.fit_linear_map(npx_trim[other_idx], br_trim[ref_idx])
     log.info(
         "linear map from %d matched edges: slope %.9f (%+.1f ppm), intercept %.6f s, "
         "fit residual max %.1f us",
@@ -1820,7 +1828,8 @@ def time_remapping(
     spike_times_path = results_dir / "spike_times.npy"
     if not spike_times_path.exists():
         log.info("no sorting at %s; wrote the time map only", results_dir)
-        _save_map(aligned_dir, mapping, offset, config, obx_map, method="map_only")
+        _save_map(aligned_dir, mapping, offset, config, obx_map, method="map_only",
+                  cycles_from=cycles_from)
         _stamp_exports(config, mapping, obx_map)
         return TimeMap(mapping, offset, "map_only", burst_match=match)
 
@@ -1835,11 +1844,12 @@ def time_remapping(
 
     # Kilosort writes sample indices; TPrime needs seconds. Skipping this is the
     # easiest way to produce a confidently wrong alignment.
+    # Both per-spike arrays sit beside the sorting they came from.
     spike_seconds = tprime_mod.spike_times_to_seconds(np.load(spike_times_path), fs)
-    seconds_path = aligned_dir / f"{system}_spike_seconds.npy"
+    seconds_path = results_dir / f"{system}_spike_seconds.npy"
     np.save(seconds_path, spike_seconds)
 
-    out_path = aligned_dir / f"{system}_spike_seconds_blackrock.npy"
+    out_path = _aligned_spike_path(config, system)
     if config.machine.has_tprime:
         args = tprime_mod.build_tprime_args(
             to_stream=br_trim_path,
@@ -1860,9 +1870,120 @@ def time_remapping(
         )
         method = "linear_fit"
 
-    _save_map(aligned_dir, mapping, offset, config, obx_map, method=method)
+    _save_map(aligned_dir, mapping, offset, config, obx_map, method=method,
+              cycles_from=cycles_from)
     _stamp_exports(config, mapping, obx_map)
     return TimeMap(mapping, offset, method, aligned_path=out_path, burst_match=match)
+
+
+def _fit_1hz(
+    config: SessionConfig, br_1hz: np.ndarray, npx_1hz: np.ndarray, coarse
+) -> tuple[np.ndarray, np.ndarray, align.LinearMap]:
+    """Trim both 1 Hz trains to their overlap, pair them under ``coarse``, fit a line.
+
+    ``coarse`` maps probe seconds onto Blackrock time to within a quarter
+    period, or is a constant offset. Trimming matters because TPrime aligns
+    edge *sequences*: an edge present in only one recording shifts the
+    correspondence by whole cycles.
+    """
+    if not callable(coarse):
+        constant = float(coarse)
+
+        def coarse(times, constant=constant):
+            return np.asarray(times, dtype=np.float64) + constant
+
+    br_trim, npx_trim, npx_coarse = align.trim_pair_under_map(
+        br_1hz, npx_1hz, coarse(npx_1hz), margin_s=config.sync_period_s / 4
+    )
+    log.info(
+        "1 Hz trains trimmed to overlap: Blackrock %d -> %d, SpikeGLX %d -> %d",
+        br_1hz.size, br_trim.size, npx_1hz.size, npx_trim.size,
+    )
+    ref_idx, other_idx = burst.match_times(
+        br_trim, npx_coarse, 0.0, tolerance_s=config.sync_period_s / 4
+    )
+    if ref_idx.size < 2:
+        raise ValueError(f"only {ref_idx.size} matched 1 Hz edges; cannot fit a time map")
+    return br_trim, npx_trim, align.fit_linear_map(npx_trim[other_idx], br_trim[ref_idx])
+
+
+#: How far, in seconds, a 1 Hz-only offset may be from the truth. It is
+#: ambiguous by whole periods within roughly the difference between when the two
+#: recordings started; a minute covers any start order a rig produces.
+CYCLE_SEARCH_S = 60.0
+
+
+def _cycle_from_behaviour(
+    config: SessionConfig,
+    provisional: align.LinearMap,
+    obx_map: align.LinearMap | None,
+) -> tuple[Any, str]:
+    """``(CycleVote or None, source)``: the whole-cycle correction, from the
+    photodiode, else the eye. On ``None`` the source says why not.
+
+    Both signals are on the OneBox and on Blackrock's ``.ns2``. The OneBox copy
+    reaches Blackrock time through ``onebox_to_probe`` and the provisional 1 Hz
+    fit, which is right but for a whole number of periods; the vote finds it.
+    Never a fit: the corrected 1 Hz pairing is refitted afterwards.
+    """
+    from dataclasses import replace as _replace
+
+    from ._io import analog
+    from ._sync import cycles
+
+    brk, npx = config.blackrock, config.neuropixels
+    if obx_map is None:
+        return None, "no OneBox 1 Hz edges, so the OneBox copies cannot be mapped"
+    shared = [n for n in brk.analog_channels if n in npx.analog_channels]
+    if brk.analog_file is None or not shared:
+        return None, ("no channel named in both blackrock.analog_channels and "
+                      "neuropixels.analog_channels to pick the cycle with")
+    try:
+        onebox = analog.load_onebox_analog(
+            analog.find_onebox_analog(config.paths.export_for("neuropixels")),
+            require_blackrock=False,
+        )
+        br = analog.open_blackrock_analog(
+            brk.analog_file, {n: brk.analog_channels[n] for n in shared},
+            gap_tolerance_ms=brk.gap_tolerance_ms,
+            tolerance_s=config.alignment_tolerance_s, by="position",
+        )
+    except (OSError, ValueError, IndexError) as error:
+        return None, f"no photodiode or eye to pick the cycle with ({error})"
+    composed = align.compose_linear_maps(provisional, obx_map)
+    onebox = _replace(onebox, slope=composed.slope, intercept=composed.intercept)
+    period = config.sync_period_s
+
+    reasons = []
+    if "photodiode" in shared:
+        try:
+            obx_t, _ = analog.detect_onebox_events(onebox, "photodiode")
+            br_t, _ = analog.detect_blackrock_events(br, "photodiode")
+            vote = cycles.cycle_shift_from_events(
+                br_t, composed.apply(obx_t), period_s=period, search_s=CYCLE_SEARCH_S,
+            )
+        except (OSError, ValueError) as error:
+            vote, note = None, str(error)
+        else:
+            note = f"{obx_t.size} OneBox / {br_t.size} Blackrock edges, no clear winner"
+        if vote is not None:
+            return vote, "photodiode"
+        reasons.append(f"photodiode: {note}")
+
+    for name in [n for n in shared if n != "photodiode"]:
+        try:
+            _, lags, _ = analog.measure_lags(
+                onebox, br, name, n_windows=20, window_s=2 * CYCLE_SEARCH_S,
+                max_lag_s=CYCLE_SEARCH_S + period, min_corr=0.5, differentiate=True,
+            )
+        except (OSError, ValueError) as error:
+            reasons.append(f"{name}: {error}")
+            continue
+        vote = cycles.cycle_shift_from_lags(lags, period_s=period)
+        if vote is not None:
+            return vote, name
+        reasons.append(f"{name}: {lags.size} windows locked, no clear winner")
+    return None, "could not pick the cycle: " + "; ".join(reasons)
 
 
 def _save_map(
@@ -1872,12 +1993,16 @@ def _save_map(
     config: SessionConfig,
     obx_map: align.LinearMap | None = None,
     method: str | None = None,
+    cycles_from: str | None = None,
 ) -> None:
     obx_to_br = None if obx_map is None else align.compose_linear_maps(mapping, obx_map)
     payload = {
         "session": config.session,
         "reference_timebase": "blackrock",
         "coarse_offset_s": offset,
+        # What picked which 1 Hz cycle pairs with which: "burst", "photodiode",
+        # an eye channel's label, or "1hz_only" (ambiguous by whole seconds).
+        "cycles_from": cycles_from,
         "slope": mapping.slope,
         "intercept": mapping.intercept,
         "drift_ppm": mapping.drift_ppm,
@@ -2167,6 +2292,11 @@ def _independent_checks(config: SessionConfig) -> list[dict[str, Any]]:
 # ----------------------------------------------------------------------------
 
 
+def _aligned_spike_path(config: SessionConfig, system: str) -> Path:
+    """Spike times on Blackrock time, beside the sorting they belong to."""
+    return config.paths.sorted_for(system) / f"{system}_spike_seconds_blackrock.npy"
+
+
 def _resolve_spike_seconds(
     config: SessionConfig, system: str, phy
 ) -> tuple[np.ndarray | None, str, object | None]:
@@ -2186,9 +2316,7 @@ def _resolve_spike_seconds(
     traces are already on. Neither present leaves times in the sorter's timebase.
     """
     results_dir = config.paths.sorted_for(system)
-    aligned_path = (
-        config.paths.aligned / f"{system}_spike_seconds_blackrock.npy"
-    )
+    aligned_path = _aligned_spike_path(config, system)
     if aligned_path.exists():
         aligned = np.load(aligned_path)
         if aligned.size == phy.spike_samples.size:

@@ -330,6 +330,7 @@ def measure_lags(
     window_s: float = 10.0,
     max_lag_s: float = 0.02,
     min_corr: float = 0.8,
+    differentiate: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """``(window centres, lags, peak correlations)`` of one continuous channel.
 
@@ -339,6 +340,11 @@ def measure_lags(
     Blackrock's own samples and cross-correlated with them. Windows whose peak
     correlation is below ``min_corr`` -- no movement to lock onto -- are dropped.
     A positive lag means the OneBox copy is later.
+
+    ``differentiate`` correlates the sample-to-sample change instead -- for a
+    search over seconds: an eye trace wanders slowly, so its own correlation
+    peak is broad, while its changes (saccades) peak sharply. Clipped,
+    so one blink cannot own the correlation.
     """
     start, stop = get_recording_overlap(onebox, blackrock)
     stream = blackrock.streams[name]
@@ -362,6 +368,8 @@ def measure_lags(
         if k1 - k0 < 3:
             continue
         y_obx = np.interp(t_br, onebox.blackrock_time(k0, k1), read_onebox(onebox, name, k0, k1))
+        if differentiate:
+            y_br, y_obx = compare.clipped_diff(y_br), compare.clipped_diff(y_obx)
         lag, corr = compare.xcorr_lag(y_br, y_obx, stream.fs, max_lag_s)
         if np.isfinite(lag) and corr >= min_corr:
             kept_t.append(centre)

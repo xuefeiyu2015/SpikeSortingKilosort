@@ -190,15 +190,17 @@ kilosort: {}
 #
 # Outputs -- one folder per system, beside its own recording
 #   {blackrock_dir}/kilosort4/          sorted Utah array, NSP edge files,
-#                                       the cross-system time map, and export/
+#                                       and export/
 #   {neuropixels_dir}/kilosort4/        sorted Neuropixels, SpikeGLX edge files,
+#                                       the time map onto Blackrock time,
 #                                       the LF band, and export/
 #
 #   Everything derived from one recording lands in one directory, so handing an
 #   analysis a sorting means handing it a folder rather than a tour of three
 #   trees. There is no system or probe level above it: the directory this file
-#   names already says which recording it is. Cross-system results go under the
-#   Blackrock one, because Blackrock is the reference timebase.
+#   names already says which recording it is. The time map goes with the
+#   Neuropixels sorting it maps: Blackrock's own times need no map, and a
+#   local sorting then stays local, reading only Blackrock's edge files.
 #
 # Where the SpikeGLX run went
 #   A session names one binary -- bin_file -- and nothing else. There is no

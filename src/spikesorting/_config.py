@@ -601,9 +601,9 @@ class OutputPaths:
     blackrock_dir: Path | None = None
     neuropixels_dir: Path | None = None
     sorter: str = SORTER_NAME
-    #: ``imec<n>`` when the session states a ``probes:`` list, else None. It
-    #: separates the *cross-system* outputs only -- see :attr:`aligned`. Each
-    #: probe's own sorting is already apart, in its own ``neuropixels_dir``.
+    #: ``imec<n>`` when the session states a ``probes:`` list, else None. A
+    #: label only: each probe's outputs are already apart, in its own
+    #: ``neuropixels_dir``.
     probe_tag: str | None = None
 
     def dir_for(self, system: str) -> Path | None:
@@ -658,20 +658,22 @@ class OutputPaths:
 
     @property
     def aligned(self) -> Path:
-        """The time map's home: the reference system's folder, or the only one.
+        """The time map's home: the folder of the sorting it maps.
 
-        One level deeper when the session states a probe list. Every probe of a
-        run is mapped onto the *same* Blackrock recording, so all of them would
-        otherwise write ``time_map.json`` -- and the trimmed edge files, and
-        ``neuropixels_spike_seconds_blackrock.npy`` -- to one directory, each on
-        top of the last. Each probe has its own oscillator and its own SY word, so
-        those are genuinely different maps and the last one written would win.
+        The map turns Neuropixels times into Blackrock time, so it belongs to the
+        Neuropixels recording -- Blackrock's own spikes are already on its clock
+        and never read it. It sits beside that sorting, with the trimmed edges,
+        ``validation.json`` and the mapped spike times, wherever that folder is:
+        a local sorting stays local and only Blackrock's few-KB edge files are
+        read off the share. Each probe already has its own ``neuropixels_dir``,
+        so two probes' maps cannot collide.
 
-        A single-probe session has ``probe_tag`` None and no such level: there is
-        one map, and a directory holding one thing needs no subdivision.
+        A session with no Neuropixels has nothing to map; the Blackrock folder
+        is named so the path is still defined.
         """
-        base = self.primary / self.sorter
-        return base if self.probe_tag is None else base / self.probe_tag
+        if self.neuropixels_dir is not None:
+            return self.sorted_for("neuropixels")
+        return self.sorted_for("blackrock")
 
     def export_for(self, system: str) -> Path:
         """The copy-paste bundle for one system: everything derived from it.

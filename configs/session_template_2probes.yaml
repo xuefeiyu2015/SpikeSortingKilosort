@@ -330,16 +330,17 @@ kilosort: {}
 #
 # Outputs -- one folder per stream, beside its own recording
 #   {blackrock_dir}/kilosort4/          NSP edge files and export/
-#   {blackrock_dir}/kilosort4/imec<n>/  probe n's time map onto Blackrock time
 #   {neuropixels_dir}/<run>_imec<n>/kilosort4/
 #                                       probe n's sorting, its SpikeGLX edge
-#                                       files, its LF band, and its export/
+#                                       files, its time map onto Blackrock
+#                                       time, its LF band, and its export/
 #
 #   Everything derived from one recording lands in one directory, so handing an
 #   analysis a sorting means handing it a folder rather than a tour of three
 #   trees. There is no system or probe level above it: the directory this file
-#   names already says which recording it is. Cross-system results go under the
-#   Blackrock one, because Blackrock is the reference timebase.
+#   names already says which recording it is. The time map goes with the
+#   Neuropixels sorting it maps: Blackrock's own times need no map, and a
+#   local sorting then stays local, reading only Blackrock's edge files.
 #
 # Where the SpikeGLX run went
 #   A session names one binary -- bin_file -- and nothing else. There is no
@@ -370,10 +371,9 @@ kilosort: {}
 #   Naming both bin_file and bin_files raises, as does one probe appearing twice.
 #
 #   Each probe's outputs go inside its own <run>_imec<n>/ folder, so they cannot
-#   collide -- which is why neuropixels_dir is the gate folder here. The one
-#   place two probes would otherwise land on top of each other is the time map,
-#   since both are fitted onto the SAME Blackrock recording; those go to
-#   {blackrock_dir}/kilosort4/imec<n>/ instead, one per probe.
+#   collide -- which is why neuropixels_dir is the gate folder here. That
+#   includes each probe's time map: both are fitted onto the SAME Blackrock
+#   recording, but each map sits beside the sorting it maps.
 #
 #   The 14 s burst comes from the OneBox and is shared by the run, while each
 #   probe's 1 Hz train comes from its own SY word -- which is why each needs a

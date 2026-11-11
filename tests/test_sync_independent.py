@@ -231,3 +231,78 @@ def test_without_the_ns2_keys_there_is_nothing_to_check(tmp_path):
     bare = replace(session, blackrock=replace(session.blackrock, analog_file=None,
                                               analog_channels={}))
     assert pipeline._independent_checks(bare) == []
+
+
+# ---------------------------------------------------------------------------
+# No burst: the same channels pick the 1 Hz cycle
+# ---------------------------------------------------------------------------
+
+
+def _plant_1hz_without_burst(session):
+    """The OneBox's 1 Hz on every clock; the probe shares the OneBox's crystal."""
+    from spikesorting._sync import catgt
+
+    n_obx = int((T0 + DURATION - C) / M * OBX_FS)
+    t = 0.25 + np.arange(int(n_obx / OBX_FS) - 1, dtype=np.float64)
+    br = M * t + C
+    keep = (br > T0 + 0.5) & (br < T0 + DURATION - 0.5)
+    for system, files in (
+        ("neuropixels", {"npx_1hz": t, "npx_obx_1hz": t, "npx_burst": np.empty(0)}),
+        ("blackrock", {"blackrock_1hz": br[keep], "blackrock_burst": np.empty(0)}),
+    ):
+        folder = session.paths.sync_for(system)
+        folder.mkdir(parents=True, exist_ok=True)
+        for name, times in files.items():
+            catgt.write_edge_file(folder / f"{name}.txt", times)
+
+
+def _remap_with_a_planted_cycle_error(tmp_path, monkeypatch, drop=()):
+    import json
+    from dataclasses import replace
+
+    import spikesorting as ss
+    from spikesorting._sync import burst
+
+    session, reader = _session(tmp_path, stamped_slope=M)
+    if drop:
+        kept = {k: v for k, v in session.blackrock.analog_channels.items() if k not in drop}
+        session = replace(session, blackrock=replace(session.blackrock, analog_channels=kept))
+    _plant_1hz_without_burst(session)
+    monkeypatch.setattr(analog, "open_blackrock_analog", _open_with(reader))
+    # The 1 Hz alone lands three cycles off -- what it does when one recording
+    # started a few seconds before the other.
+    true_offset = C + (M - 1.0) * DURATION / 2
+    monkeypatch.setattr(burst, "estimate_offset", lambda *a, **k: true_offset + 3.0)
+
+    result = ss.time_remapping(session, "neuropixels")
+    payload = json.loads((session.paths.aligned / "time_map.json").read_text())
+    return result, payload
+
+
+def test_without_a_burst_the_photodiode_picks_the_cycle(tmp_path, monkeypatch):
+    result, payload = _remap_with_a_planted_cycle_error(tmp_path, monkeypatch)
+    assert payload["cycles_from"] == "photodiode"
+    # The fine map is still the 1 Hz fit: exact, not just within a cycle.
+    assert result.mapping.intercept == pytest.approx(C, abs=1e-6)
+    assert result.mapping.slope == pytest.approx(M, rel=1e-8)
+    # ...and the OneBox analog export is stamped, burst or no burst.
+    assert payload["onebox_to_blackrock"]["intercept"] == pytest.approx(C, abs=1e-6)
+
+
+def test_without_a_burst_or_photodiode_the_eye_picks_the_cycle(tmp_path, monkeypatch):
+    result, payload = _remap_with_a_planted_cycle_error(tmp_path, monkeypatch, drop=("photodiode",))
+    assert payload["cycles_from"] == "eye_x"
+    assert result.mapping.intercept == pytest.approx(C, abs=1e-6)
+
+
+def test_with_nothing_to_pick_the_cycle_the_map_says_so(tmp_path, monkeypatch):
+    from spikesorting._sync.report import build_sync_report
+
+    result, payload = _remap_with_a_planted_cycle_error(
+        tmp_path, monkeypatch, drop=("photodiode", "eye_x")
+    )
+    assert payload["cycles_from"] == "1hz_only"
+    assert result.mapping.intercept == pytest.approx(C + 3.0, abs=1e-3)   # wrong, and flagged
+    report = build_sync_report(payload, None, [])
+    assert report["verdict"] == "NOT VALIDATED"
+    assert "off by whole seconds" in report["verdict_note"]

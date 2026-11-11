@@ -124,6 +124,13 @@ def build_sync_report(
         "error_from": "14 s burst: passes through this fit",
     })
 
+    cycles_from = time_map.get("cycles_from")
+    if cycles_from == "1hz_only":
+        verdict_note += ("; WARNING: no burst, photodiode or eye picked the 1 Hz cycle, "
+                         "so the map may be off by whole seconds")
+    elif cycles_from and cycles_from != "burst":
+        verdict_note += f"; the 1 Hz cycle was picked by the {cycles_from} (no burst)"
+
     composed = time_map.get("onebox_to_blackrock")
     drifting = [c["channel"] for c in checks or [] if c.get("status") == "DRIFT"]
     if drifting:
@@ -133,6 +140,7 @@ def build_sync_report(
         "verdict_note": verdict_note,
         "tolerance_ms": tolerance_ms,
         "method": time_map.get("method"),
+        "cycles_from": cycles_from,
         "probe_to_blackrock": {
             "slope": time_map["slope"], "intercept_s": time_map["intercept"],
             "drift_ppm": time_map["drift_ppm"],
@@ -198,8 +206,9 @@ def render_sync_report(report: dict[str, Any], title: str = "") -> str:
     if checks:
         lines += [
             "", "Independent checks: channels recorded on both systems (ms)", "-" * 60,
-            "Never used for alignment. Judged on DRIFT across the session; a constant",
-            "offset is Blackrock's filter delay on its 1 kHz stream, not a sync error.",
+            "Never fitted (without a burst they only pick the 1 Hz cycle). Judged on",
+            "DRIFT across the session; a constant offset is Blackrock's filter delay",
+            "on its 1 kHz stream, not a sync error.",
             "",
         ]
         for c in checks:

@@ -1394,6 +1394,34 @@ def test_time_remapping_recovers_a_planted_offset_and_drift(tmp_path):
     assert "ppm" in result.summary()
 
 
+def test_the_neuropixels_side_writes_nothing_into_the_blackrock_folder(tmp_path):
+    # blackrock_dir is often a share while the Neuropixels sorting is local. The
+    # map, the trimmed edges and the per-spike arrays all belong to the sorting,
+    # so time_remapping only *reads* Blackrock's edge files.
+    from spikesorting._sync import catgt
+
+    session = _session(tmp_path)
+    for system in ("blackrock", "neuropixels"):
+        session.paths.sync_for(system).mkdir(parents=True, exist_ok=True)
+    br = np.arange(0.0, 600.0, 1.0) + 100.0
+    catgt.write_edge_file(session.paths.sync_for("blackrock") / "blackrock_1hz.txt", br)
+    catgt.write_edge_file(session.paths.sync_for("neuropixels") / "npx_1hz.txt", br - 12.0)
+
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    sorted_dir.mkdir(parents=True, exist_ok=True)
+    np.save(sorted_dir / "spike_times.npy", np.array([30_000, 60_000, 90_000]))
+    (sorted_dir / "params.py").write_text("sample_rate = 30000.0\n", encoding="utf-8")
+
+    br_dir = session.paths.sorted_for("blackrock")
+    before = {p.name for p in br_dir.iterdir()}
+    result = ss.time_remapping(session, "neuropixels")
+
+    assert result.aligned_path.parent == sorted_dir
+    assert np.allclose(np.load(result.aligned_path), [13.0, 14.0, 15.0])
+    assert (sorted_dir / "time_map.json").exists()
+    assert (sorted_dir / "npx_1hz_trimmed.txt").exists()
+    assert {p.name for p in br_dir.iterdir()} == before
+
 def _plant_burst_on_the_onebox_clock(session, with_onebox_1hz):
     """Three hours: a probe 50 ppm off Blackrock, a OneBox 30 ppm off the probe.
 

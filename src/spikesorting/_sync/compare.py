@@ -37,6 +37,7 @@ __all__ = [
     "auto_threshold",
     "offset_and_drift",
     "xcorr_lag",
+    "clipped_diff",
 ]
 
 
@@ -248,6 +249,22 @@ def offset_and_drift(times_s: np.ndarray, residuals_s: np.ndarray) -> dict[str, 
         "drift_ppm": float(slope) * 1e6,
         "spread_p95_ms": float(np.percentile(spread, 95)) * 1e3,
     }
+
+
+def clipped_diff(values: np.ndarray, n_mad: float = 5.0) -> np.ndarray:
+    """Sample-to-sample change, clipped at ``n_mad`` median absolute deviations.
+
+    For correlating an eye trace by its movements: a blink, or a value that
+    saturated, is one enormous step that would otherwise own the correlation.
+    """
+    d = np.diff(np.asarray(values, dtype=np.float64))
+    if d.size == 0:
+        return d
+    mad = float(np.median(np.abs(d - np.median(d))))
+    if mad == 0:
+        return d
+    limit = n_mad * mad
+    return np.clip(d, -limit, limit)
 
 
 def xcorr_lag(
