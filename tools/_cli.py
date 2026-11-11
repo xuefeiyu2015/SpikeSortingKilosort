@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -197,19 +198,22 @@ class Runner:
             print(f"[--] {label}\n       {why}")
             return None
 
+        started = time.perf_counter()
         try:
             value = verb(*args, **kwargs)
         except Exception as error:  # a stage that blows up must not hide the rest
             self.failures += 1
             self.last_failed = True
-            print(f"[!!] {label}\n       {type(error).__name__}: {error}")
+            took = _elapsed(time.perf_counter() - started)
+            print(f"[!!] {label}  ({took})\n       {type(error).__name__}: {error}")
             self.stopped = True
             return None
 
+        took = _elapsed(time.perf_counter() - started)
         if value is None:
-            print(f"[--] {label}\n       nothing to do")
+            print(f"[--] {label}  ({took})\n       nothing to do")
         else:
-            print(f"[ok] {label}\n       {_describe(value)}")
+            print(f"[ok] {label}  ({took})\n       {_describe(value)}")
         return value
 
     def finish(self, name: str) -> int:
@@ -219,6 +223,15 @@ class Runner:
             return 1
         print(f"{name} finished")
         return 0
+
+
+def _elapsed(seconds: float) -> str:
+    """``0.4 s``, ``12.3 s``, ``4.2 min``, ``1.53 h`` -- how long a stage took."""
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f} min"
+    return f"{seconds / 3600:.2f} h"
 
 
 def _describe(value) -> str:

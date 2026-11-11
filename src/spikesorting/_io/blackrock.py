@@ -32,6 +32,7 @@ __all__ = [
     "nsx_number",
     "open_reader",
     "stream_for_channel",
+    "stream_for_position",
     "read_channel",
     "iter_channel",
     "list_streams",
@@ -366,7 +367,27 @@ def stream_for_channel(reader: Any, channel: int | str, seg_index: int = 0) -> B
     if index is None:
         available = ", ".join(str(row["id"]) for row in channels[:16])
         raise KeyError(f"channel {channel!r} not found; available ids include: {available} ...")
+    return _stream_at(reader, index, seg_index)
 
+
+def stream_for_position(reader: Any, position: int, seg_index: int = 0) -> BlackrockStream:
+    """The channel at ``position`` (0-based) in the file, and nothing else.
+
+    No id or name lookup: a session that says "position 1" must not land on the
+    channel whose *id* is 1. The chosen channel's id and name are in the result,
+    so a caller can log what the position resolved to.
+    """
+    channels = _channel_table(reader)
+    if not 0 <= int(position) < len(channels):
+        raise IndexError(
+            f"position {position} is outside this file's {len(channels)} channels "
+            f"(ids: {', '.join(str(row['id']) for row in channels[:16])})"
+        )
+    return _stream_at(reader, int(position), seg_index)
+
+
+def _stream_at(reader: Any, index: int, seg_index: int) -> BlackrockStream:
+    channels = _channel_table(reader)
     row = channels[index]
     stream_ids = list(reader.header["signal_streams"]["id"])
     stream_index = stream_ids.index(row["stream_id"]) if row["stream_id"] in stream_ids else 0

@@ -81,3 +81,11 @@ def test_a_printed_path_survives_being_pasted_into_a_shell():
     ]
     # ...and a path with nothing to protect is printed as it was typed.
     assert shell_arg("session_x") == "session_x"
+
+
+def test_each_stage_reports_how_long_it_took():
+    from _cli import _elapsed
+
+    assert _elapsed(0.42) == "0.4 s"
+    assert _elapsed(252) == "4.2 min"
+    assert _elapsed(5508) == "1.53 h"

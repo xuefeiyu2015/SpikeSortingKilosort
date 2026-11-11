@@ -35,6 +35,8 @@ __all__ = [
     "display_stride",
     "display_envelope",
     "auto_threshold",
+    "offset_and_drift",
+    "xcorr_lag",
 ]
 
 
@@ -215,3 +217,90 @@ def auto_threshold(values: np.ndarray) -> float:
     """Midway between the 1st and 99th percentile: a two-level signal's crossing."""
     lo, hi = _level_range(np.asarray(values, dtype=np.float64))
     return (lo + hi) / 2.0
+
+
+def offset_and_drift(times_s: np.ndarray, residuals_s: np.ndarray) -> dict[str, float]:
+    """Split residuals into a constant offset, a drift across the session, and spread.
+
+    The distinction is the whole point of checking against a second copy of a
+    signal. A **constant** offset is the recording hardware -- Blackrock filters
+    its 1 kHz stream before storing it, which delays it by a fixed amount -- and
+    says nothing about synchronization. A residual that **changes** over the
+    session is a rate error, which is what synchronization exists to remove. So
+    the drift (a line through residual vs time, end minus start) is the number
+    to judge; the offset is reported so a large one can be explained.
+    """
+    t = np.asarray(times_s, dtype=np.float64).ravel()
+    r = np.asarray(residuals_s, dtype=np.float64).ravel()
+    keep = np.isfinite(t) & np.isfinite(r)
+    t, r = t[keep], r[keep]
+    if r.size < 3:
+        raise ValueError(f"only {r.size} measurements; need at least 3 for a trend")
+    centre = t.mean()
+    slope, intercept = np.polyfit(t - centre, r, 1)
+    span = float(t.max() - t.min())
+    spread = np.abs(r - (slope * (t - centre) + intercept))
+    return {
+        "n": float(r.size),
+        "span_min": span / 60.0,
+        "median_offset_ms": float(np.median(r)) * 1e3,
+        "drift_ms": float(slope * span) * 1e3,
+        "drift_ppm": float(slope) * 1e6,
+        "spread_p95_ms": float(np.percentile(spread, 95)) * 1e3,
+    }
+
+
+def xcorr_lag(
+    reference: np.ndarray, other: np.ndarray, fs: float, max_lag_s: float
+) -> tuple[float, float]:
+    """Lag of ``other`` behind ``reference``, in seconds, and the peak correlation.
+
+    Both on one sample grid at ``fs``. Positive means ``other`` happens later --
+    the same sign as an event residual (OneBox minus Blackrock). Each trace is
+    standardized, so the peak is a correlation coefficient: a flat stretch with
+    no eye movement gives a low peak, and the caller drops it. The peak is
+    refined between samples with a parabola, since a 1 kHz grid alone would
+    round every lag to a millisecond.
+    """
+    from scipy import signal
+
+    a = np.asarray(reference, dtype=np.float64)
+    b = np.asarray(other, dtype=np.float64)
+    n = min(a.size, b.size)
+    a, b = a[:n], b[:n]
+    sa, sb = a.std(), b.std()
+    if n < 3 or sa == 0 or sb == 0:
+        return float("nan"), 0.0
+    a, b = (a - a.mean()) / sa, (b - b.mean()) / sb
+
+    corr = signal.correlate(b, a, mode="full", method="fft") / n
+    lags = signal.correlation_lags(n, n, mode="full")
+    window = np.abs(lags) <= int(round(max_lag_s * fs))
+    corr, lags = corr[window], lags[window]
+    i = int(np.argmax(corr))
+    return _refine_lag(a, b, int(lags[i])) / fs, float(corr[i])
+
+
+def _refine_lag(a: np.ndarray, b: np.ndarray, whole: int) -> float:
+    """The fractional lag, in samples, within one sample of ``whole``.
+
+    Finds the shift that best overlays ``b`` on ``a`` by interpolating ``b``
+    between samples. A parabola through the three correlation values around the
+    peak is the usual shortcut, but it is biased whenever the peak is not
+    parabolic -- for a sharp-cornered one, by most of a sample.
+    """
+    from scipy.optimize import minimize_scalar
+
+    idx = np.arange(b.size, dtype=np.float64)
+    edge = abs(whole) + 2
+    inner = slice(edge, a.size - edge)
+    if inner.stop - inner.start < 3:
+        return float(whole)
+
+    def misfit(lag: float) -> float:
+        shifted = np.interp(idx[inner] + lag, idx, b)
+        return float(np.mean((shifted - a[inner]) ** 2))
+
+    best = minimize_scalar(misfit, bounds=(whole - 1.0, whole + 1.0), method="bounded",
+                           options={"xatol": 1e-4})
+    return float(best.x)

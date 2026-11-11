@@ -494,9 +494,11 @@ def test_a_utah_export_lands_on_the_nsp_clock(tmp_path, kilosort_results):
     # ...and the sorter's own index survives beside it, so nothing is one-way.
     assert samples.size == exported.size
 
-    # Only what an analysis copies away: no .npy/.npz duplicates of Kilosort's.
+    # Only what an analysis copies away: no .npy/.npz duplicates of Kilosort's,
+    # plus the small records that explain them -- here the .ns6 clock map.
     names = {p.name for p in (sorted_dir / "export").iterdir() if p.is_file()}
-    assert names == {"HUB.sorted_spikes.mat", "units.csv", "sorting_summary_info.json"}
+    assert names == {"HUB.sorted_spikes.mat", "units.csv", "sorting_summary_info.json",
+                     "nsp_time_map.json"}
 
     info = json.loads((sorted_dir / "export" / "sorting_summary_info.json").read_text())
     assert info["timebase"] == "nsp"
@@ -1439,6 +1441,13 @@ def test_the_burst_is_mapped_off_the_onebox_clock_before_validation(tmp_path):
     validation = json.loads((session.paths.aligned / "validation.json").read_text())
     assert validation["burst_clock"] == "probe"
 
+    # The report lands in the probe's export, beside the data it describes.
+    export = session.paths.export_for("neuropixels")
+    sync = json.loads((export / "sync_report.json").read_text())
+    assert sync["verdict"] == "PASS"
+    assert sync["channels"][-1]["max_ms"] == pytest.approx(report.max_residual_s * 1e3)
+    assert "Verdict: PASS" in (export / "sync_report.txt").read_text()
+
     # The composed map takes a OneBox time -- an eye or photodiode sample --
     # straight onto Blackrock time: here the planted burst, recorded on the OneBox.
     composed = time_map["onebox_to_blackrock"]
@@ -1888,3 +1897,98 @@ def test_the_waveform_export_without_kilosort_says_how_to_get_it(tmp_path, monke
 
     with pytest.raises(ImportError, match="kilosort4"):
         pipeline._kilosort_preprocessing(tmp_path)
+
+
+def test_a_session_without_blackrock_says_synchronization_is_skipped(tmp_path):
+    # The [--] line is the only place a run says its times are not on Blackrock
+    # time, so it names the consequence, not just the skip.
+    npx_only = tmp_path / "npx_only.yaml"
+    npx_only.write_text(
+        f"neuropixels_dir: '{tmp_path / 'np'}'\nneuropixels:\n  bin_file: '/a/x.bin'\n",
+        encoding="utf-8",
+    )
+    session = cfg.load_session_config(npx_only, "mac", CONFIG_DIR)
+
+    for verb in (ss.time_remapping, ss.validate_remapping):
+        why = ss.skip_reason(session, verb, "neuropixels")
+        assert "no Blackrock in this session" in why
+        assert "synchronization skipped" in why and "probe clock" in why
+    assert ss.time_remapping(session, "neuropixels") is None
+
+    br_only = tmp_path / "br_only.yaml"
+    br_only.write_text(
+        f"blackrock_dir: '{tmp_path / 'br'}'\nblackrock:\n  sync_file: '/b/y.ns5'\n",
+        encoding="utf-8",
+    )
+    why = ss.skip_reason(cfg.load_session_config(br_only, "mac", CONFIG_DIR),
+                         ss.time_remapping, "neuropixels")
+    assert "no Neuropixels in this session" in why
+
+
+def test_the_sync_report_says_not_validated_without_bursts(tmp_path):
+    session = _session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    (session.paths.sync_for("neuropixels") / "npx_burst.txt").write_text("")
+    ss.time_remapping(session, "neuropixels")
+
+    assert ss.validate_remapping(session, figures=False) is None
+    sync = json.loads(
+        (session.paths.export_for("neuropixels") / "sync_report.json").read_text()
+    )
+    assert sync["verdict"] == "NOT VALIDATED"
+
+
+def test_a_clock_map_from_another_file_is_never_applied_to_spikes(tmp_path):
+    # The .ns5 sync map and the .ns6 spike map used to share one filename in one
+    # folder; the export then converted .ns6 spikes on the .ns5's crystal.
+    from spikesorting._io.blackrock import NspSegment, NspTimeMap
+    from spikesorting._sync import extract
+
+    time_map = NspTimeMap((NspSegment(0, 1000, 1 / 30000, 5.0, 0.0),), 30000.0, "3.0", True)
+    extract._write_nsp_map(tmp_path, time_map, Path("/b/NSP_001.ns5"))
+    assert (tmp_path / extract.SYNC_NSP_MAP).exists()
+    assert not (tmp_path / "nsp_time_map.json").exists()
+
+    (tmp_path / "nsp_time_map.json").write_text(
+        json.dumps(dict(time_map.to_dict(), source="/b/NSP_001.ns5")), encoding="utf-8"
+    )
+    assert pipeline.read_nsp_time_map(tmp_path, Path("/b/HUB_001.ns6")) is None
+    assert pipeline.read_nsp_time_map(tmp_path, Path("/b/NSP_001.ns5")) is not None
+    assert pipeline.read_nsp_time_map(tmp_path) is not None   # no source to check
+
+
+def test_the_export_carries_copies_of_the_run_records(tmp_path):
+    session = _session(tmp_path)
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    prep = session.paths.preprocessed_for("neuropixels")
+    aligned = session.paths.aligned
+    for folder, name in ((sorted_dir, "run_info.json"), (sorted_dir, "kilosort4.log"),
+                         (prep, "preprocess.json"), (aligned, "time_map.json"),
+                         (aligned, "validation.json")):
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / name).write_text(name, encoding="utf-8")
+    out = session.paths.export_for("neuropixels")
+    out.mkdir(parents=True)
+
+    copied = pipeline._copy_records(session, "neuropixels", out)
+
+    assert sorted(p.name for p in copied.values()) == [
+        "kilosort4.log", "preprocess.json", "run_info.json", "time_map.json",
+        "validation.json",
+    ]
+    assert (out / "run_info.json").read_text() == "run_info.json"
+    assert (sorted_dir / "run_info.json").exists()            # copied, not moved
+
+
+def test_run_info_records_the_source_and_how_long_the_sort_took(tmp_path):
+    session = _session(tmp_path)
+    result = pipeline.SortSummary(
+        results_dir=tmp_path, n_units=3, n_spikes=10, fs=30000.0,
+        binary=Path("/p/x.bin"), settings={},
+    )
+    timing = {"preprocessing": "reused", "kilosort_s": 12.5, "total_s": 13.0}
+    pipeline._write_run_info(session, "neuropixels", result, {}, timing)
+
+    info = json.loads((tmp_path / "run_info.json").read_text())
+    assert info["timing"]["kilosort_s"] == 12.5
+    assert info["source_recording"].endswith("x.bin")

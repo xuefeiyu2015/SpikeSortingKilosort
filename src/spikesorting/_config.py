@@ -387,6 +387,15 @@ class BlackrockSpec:
     sync_file: Path | None = None
     #: HUB-*.ns6 -- holds the Utah array spike data.
     spike_file: Path | None = None
+    #: NSP-*.ns2 -- the 1 kHz behavioural channels: Blackrock's copy of what the
+    #: OneBox records on XA1-XA4. Read only to *check* synchronization; nothing
+    #: is aligned by it.
+    analog_file: Path | None = None
+    #: ``{OneBox label: position in analog_file}``, 0-based -- the channel's
+    #: place in the file, never its id: an id lookup could land on a different
+    #: channel whose id happens to equal the number. Labels match the OneBox's
+    #: ``neuropixels.analog_channels``, which is what pairs the two copies.
+    analog_channels: dict[str, int] = field(default_factory=dict)
     sync_1hz_channel: int = 1
     burst_channel: int = 2
     #: Rising-edge thresholds, in the units returned by the reader (see io.blackrock).
@@ -420,6 +429,11 @@ class BlackrockSpec:
         return cls(
             sync_file=_as_path(data.get("sync_file")),
             spike_file=_as_path(data.get("spike_file")),
+            analog_file=_as_path(data.get("analog_file")),
+            analog_channels={
+                str(name): int(position)
+                for name, position in (data.get("analog_channels") or {}).items()
+            },
             sync_1hz_channel=int(data.get("sync_1hz_channel", 1)),
             burst_channel=int(data.get("burst_channel", 2)),
             sync_threshold=float(data.get("sync_threshold", 2.5)),
@@ -982,6 +996,8 @@ class SessionConfig:
                 problems.append(f"blackrock.sync_file does not exist: {brk.sync_file}")
             if brk.spike_file is not None and not brk.spike_file.exists():
                 problems.append(f"blackrock.spike_file does not exist: {brk.spike_file}")
+            if brk.analog_file is not None and not brk.analog_file.exists():
+                problems.append(f"blackrock.analog_file does not exist: {brk.analog_file}")
 
         # A channel map that is *named* but absent is a hard error -- the
         # alternative is finding out after the recording has been copied to the
@@ -1312,6 +1328,7 @@ def load_session_config(
     _reject_bad_preprocess(config, session_path)
     _reject_sorting_nothing(config, data, session_path)
     _reject_bad_analog_channels(config, session_path)
+    _reject_bad_blackrock_analog(config, session_path)
     _reject_colliding_system_dirs(config, session_path)
     return config
 
@@ -1434,6 +1451,39 @@ def _reject_bad_analog_channels(config: SessionConfig, path: Path) -> None:
             f"{path}: neuropixels.analog_channels names "
             + ", ".join(f"XA{n}" for n in shared) + " more than once"
         )
+
+
+def _reject_bad_blackrock_analog(config: SessionConfig, path: Path) -> None:
+    """``analog_file`` and ``analog_channels`` come together, as positions.
+
+    One without the other is read by nobody. A label the OneBox does not also
+    carry has nothing to be compared with, which is the only thing these are for
+    -- so it is refused rather than left to be silently skipped.
+    """
+    brk = config.blackrock
+    if bool(brk.analog_file) != bool(brk.analog_channels):
+        named, missing = (
+            ("analog_file", "analog_channels") if brk.analog_file
+            else ("analog_channels", "analog_file")
+        )
+        raise ValueError(
+            f"{path}: blackrock.{named} is set but blackrock.{missing} is not; "
+            "they describe one file and its channels, so state both or neither"
+        )
+    positions = list(brk.analog_channels.values())
+    if any(p < 0 for p in positions):
+        raise ValueError(f"{path}: blackrock.analog_channels positions are 0-based, >= 0")
+    if len(set(positions)) != len(positions):
+        raise ValueError(f"{path}: blackrock.analog_channels names one position twice")
+    onebox = set(config.neuropixels.analog_channels)
+    if brk.analog_channels and config.has_data("neuropixels"):
+        unmatched = sorted(set(brk.analog_channels) - onebox)
+        if unmatched:
+            raise ValueError(
+                f"{path}: blackrock.analog_channels {unmatched} have no OneBox copy "
+                f"in neuropixels.analog_channels ({sorted(onebox) or 'none'}); the "
+                "labels are what pair the two recordings"
+            )
 
 
 def _reject_sorting_nothing(

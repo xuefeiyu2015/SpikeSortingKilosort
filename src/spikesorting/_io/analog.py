@@ -36,6 +36,8 @@ __all__ = [
     "detect_onebox_events",
     "detect_blackrock_events",
     "get_window_traces",
+    "measure_lags",
+    "source_for",
 ]
 
 
@@ -165,17 +167,32 @@ def open_blackrock_analog(
     channels: dict[str, int],
     gap_tolerance_ms: float | None = None,
     tolerance_s: float | None = 1e-3,
+    by: str = "id",
 ) -> BlackrockAnalog:
-    """Open a ``.nsX`` and resolve the named channels (``{label: channel id}``).
+    """Open a ``.nsX`` and resolve the named channels (``{label: channel}``).
+
+    ``by="id"`` for a channel id (the ``.ns5`` sync channels), ``by="position"``
+    for a 0-based place in the file (``blackrock.analog_channels``). What each
+    position resolved to is logged, so a wrong guess shows on the first run.
 
     The NSP time map is measured from this file, as ``extract_sync`` does for the
     sync file: each ``.nsX`` is its own crystal.
     """
+    import logging
+
     from . import blackrock
 
+    if by not in ("id", "position"):
+        raise ValueError(f"by must be 'id' or 'position', got {by!r}")
     path = Path(path)
     reader = blackrock.open_reader(path, gap_tolerance_ms=gap_tolerance_ms)
-    streams = {name: blackrock.stream_for_channel(reader, ch) for name, ch in channels.items()}
+    lookup = blackrock.stream_for_channel if by == "id" else blackrock.stream_for_position
+    streams = {name: lookup(reader, ch) for name, ch in channels.items()}
+    for name, stream in streams.items():
+        logging.getLogger(__name__).info(
+            "%s: %s -> channel id %s (%s), %g Hz",
+            path.name, name, stream.channel_id, stream.channel_name, stream.fs,
+        )
     stream_index = next(iter(streams.values())).stream_index if streams else 0
     time_map = blackrock.nsp_time_map(
         reader, blackrock.nsx_number(path), stream_index=stream_index, tolerance_s=tolerance_s
@@ -204,15 +221,17 @@ def read_edge_file(path: str | Path) -> np.ndarray:
 
 
 def get_recording_overlap(
-    onebox: OneBoxAnalog, blackrock: BlackrockAnalog | None
+    onebox: OneBoxAnalog, blackrock: BlackrockAnalog | list[BlackrockAnalog] | None
 ) -> tuple[float, float]:
-    """``(start, stop)`` of Blackrock time both systems were recording."""
+    """``(start, stop)`` of Blackrock time every given file was recording."""
     start = onebox.intercept
     stop = onebox.slope * (onebox.n_samples / onebox.fs) + onebox.intercept
-    if blackrock is not None:
-        segments = blackrock.segments
-        first, _, _, intercept = segments[0]
-        last, n, slope, last_intercept = segments[-1]
+    sources = blackrock if isinstance(blackrock, list) else [blackrock]
+    for source in sources:
+        if source is None:
+            continue
+        _, _, _, intercept = source.segments[0]
+        _, n, slope, last_intercept = source.segments[-1]
         start = max(start, intercept)
         stop = min(stop, last_intercept + slope * n)
     return start, stop
@@ -251,9 +270,17 @@ def detect_blackrock_events(
     return br.time_map.apply(samples), threshold
 
 
+def source_for(
+    blackrock: BlackrockAnalog | list[BlackrockAnalog] | None, name: str
+) -> BlackrockAnalog | None:
+    """The Blackrock file that records ``name``, among one or several."""
+    sources = blackrock if isinstance(blackrock, list) else [blackrock]
+    return next((b for b in sources if b is not None and name in b.streams), None)
+
+
 def get_window_traces(
     onebox: OneBoxAnalog,
-    blackrock: BlackrockAnalog | None,
+    blackrock: BlackrockAnalog | list[BlackrockAnalog] | None,
     t0_s: float,
     t1_s: float,
     names: list[str] | None = None,
@@ -283,12 +310,61 @@ def get_window_traces(
             trace.t_onebox, trace.y_onebox = compare.display_envelope(
                 t, compare.normalize_trace(read_onebox(onebox, name, k0, k1)), max_points
             )
-        if blackrock is not None and name in blackrock.streams:
-            s0, s1 = compare.blackrock_sample_range(t0_s, t1_s, blackrock.segments)
+        source = source_for(blackrock, name)
+        if source is not None:
+            s0, s1 = compare.blackrock_sample_range(t0_s, t1_s, source.segments)
             trace.t_blackrock, trace.y_blackrock = compare.display_envelope(
-                blackrock.time_map.apply(np.arange(s0, s1)),
-                compare.normalize_trace(read_blackrock(blackrock, name, s0, s1)),
+                source.time_map.apply(np.arange(s0, s1)),
+                compare.normalize_trace(read_blackrock(source, name, s0, s1)),
                 max_points,
             )
         traces.append(trace)
     return traces
+
+
+def measure_lags(
+    onebox: OneBoxAnalog,
+    blackrock: BlackrockAnalog,
+    name: str,
+    n_windows: int = 60,
+    window_s: float = 10.0,
+    max_lag_s: float = 0.02,
+    min_corr: float = 0.8,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(window centres, lags, peak correlations)`` of one continuous channel.
+
+    ``n_windows`` windows spread evenly over the overlap -- enough to see a
+    trend across the session without reading all of it. In each, the OneBox
+    trace (on Blackrock time, through the stamped map) is interpolated onto
+    Blackrock's own samples and cross-correlated with them. Windows whose peak
+    correlation is below ``min_corr`` -- no movement to lock onto -- are dropped.
+    A positive lag means the OneBox copy is later.
+    """
+    start, stop = get_recording_overlap(onebox, blackrock)
+    stream = blackrock.streams[name]
+    span = stop - start - window_s - 2 * max_lag_s
+    if span <= 0:
+        raise ValueError(f"{name}: the overlap is shorter than one {window_s:g} s window")
+    centres = start + max_lag_s + window_s / 2 + np.linspace(0.0, span, n_windows)
+
+    kept_t, kept_lag, kept_corr = [], [], []
+    for centre in centres:
+        t0, t1 = centre - window_s / 2, centre + window_s / 2
+        s0, s1 = compare.blackrock_sample_range(t0, t1, blackrock.segments)
+        if s1 - s0 < 3:
+            continue
+        t_br = blackrock.time_map.apply(np.arange(s0, s1))
+        y_br = read_blackrock(blackrock, name, s0, s1)
+        k0, k1 = compare.onebox_sample_range(
+            t0 - 2 * max_lag_s, t1 + 2 * max_lag_s,
+            onebox.fs, onebox.slope, onebox.intercept, onebox.n_samples,
+        )
+        if k1 - k0 < 3:
+            continue
+        y_obx = np.interp(t_br, onebox.blackrock_time(k0, k1), read_onebox(onebox, name, k0, k1))
+        lag, corr = compare.xcorr_lag(y_br, y_obx, stream.fs, max_lag_s)
+        if np.isfinite(lag) and corr >= min_corr:
+            kept_t.append(centre)
+            kept_lag.append(lag)
+            kept_corr.append(corr)
+    return np.asarray(kept_t), np.asarray(kept_lag), np.asarray(kept_corr)

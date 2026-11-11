@@ -58,6 +58,8 @@ __all__ = [
 
 NPX_1HZ = "npx_1hz"
 NPX_BURST = "npx_burst"
+#: The sync file's clock map, beside the edge files it put on the NSP clock.
+SYNC_NSP_MAP = "nsp_time_map_sync.json"
 NPX_OBX_1HZ = "npx_obx_1hz"
 BR_1HZ = "blackrock_1hz"
 BR_BURST = "blackrock_burst"
@@ -521,7 +523,10 @@ def _write_nsp_map(sync_dir: Path, time_map, source: Path) -> Path:
     """
     import json
 
-    path = Path(sync_dir) / "nsp_time_map.json"
+    # Not nsp_time_map.json: that name, in this same folder, is the *spike*
+    # file's map, which the Utah export reads. Sharing it let whichever ran last
+    # -- usually this -- convert .ns6 spikes on the .ns5's clock.
+    path = Path(sync_dir) / SYNC_NSP_MAP
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(dict(time_map.to_dict(), source=str(source)), handle, indent=2)
     return path

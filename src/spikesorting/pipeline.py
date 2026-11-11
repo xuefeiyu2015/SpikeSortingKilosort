@@ -150,7 +150,19 @@ def skip_reason(config: SessionConfig, verb: Any, system: str | None = None) -> 
             return "no OneBox (.obx.bin) in this SpikeGLX run"
 
     if name in {"time_remapping", "validate_remapping"} and not config.aligns_systems:
-        return "only one system declared, so there is nothing to align against"
+        # Say what it means for the data, not just that a stage was skipped: a
+        # session with no Blackrock ends with times on the probe's own clock.
+        if config.has_data("neuropixels"):
+            return (
+                "no Blackrock in this session -- synchronization skipped; "
+                "times stay on the probe clock (timebase: sorter)"
+            )
+        if config.has_data("blackrock"):
+            return (
+                "no Neuropixels in this session -- nothing to synchronize; "
+                "Blackrock is already the reference clock"
+            )
+        return "neither system declares a recording -- nothing to synchronize"
 
     if name == "time_remapping" and system == REFERENCE_SYSTEM:
         return f"{REFERENCE_SYSTEM} is the reference timebase; nothing to map it onto"
@@ -619,15 +631,29 @@ def write_nsp_time_map(config: SessionConfig, out_dir: Path, source: Path) -> An
     return time_map
 
 
-def read_nsp_time_map(directory: Path) -> Any | None:
-    """The map written by :func:`write_nsp_time_map`, or None if there is none."""
+def read_nsp_time_map(directory: Path, source: Path | None = None) -> Any | None:
+    """The map written by :func:`write_nsp_time_map`, or None if there is none.
+
+    With ``source``, a map measured from a *different* file is refused (None):
+    each ``.nsX`` is its own crystal, so the ``.ns5`` sync file's map applied to
+    ``.ns6`` spike samples is wrong by tens of ms over a session. Sessions sorted
+    before the sync map got its own name could hold exactly that.
+    """
     from ._io.blackrock import NspTimeMap
 
     path = Path(directory) / "nsp_time_map.json"
     if not path.exists():
         return None
     with open(path, "r", encoding="utf-8") as handle:
-        return NspTimeMap.from_dict(json.load(handle))
+        payload = json.load(handle)
+    recorded = payload.get("source")
+    if source is not None and recorded and Path(recorded).name != Path(source).name:
+        log.warning(
+            "%s was measured from %s, not the spike file %s; not using it",
+            path, Path(recorded).name, Path(source).name,
+        )
+        return None
+    return NspTimeMap.from_dict(payload)
 
 
 def _input_path(config: SessionConfig, system: str) -> Path | None:
@@ -788,7 +814,13 @@ def sort_with_kilosort(
     if dry_run:
         return _dry_run(config, system, probe, final_dir)
 
+    import time
+    from datetime import datetime
+
+    started, t0 = datetime.now().astimezone(), time.perf_counter()
+    reused = not _stale_reasons(config, system)[0]
     binary = _binary_for(config, system)
+    t_preprocessed = time.perf_counter()
 
     settings, kwargs = _kilosort_arguments(config, system, binary)
 
@@ -811,6 +843,7 @@ def sort_with_kilosort(
             device=torch.device(config.machine.device),
             **kwargs,
         )
+        t_sorted = time.perf_counter()
         if work_dir != final_dir:
             _clear_previous_curation(final_dir)
             _publish(work_dir, final_dir)
@@ -827,7 +860,17 @@ def sort_with_kilosort(
         binary=binary.path,
         settings=settings,
     )
-    _write_run_info(config, system, result, kwargs)
+    t_done = time.perf_counter()
+    timing = {
+        "started": started.isoformat(timespec="seconds"),
+        "finished": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "preprocessing": "reused" if reused else "made",
+        "preprocess_s": round(t_preprocessed - t0, 1),
+        "kilosort_s": round(t_sorted - t_preprocessed, 1),
+        "publish_s": round(t_done - t_sorted, 1),
+        "total_s": round(t_done - t0, 1),
+    }
+    _write_run_info(config, system, result, kwargs, timing)
 
     # Blackrock only: record what turns these sample indices into NSP-clock
     # seconds, beside the sorting, while the file that produced them is known.
@@ -1182,6 +1225,38 @@ def _unit_page_data(
     return units
 
 
+def _records_for(config: SessionConfig, system: str) -> list[Path]:
+    """The records copied into ``export/``, so the bundle explains itself once
+    copied away. Missing ones are skipped by the caller."""
+    sorted_dir = config.paths.sorted_for(system)
+    records = [
+        sorted_dir / "run_info.json",                    # Kilosort settings, timing
+        sorted_dir / "kilosort4.log",                    # Kilosort's own log
+        config.paths.preprocessed_for(system) / "preprocess.json",
+    ]
+    if system == "neuropixels":
+        records += [config.paths.aligned / "time_map.json",
+                    config.paths.aligned / "validation.json"]
+    else:
+        records.append(sorted_dir / "nsp_time_map.json")  # the .ns6 clock
+    return records
+
+
+def _copy_records(config: SessionConfig, system: str, out_dir: Path) -> dict[str, Path]:
+    """Copy the run's records beside the products they describe.
+
+    Copies, not moves: the originals stay where the pipeline reads them, and a
+    re-export refreshes these. Small JSON and text only -- nothing here is data.
+    """
+    copied: dict[str, Path] = {}
+    for source in _records_for(config, system):
+        if source.exists():
+            target = out_dir / source.name
+            shutil.copy2(source, target)
+            copied[source.stem] = target
+    return copied
+
+
 def _write_summary(
     config: SessionConfig,
     system: str,
@@ -1249,6 +1324,7 @@ def _write_run_info(
     system: str,
     result: SortSummary,
     kwargs: dict[str, Any],
+    timing: dict[str, Any] | None = None,
 ) -> None:
     """Record what produced this sorting, beside the sorting itself."""
     payload = {
@@ -1258,7 +1334,10 @@ def _write_run_info(
         "system": system,
         # Which stream, not just which system: a run can hold several probes.
         "stream": stream_label(system),
+        # The recording as the session names it, and the binary Kilosort read.
+        "source_recording": str(_input_path(config, system)),
         "binary": str(result.binary),
+        "timing": timing,
         "n_units": result.n_units,
         "n_spikes": result.n_spikes,
         "fs": result.fs,
@@ -1735,7 +1814,7 @@ def time_remapping(
     spike_times_path = results_dir / "spike_times.npy"
     if not spike_times_path.exists():
         log.info("no sorting at %s; wrote the time map only", results_dir)
-        _save_map(aligned_dir, mapping, offset, config, obx_map)
+        _save_map(aligned_dir, mapping, offset, config, obx_map, method="map_only")
         _stamp_exports(config, mapping, obx_map)
         return TimeMap(mapping, offset, "map_only", burst_match=match)
 
@@ -1775,7 +1854,7 @@ def time_remapping(
         )
         method = "linear_fit"
 
-    _save_map(aligned_dir, mapping, offset, config, obx_map)
+    _save_map(aligned_dir, mapping, offset, config, obx_map, method=method)
     _stamp_exports(config, mapping, obx_map)
     return TimeMap(mapping, offset, method, aligned_path=out_path, burst_match=match)
 
@@ -1786,6 +1865,7 @@ def _save_map(
     offset: float,
     config: SessionConfig,
     obx_map: align.LinearMap | None = None,
+    method: str | None = None,
 ) -> None:
     obx_to_br = None if obx_map is None else align.compose_linear_maps(mapping, obx_map)
     payload = {
@@ -1797,6 +1877,9 @@ def _save_map(
         "drift_ppm": mapping.drift_ppm,
         "n_points": mapping.n_points,
         "fit_max_residual_s": float(np.abs(mapping.residuals_s).max()),
+        "fit_rms_residual_s": float(np.sqrt(np.mean(mapping.residuals_s ** 2))),
+        # tprime, linear_fit, or map_only when there was no sorting to map yet.
+        "method": method,
         "formula": "blackrock_time = slope * spikeglx_time + intercept",
         # Which clock the burst was on when it picked the coarse offset.
         "burst_clock": "probe" if obx_map is not None else "onebox",
@@ -1806,6 +1889,7 @@ def _save_map(
             "drift_ppm": obx_map.drift_ppm,
             "n_points": obx_map.n_points,
             "fit_max_residual_s": float(np.abs(obx_map.residuals_s).max()),
+            "fit_rms_residual_s": float(np.sqrt(np.mean(obx_map.residuals_s ** 2))),
             "formula": "probe_time = slope * onebox_time + intercept",
         },
         # The two fits above composed: what a OneBox analog channel (eye, pupil,
@@ -1902,6 +1986,7 @@ def validate_remapping(
             "independently validated. The 1 Hz fit residuals in time_map.json are the "
             "only available quality measure, and they are not held-out data."
         )
+        _write_sync_report(config, None)
         return None
 
     with open(map_path, "r", encoding="utf-8") as handle:
@@ -1920,19 +2005,17 @@ def validate_remapping(
     )
     log.info("%s", report.summary())
 
+    validation = {
+        "n_checked": report.n_checked,
+        "max_residual_s": report.max_residual_s,
+        "median_residual_s": report.median_residual_s,
+        "tolerance_s": report.tolerance_s,
+        "passed": report.passed,
+        "burst_clock": "probe" if obx_map is not None else "onebox",
+    }
     with open(aligned_dir / "validation.json", "w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "n_checked": report.n_checked,
-                "max_residual_s": report.max_residual_s,
-                "median_residual_s": report.median_residual_s,
-                "tolerance_s": report.tolerance_s,
-                "passed": report.passed,
-                "burst_clock": "probe" if obx_map is not None else "onebox",
-            },
-            handle,
-            indent=2,
-        )
+        json.dump(validation, handle, indent=2)
+    _write_sync_report(config, validation)
 
     if figures and report.n_checked:
         axes = plots.plot_alignment_residuals(
@@ -1945,6 +2028,132 @@ def validate_remapping(
         log.info("wrote %s", path)
 
     return report
+
+
+def _write_sync_report(config: SessionConfig, validation: dict | None) -> Path | None:
+    """``sync_report.json`` and ``.txt`` in the probe's ``export/``.
+
+    Built from ``time_map.json`` and the burst check, so it says nothing the
+    pipeline did not measure -- it puts it in one place, per signal and per
+    channel, beside the data it describes.
+    """
+    from ._io import analog
+    from ._sync.report import build_sync_report, render_sync_report
+
+    map_path = config.paths.aligned / "time_map.json"
+    if not map_path.exists():
+        return None
+    with open(map_path, "r", encoding="utf-8") as handle:
+        time_map = json.load(handle)
+
+    export_dir = config.paths.export_for("neuropixels")
+    names: list[str] = []
+    try:
+        names = list(analog.load_onebox_analog(
+            analog.find_onebox_analog(export_dir), require_blackrock=False
+        ).names)
+    except (OSError, ValueError):
+        pass                               # no analog export for this probe
+
+    checks = _independent_checks(config)
+    report = build_sync_report(
+        time_map, validation, names, stream_label("neuropixels"), checks=checks
+    )
+    report["time_map"] = str(map_path)
+    for check in checks:
+        if check.get("status") == "DRIFT":
+            log.warning(
+                "%s drifts %.3f ms across the session against Blackrock's copy -- "
+                "a rate error the burst check did not show", check["channel"],
+                check["drift_ms"],
+            )
+    export_dir.mkdir(parents=True, exist_ok=True)
+    path = export_dir / "sync_report.json"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2)
+    title = f"{config.session} | {stream_label('neuropixels')}"
+    if config.probe_tag is not None:
+        title += f" {config.probe_tag}"
+    text = render_sync_report(report, title)
+    (export_dir / "sync_report.txt").write_text(text, encoding="utf-8")
+    log.info("sync %s -> %s", report["verdict"], path)
+    return path
+
+
+#: Pairing window for photodiode edges after mapping. Wider than the burst's:
+#: Blackrock's .ns2 is filtered and 1 kHz, so its copy sits a few ms late.
+PHOTODIODE_PAIRING_S = 0.02
+
+
+def _independent_checks(config: SessionConfig) -> list[dict[str, Any]]:
+    """Each behavioural channel recorded twice, compared after synchronization.
+
+    Needs the OneBox analog export on Blackrock time and ``blackrock.analog_file``
+    with its ``analog_channels``. These channels play no part in alignment --
+    not even in picking cycles, as the burst does -- so their agreement is the
+    most independent evidence there is. The photodiode is compared edge by edge;
+    every other channel by cross-correlation in windows across the session.
+
+    Judged on **drift**, not offset: Blackrock's 1 kHz stream is filtered before
+    it is stored, which delays it by a constant, so a constant offset is the
+    hardware and a changing one is a synchronization error.
+    """
+    from ._io import analog
+    from ._sync import compare
+
+    brk = config.blackrock
+    if brk.analog_file is None or not brk.analog_channels:
+        return []
+
+    def unmeasured(note: str) -> list[dict[str, Any]]:
+        return [{"channel": n, "status": "not measured", "note": note}
+                for n in brk.analog_channels]
+
+    try:
+        onebox = analog.load_onebox_analog(
+            analog.find_onebox_analog(config.paths.export_for("neuropixels"))
+        )
+    except (OSError, ValueError) as error:
+        return unmeasured(f"no OneBox analog export on Blackrock time: {error}")
+    try:
+        br = analog.open_blackrock_analog(
+            brk.analog_file, brk.analog_channels, gap_tolerance_ms=brk.gap_tolerance_ms,
+            tolerance_s=config.alignment_tolerance_s, by="position",
+        )
+    except (OSError, ValueError, IndexError) as error:
+        return unmeasured(f"could not read {brk.analog_file}: {error}")
+
+    tolerance_ms = config.alignment_tolerance_s * 1e3
+    checks = []
+    for name, position in brk.analog_channels.items():
+        stream = br.streams[name]
+        entry: dict[str, Any] = {
+            "channel": name,
+            "blackrock": f"{brk.analog_file.name} position {position} "
+                         f"(id {stream.channel_id}, {stream.channel_name}, {stream.fs:g} Hz)",
+        }
+        try:
+            if name == "photodiode":
+                obx_t, _ = analog.detect_onebox_events(onebox, name)
+                br_t, _ = analog.detect_blackrock_events(br, name)
+                comp = compare.compare_event_times(
+                    br_t, obx_t, onebox.slope, onebox.intercept,
+                    label=name, tolerance_s=PHOTODIODE_PAIRING_S,
+                )
+                stats = compare.offset_and_drift(comp.blackrock_s, comp.after_s)
+                entry["method"] = "rising edges"
+            else:
+                t, lag, _ = analog.measure_lags(onebox, br, name)
+                stats = compare.offset_and_drift(t, lag)
+                entry["method"] = "cross-correlation in windows"
+        except (OSError, ValueError) as error:
+            entry.update(status="not measured", note=str(error))
+            checks.append(entry)
+            continue
+        entry.update(stats)
+        entry["status"] = "consistent" if abs(stats["drift_ms"]) <= tolerance_ms else "DRIFT"
+        checks.append(entry)
+    return checks
 
 
 # ----------------------------------------------------------------------------
@@ -1984,7 +2193,17 @@ def _resolve_spike_seconds(
             aligned.size, phy.spike_samples.size,
         )
     elif system == "blackrock":
-        time_map = read_nsp_time_map(results_dir)
+        spike_file = config.blackrock.spike_file
+        time_map = read_nsp_time_map(results_dir, spike_file)
+        if time_map is None and spike_file is not None:
+            # Missing, or measured from the wrong file: measure the right one.
+            try:
+                time_map = write_nsp_time_map(config, results_dir, spike_file)
+            except Exception as error:
+                log.warning(
+                    "could not measure the NSP clock for %s (%s: %s)",
+                    spike_file, type(error).__name__, error,
+                )
         if time_map is not None:
             log.info("NSP clock: %s", time_map.summary())
             return time_map.apply(phy.spike_samples), "nsp", time_map
@@ -2415,9 +2634,9 @@ def export_results(
     log.info("timebase: %s", timebase)
 
     # One folder per stream holding only what an analysis copies away: the .mat
-    # files, units.csv, the figures and the manifest. Kilosort's arrays stay in
-    # the sorting folder above, and the time map is cross-system, so neither is
-    # duplicated here.
+    # files, units.csv, the figures, the manifest, and copies of the small
+    # records that explain them (_copy_records). Kilosort's arrays stay in the
+    # sorting folder above.
     out_dir = config.paths.export_for(system)
     table = final.build_unit_table(phy, unit_ids, spike_times_s)
     units_csv = final.export_unit_table(out_dir, table)
@@ -2445,6 +2664,7 @@ def export_results(
         config, system, out_dir, timebase, unit_ids, measured, phy.curated, time_map
     )
     paths = {"units": units_csv, "sorted_spikes": mat_path, "summary": summary}
+    paths.update(_copy_records(config, system, out_dir))
 
     if figures and unit_ids.size:
         figure_dir = config.paths.figures_for(system)

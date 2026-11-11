@@ -54,6 +54,10 @@ blackrock:
   # ---------- edit for this session ----------
   spike_file: null   # no Utah array in this session -- sync only
   sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"    # the two sync channels
+  # Blackrock's copy of the OneBox behaviour channels, 1 kHz: compared after
+  # synchronization as an independent check -- see "OneBox analog".
+  analog_file: "{blackrock_dir}/NSP-Athos_001.ns2"
+  analog_channels: {eye_x: 0, eye_y: 1, pupil: 2, photodiode: 3}   # positions in the file
   probe_file: null       # ...so no channel map is needed, or looked for.
                          # An array's .cmp goes here too -- see "Probes".
   # ...and no kilosort: block either: those settings describe how to sort an
@@ -229,6 +233,13 @@ kilosort: {}
 #   The samples are on the OneBox clock; Blackrock time is time_map.json's
 #   onebox_to_blackrock, stamped in once time_remapping has run. It is the
 #   chain the held-out burst travels, so validation.json is its check.
+#
+#   blackrock.analog_file/analog_channels name Blackrock's own copies (the
+#   .ns2, by 0-based position in the file, never by id). validate_remapping
+#   compares them with the OneBox's after synchronization and adds the result
+#   to export/sync_report.txt: photodiode by edges, the rest by
+#   cross-correlation. Judged on drift across the session -- a constant offset
+#   is Blackrock's filter delay on its 1 kHz stream. They warn, never fail.
 #   ~0.7 GB/hour at analog_decimate: 1 for twelve inputs; the stride has no
 #   anti-alias filter, so keep it where the photodiode edge still resolves.
 #

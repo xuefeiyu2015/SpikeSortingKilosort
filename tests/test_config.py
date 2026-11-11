@@ -276,8 +276,10 @@ def test_the_utah_only_template_differs_only_by_the_missing_probe():
     # where it would have gone anyway.
     assert utah.paths.aligned == utah.paths.sorted_for("blackrock")
 
-    # The array half is untouched.
-    assert utah.blackrock == one.blackrock
+    # The array half is untouched -- except the .ns2 behaviour channels, which
+    # exist only to be compared with a OneBox, and this session has none.
+    from dataclasses import replace
+    assert utah.blackrock == replace(one.blackrock, analog_file=None, analog_channels={})
     assert utah.sorts_blackrock is True
 
     stated = {
@@ -287,6 +289,7 @@ def test_the_utah_only_template_differs_only_by_the_missing_probe():
         "kilosort_on_neuropixels",
         "kilosort_by_system",
         "export_analog",      # the OneBox's inputs; no SpikeGLX run, no OneBox
+        "blackrock",          # compared above, less the .ns2 it has no use for
     }
     differing = [
         f
