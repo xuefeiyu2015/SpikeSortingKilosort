@@ -695,9 +695,33 @@ class OutputPaths:
                 paths += [self.sorted_for(system), self.export_for(system)]
         return tuple(dict.fromkeys(paths))
 
+    def require_dir(self, system: str) -> Path:
+        """That system's directory, which must already exist.
+
+        It holds the raw recording, so a directory that is not there is a wrong
+        path -- a typo, an unmounted share -- never a folder to create. Creating
+        it (``mkdir(parents=True)`` makes every missing level) used to build the
+        mistyped path on disk with an empty ``kilosort4/`` inside and carry on.
+        Everything the pipeline writes goes *inside* this directory, so checking
+        it here, before the first write, is enough.
+        """
+        directory = self._require(system)
+        if not directory.is_dir():
+            raise FileNotFoundError(
+                f"{system}_dir does not exist: {directory}\n"
+                "  It holds the recording, so it is never created -- check the path "
+                "in the session file (and that the share is mounted)."
+            )
+        return directory
+
     def mkdirs(self) -> None:
-        for path in self.all():
-            path.mkdir(parents=True, exist_ok=True)
+        """Create each system's output folders, inside its existing directory."""
+        for system in ("neuropixels", "blackrock"):
+            if self.dir_for(system) is None:
+                continue
+            self.require_dir(system)
+            for path in (self.sorted_for(system), self.export_for(system)):
+                path.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass(frozen=True)
@@ -961,6 +985,14 @@ class SessionConfig:
         raising, so callers can report every problem at once before a long job.
         """
         problems: list[str] = []
+
+        # Each system's own directory first: it is where the recording lives, so a
+        # wrong one is usually *the* mistake, and every file below it then fails
+        # too. Said once, plainly, rather than only as a list of missing files.
+        for system in ("neuropixels", "blackrock"):
+            directory = getattr(self, f"{system}_dir")
+            if self.has_data(system) and directory is not None and not directory.is_dir():
+                problems.append(f"{system}_dir does not exist: {directory}")
 
         # Gated on the data being *declared*, not on sorting being wanted: the
         # LFP and sync stages read the same files, so an unsortable session still

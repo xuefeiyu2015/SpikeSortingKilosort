@@ -138,10 +138,13 @@ def load(args: argparse.Namespace, require_inputs: bool = True) -> SessionConfig
         config = with_overrides(config, **overrides)
     config = _select_probes(config, getattr(args, "probe", None))
 
-    for _, probe_config in config.per_probe():
-        probe_config.paths.mkdirs()
+    # Check before creating anything: a mistyped directory must not be built on
+    # disk. mkdirs refuses one that does not exist even when the inputs are not
+    # required (the exporting driver), since every output goes inside it.
     if require_inputs:
         config.require_inputs()
+    for _, probe_config in config.per_probe():
+        probe_config.paths.mkdirs()
 
     print(f"session '{config.session}' on machine '{config.machine.name}'")
     if overrides:

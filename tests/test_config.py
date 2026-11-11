@@ -513,6 +513,7 @@ def test_output_paths_are_derived_from_each_systems_directory(tmp_path):
     paths = cfg.OutputPaths(tmp_path / "br", tmp_path / "np")
     assert paths.sync_for("blackrock").parent == tmp_path / "br"
     assert paths.aligned.parent == tmp_path / "br"
+    (tmp_path / "br").mkdir(), (tmp_path / "np").mkdir()   # the recordings' folders
     paths.mkdirs()
     assert all(p.exists() for p in paths.all())
 
@@ -520,6 +521,7 @@ def test_output_paths_are_derived_from_each_systems_directory(tmp_path):
 def test_only_the_reachable_directories_are_created(tmp_path):
     # A single-system session must not be asked for the other system's paths.
     paths = cfg.OutputPaths(neuropixels_dir=tmp_path / "np")
+    (tmp_path / "np").mkdir()
     paths.mkdirs()
 
     assert all(p.exists() for p in paths.all())
@@ -619,6 +621,7 @@ def test_two_sessions_pointed_at_one_directory_would_share_a_folder(tmp_path):
 
 def test_mkdirs_creates_both_systems_folders(tmp_path):
     paths = cfg.OutputPaths(tmp_path / "br", tmp_path / "np")
+    (tmp_path / "br").mkdir(), (tmp_path / "np").mkdir()
     paths.mkdirs()
 
     for system in ("neuropixels", "blackrock"):
@@ -948,7 +951,8 @@ def test_a_probe_file_that_exists_is_not_a_problem(tmp_path):
     probe.write_text("{}", encoding="utf-8")
     session = _flags(tmp_path, f"blackrock:\n  probe_file: '{probe}'\n")
 
-    assert not any("probe" in p for p in session.missing_inputs())
+    # Match the message, not a substring: tmp_path carries this test's name.
+    assert not any("probe_file does not exist" in p for p in session.missing_inputs())
 
 
 def test_naming_no_map_at_all_is_not_a_missing_input(tmp_path):
@@ -1561,3 +1565,26 @@ def test_analog_decimate_below_one_is_refused(tmp_path):
             tmp_path,
             "analog_decimate: 0\nneuropixels:\n  bin_file: '/a/run_g0_t0.imec0.ap.bin'\n",
         )
+
+
+def test_a_missing_system_directory_is_reported_and_never_created(tmp_path):
+    paths = cfg.OutputPaths(blackrock_dir=tmp_path / "br_typo", neuropixels_dir=tmp_path / "np")
+    (tmp_path / "np").mkdir()
+
+    with pytest.raises(FileNotFoundError, match="blackrock_dir does not exist"):
+        paths.mkdirs()
+    assert not (tmp_path / "br_typo").exists()
+
+    session = _flags(tmp_path, "")                      # np exists, br does not
+    problems = session.missing_inputs()
+    assert any(p.startswith("blackrock_dir does not exist") for p in problems)
+    assert not any(p.startswith("neuropixels_dir") for p in problems)
+
+
+def test_extraction_never_creates_the_recordings_folder(tmp_path):
+    from spikesorting._sync import extract
+
+    session = _flags(tmp_path, "")                       # neuropixels_dir: tmp/np, absent
+    with pytest.raises(FileNotFoundError, match="neuropixels_dir does not exist"):
+        extract.extract_neuropixels_edges(session)
+    assert not session.paths.dir_for("neuropixels").exists()

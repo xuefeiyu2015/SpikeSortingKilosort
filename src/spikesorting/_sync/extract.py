@@ -351,6 +351,7 @@ def extract_neuropixels_edges(
     and writes the canonical edge files.
     """
     report = ExtractionReport()
+    config.paths.require_dir("neuropixels")       # never create the recording's folder
     sync_dir = config.paths.sync_for("neuropixels")
     sync_dir.mkdir(parents=True, exist_ok=True)
 
@@ -460,9 +461,10 @@ def extract_blackrock_edges(
         report.note("Blackrock extraction skipped: no blackrock.sync_file configured.")
         return report
 
+    config.paths.require_dir("blackrock")         # never create the recording's folder
+    reader = blackrock.open_reader(spec.sync_file, gap_tolerance_ms=spec.gap_tolerance_ms)
     sync_dir = config.paths.sync_for("blackrock")
     sync_dir.mkdir(parents=True, exist_ok=True)
-    reader = blackrock.open_reader(spec.sync_file, gap_tolerance_ms=spec.gap_tolerance_ms)
 
     # Edge times go out on the NSP clock, the same axis the .nev markers and the
     # eye traces use -- so the fitted Neuropixels map lands there too, with

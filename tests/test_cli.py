@@ -9,6 +9,8 @@ being read directly by the loops.
 
 from __future__ import annotations
 
+import pytest
+
 import argparse
 
 from _cli import flag_overrides
@@ -56,6 +58,7 @@ def test_overrides_reach_the_loaded_session_without_touching_the_file(tmp_path):
         encoding="utf-8",
     )
     common = {"config": str(session), "machine": "mac", "probe": None}
+    (tmp_path / "np").mkdir()
 
     assert load(_args(**common), require_inputs=False).export_lfp is False
 
@@ -89,3 +92,21 @@ def test_each_stage_reports_how_long_it_took():
     assert _elapsed(0.42) == "0.4 s"
     assert _elapsed(252) == "4.2 min"
     assert _elapsed(5508) == "1.53 h"
+
+
+@pytest.mark.parametrize("require_inputs", [True, False])     # sorting / exporting driver
+def test_a_mistyped_directory_is_never_created(tmp_path, require_inputs):
+    # The bug: load() made <typo>/kilosort4/export with mkdir(parents=True) before
+    # anything checked the path, leaving a fake recording folder on disk.
+    from _cli import load
+
+    typo = tmp_path / "SGL_DATA" / "Athos_g1_typo"
+    session = tmp_path / "s.yaml"
+    session.write_text(
+        f"neuropixels_dir: '{typo}'\nneuropixels:\n  bin_file: '{{neuropixels_dir}}/x.ap.bin'\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(FileNotFoundError, match="neuropixels_dir does not exist"):
+        load(_args(config=str(session), machine="mac", probe=None),
+             require_inputs=require_inputs)
+    assert not (tmp_path / "SGL_DATA").exists()          # not even the parent

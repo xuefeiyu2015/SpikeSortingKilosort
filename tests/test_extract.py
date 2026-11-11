@@ -58,6 +58,10 @@ def make_session(tmp_path, bin_file, _name="synthetic", n_chan=385, fs=30000, **
     session_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     session = cfg.load_session_config(session_path, "test", tmp_path / "configs")
+    for system in ("neuropixels", "blackrock"):
+        directory = session.paths.dir_for(system)
+        if directory is not None:
+            directory.mkdir(parents=True, exist_ok=True)   # the recordings' folders
     session.paths.mkdirs()
     return session
 
