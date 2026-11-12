@@ -35,6 +35,9 @@ __all__ = [
     "display_stride",
     "display_envelope",
     "auto_threshold",
+    "EventLevels",
+    "event_levels",
+    "stream_event_onsets",
     "offset_and_drift",
     "xcorr_lag",
     "clipped_diff",
@@ -218,6 +221,132 @@ def auto_threshold(values: np.ndarray) -> float:
     """Midway between the 1st and 99th percentile: a two-level signal's crossing."""
     lo, hi = _level_range(np.asarray(values, dtype=np.float64))
     return (lo + hi) / 2.0
+
+
+@dataclass(frozen=True)
+class EventLevels:
+    """Where an event channel rests, where it goes on an event, and its noise.
+
+    An event is the signal *leaving* its baseline, in whichever direction that
+    is: a photodiode can rest high and dip when the target appears. Each system
+    gets its own levels, so a copy recorded inverted still yields the same
+    moments.
+    """
+
+    baseline: float
+    active: float
+    noise: float
+
+    @property
+    def polarity(self) -> int:
+        """+1 when an event goes up from the baseline, -1 when it goes down."""
+        return 1 if self.active >= self.baseline else -1
+
+    @property
+    def amplitude(self) -> float:
+        return abs(self.active - self.baseline)
+
+    def summary(self) -> str:
+        return (f"baseline {self.baseline:.3g}, events go "
+                f"{'up' if self.polarity > 0 else 'down'} to {self.active:.3g} "
+                f"(noise {self.noise:.2g})")
+
+
+#: Hysteresis: an event starts past this fraction of the way to ``active``...
+ENTER_FRACTION = 0.6
+#: ...and ends only back below this one, so noise at one level cannot chatter.
+LEAVE_FRACTION = 0.4
+
+
+def event_levels(samples: np.ndarray, min_snr: float = 8.0) -> EventLevels:
+    """Baseline, event level and noise of a two-level channel, from samples of it.
+
+    ``samples`` should span the recording (excerpts are fine), not its first
+    minutes: a photodiode that sits still until the task starts has only noise
+    there, and a threshold set from noise detects noise.
+
+    The noise comes from sample-to-sample differences, which a level change
+    barely touches whatever the duty cycle. Samples more than ``min_snr`` noise
+    widths from the median are departures; the side with more of them is where
+    events go, so a flash lit 0.2% of the time is still seen (percentiles would
+    put both levels on the baseline). The two levels are then the medians either
+    side of the midpoint, and the baseline is the one the signal spends more
+    time at. Raises when nothing departs: there are no events to find.
+    """
+    x = np.asarray(samples, dtype=np.float64).ravel()
+    if x.size < 2:
+        raise ValueError("no samples to set event levels from")
+    noise = float(1.4826 * np.median(np.abs(np.diff(x))) / np.sqrt(2.0))
+    centre = float(np.median(x))
+    far = x[np.abs(x - centre) > min_snr * noise]
+    if far.size == 0 or np.ptp(x) == 0:
+        raise ValueError(
+            f"the signal never leaves its baseline ({centre:.3g}, range {np.ptp(x):.2g}, "
+            f"noise {noise:.2g}): no events to detect"
+        )
+    up = far > centre
+    side = far[up] if np.count_nonzero(up) >= np.count_nonzero(~up) else far[~up]
+    midpoint = (centre + float(np.median(side))) / 2.0
+    above = x >= midpoint
+    high, low = float(np.median(x[above])), float(np.median(x[~above]))
+    baseline, active = (low, high) if np.count_nonzero(~above) >= np.count_nonzero(above) \
+        else (high, low)
+    return EventLevels(baseline, active, noise)
+
+
+def stream_event_onsets(
+    chunks,
+    levels: EventLevels,
+    fs: float,
+    min_gap_s: float = 0.05,
+    max_rate_hz: float = 20.0,
+) -> np.ndarray:
+    """Seconds at which the signal leaves its baseline, over ``(start, samples)`` chunks.
+
+    Hysteresis between ``ENTER_FRACTION`` and ``LEAVE_FRACTION`` of the way to
+    the event level; an event that follows the previous one's end by less than
+    ``min_gap_s`` is the same event (a monitor's refresh flicker inside one
+    flash), and is merged into it. More than ``max_rate_hz`` events a second is
+    not a photodiode, and raises rather than vote with noise.
+    """
+    sign = levels.polarity
+    enter = ENTER_FRACTION * levels.amplitude
+    leave = LEAVE_FRACTION * levels.amplitude
+    onsets, offsets = [], []
+    state: bool | None = None
+    n_total = 0
+    for start, block in chunks:
+        s = (np.asarray(block, dtype=np.float64) - levels.baseline) * sign
+        if s.size == 0:
+            continue
+        n_total = start + s.size
+        code = np.zeros(s.size, dtype=np.int8)
+        code[s >= enter] = 1
+        code[s <= leave] = -1
+        if state is None:                        # the recording's first sample
+            state = bool(s[0] >= (enter + leave) / 2)
+        # Forward-fill: between the two levels the signal keeps its last state.
+        last = np.where(code != 0, np.arange(s.size), -1)
+        np.maximum.accumulate(last, out=last)
+        now = np.where(last >= 0, code[np.maximum(last, 0)] > 0, state)
+        before = np.concatenate([[state], now[:-1]])
+        onsets.append(np.flatnonzero(now & ~before) + start)
+        offsets.append(np.flatnonzero(~now & before) + start)
+        state = bool(now[-1])
+    on = np.concatenate(onsets) if onsets else np.empty(0, dtype=np.int64)
+    off = np.concatenate(offsets) if offsets else np.empty(0, dtype=np.int64)
+    if on.size:
+        # The end of the event before each onset; keep onsets after a real gap.
+        prev = np.searchsorted(off, on) - 1
+        gap = np.where(prev >= 0, on - off[np.maximum(prev, 0)], np.iinfo(np.int64).max)
+        on = on[gap >= min_gap_s * fs]
+    duration_s = n_total / fs if fs else 0.0
+    if duration_s and on.size / duration_s > max_rate_hz:
+        raise ValueError(
+            f"{on.size} events in {duration_s:.0f} s ({on.size / duration_s:.0f}/s): "
+            f"noise crossing the threshold, not events ({levels.summary()})"
+        )
+    return on / fs
 
 
 def offset_and_drift(times_s: np.ndarray, residuals_s: np.ndarray) -> dict[str, float]:

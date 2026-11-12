@@ -142,3 +142,80 @@ def test_window_traces_put_the_onebox_on_blackrock_time_and_plot(tmp_path):
         assert fig.axes
     with h5py.File(path, "r") as handle:                   # samples untouched
         assert handle["analog/data"].shape == (n, 2)
+
+
+# --- event onsets: leaving the baseline, whichever way --------------------------
+
+FS = 1000.0
+
+
+def _photodiode(onsets_s, dur_s=0.2, total_s=60.0, rest=4.0, lit=1.0, noise=0.02, seed=0):
+    """A photodiode resting at ``rest`` that goes to ``lit`` while the target shows."""
+    rng = np.random.default_rng(seed)
+    x = np.full(int(total_s * FS), rest) + rng.normal(0, noise, int(total_s * FS))
+    for t in onsets_s:
+        x[int(t * FS):int((t + dur_s) * FS)] += lit - rest
+    return x
+
+
+def _chunks(x, size=7_919):                         # a prime: edges land on boundaries
+    return ((k, x[k:k + size]) for k in range(0, x.size, size))
+
+
+def _onsets(x, **kw):
+    levels = compare.event_levels(x)
+    return compare.stream_event_onsets(_chunks(x), levels, FS, **kw), levels
+
+
+ONSETS = [5.0, 9.3, 17.25, 30.0, 41.7, 55.5]
+
+
+def test_a_photodiode_that_dips_gives_the_moment_the_target_appears():
+    times, levels = _onsets(_photodiode(ONSETS, rest=4.0, lit=1.0))
+    assert levels.polarity == -1
+    assert times == pytest.approx(ONSETS, abs=2e-3)
+
+
+def test_an_inverted_copy_gives_the_same_onsets():
+    # Each system gets its own levels, so a copy recorded the other way up
+    # still pairs with the first instead of being off by every flash's length.
+    up, _ = _onsets(_photodiode(ONSETS, rest=0.0, lit=3.0, seed=1))
+    down, _ = _onsets(_photodiode(ONSETS, rest=4.0, lit=1.0, seed=2))
+    assert up == pytest.approx(down, abs=2e-3)
+
+
+def test_levels_come_from_the_whole_session_not_its_first_minutes():
+    # Nothing on screen for the first 5 minutes: the old threshold, set from
+    # them, sat in the noise and found ~44 M "edges" on the rig.
+    late = [320.0, 333.3, 351.0, 380.2]
+    times, _ = _onsets(_photodiode(late, total_s=400.0))
+    assert times == pytest.approx(late, abs=2e-3)
+
+
+def test_noise_on_a_slow_edge_counts_once():
+    x = _photodiode([], total_s=10.0, rest=0.0, noise=0.0)
+    ramp = np.linspace(0.0, 1.0, 200)                # a slow 200 ms rise...
+    x[2000:2200] = ramp + 0.08 * np.sin(np.arange(200) * 2.5)   # ...with ripple on it
+    x[2200:4000] = 1.0
+    times, _ = _onsets(x)
+    assert times.size == 1
+
+
+def test_monitor_flicker_inside_one_flash_is_one_event():
+    x = _photodiode([2.0], dur_s=0.5, total_s=10.0, rest=0.0, lit=1.0, noise=0.0)
+    x[2000:2500][(np.arange(500) % 8) < 2] = 0.0      # 125 Hz refresh dropouts
+    times, _ = _onsets(x)
+    assert times == pytest.approx([2.0], abs=2e-3)
+
+
+def test_a_channel_with_no_events_says_so():
+    rng = np.random.default_rng(3)
+    with pytest.raises(ValueError, match="never leaves its baseline"):
+        compare.event_levels(rng.normal(2.0, 0.05, 60_000))
+
+
+def test_noise_crossing_a_threshold_is_refused_not_counted():
+    x = np.tile([0.0] * 3 + [1.0] * 3, 20_000).astype(float)   # 167 "events" a second
+    levels = compare.event_levels(x)
+    with pytest.raises(ValueError, match="not events"):
+        compare.stream_event_onsets(_chunks(x), levels, FS, min_gap_s=0.0)

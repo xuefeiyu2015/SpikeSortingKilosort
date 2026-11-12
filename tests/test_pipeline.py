@@ -2029,7 +2029,10 @@ def test_the_sync_report_says_not_validated_without_bursts(tmp_path):
     (session.paths.sync_for("neuropixels") / "npx_burst.txt").write_text("")
     ss.time_remapping(session, "neuropixels")
 
-    assert ss.validate_remapping(session, figures=False) is None
+    result = ss.validate_remapping(session, figures=False)
+    # It ran and wrote the report: the runner must not call that "nothing to do".
+    assert result is not None and "NOT VALIDATED" in result.summary()
+    assert result.report_path.name == "sync_report.json"
     sync = json.loads(
         (session.paths.export_for("neuropixels") / "sync_report.json").read_text()
     )

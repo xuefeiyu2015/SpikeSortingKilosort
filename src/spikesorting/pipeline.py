@@ -2127,6 +2127,18 @@ def _clock_definitions(config: SessionConfig) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class Unvalidated:
+    """``validate_remapping`` ran, wrote the sync report, and had nothing held out."""
+
+    report_path: Path | None
+    reason: str
+
+    def summary(self) -> str:
+        where = f"; sync report at {self.report_path}" if self.report_path else ""
+        return f"NOT VALIDATED ({self.reason}){where}"
+
+
 def validate_remapping(
     config: SessionConfig, figures: bool = True
 ) -> Any | None:
@@ -2141,9 +2153,10 @@ def validate_remapping(
     whether that happened (``burst_clock``); when it did not, the residuals
     include the OneBox-to-probe drift as well as the alignment's error.
 
-    Returns ``None`` when only one system is declared, no map has been fitted, or
-    neither system recorded bursts -- in which case the 1 Hz fit residuals in
-    ``time_map.json`` are the only quality measure, and they are not held-out.
+    Returns ``None`` when only one system is declared or no map has been fitted.
+    With no burst on one side it still writes the sync report and returns an
+    :class:`Unvalidated` saying so -- the 1 Hz fit residuals in ``time_map.json``
+    are then the only quality measure, and they are not held-out.
     """
     from ._plots import summary as plots
 
@@ -2166,8 +2179,8 @@ def validate_remapping(
             "independently validated. The 1 Hz fit residuals in time_map.json are the "
             "only available quality measure, and they are not held-out data."
         )
-        _write_sync_report(config, None)
-        return None
+        return Unvalidated(_write_sync_report(config, None),
+                           "no 14 s burst on one or both systems")
 
     with open(map_path, "r", encoding="utf-8") as handle:
         payload = json.load(handle)
@@ -2321,7 +2334,7 @@ def _independent_checks(config: SessionConfig) -> list[dict[str, Any]]:
                     label=name, tolerance_s=PHOTODIODE_PAIRING_S,
                 )
                 stats = compare.offset_and_drift(comp.blackrock_s, comp.after_s)
-                entry["method"] = "rising edges"
+                entry["method"] = "event onsets (leaving baseline)"
             else:
                 t, lag, _ = analog.measure_lags(onebox, br, name)
                 stats = compare.offset_and_drift(t, lag)

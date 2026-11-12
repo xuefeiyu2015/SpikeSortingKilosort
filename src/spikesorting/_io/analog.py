@@ -237,37 +237,59 @@ def get_recording_overlap(
     return start, stop
 
 
-def detect_onebox_events(
-    onebox: OneBoxAnalog, name: str, threshold: float | None = None, probe_s: float = 300.0
-) -> tuple[np.ndarray, float]:
-    """Rising edges of one OneBox channel in OneBox seconds, and the threshold used.
+#: Excerpts spread over the recording that set an event channel's levels.
+LEVEL_EXCERPTS = 100
+LEVEL_EXCERPT_S = 3.0
 
-    With no threshold, it is set midway between the 1st and 99th percentile of
-    the first ``probe_s`` seconds -- fine for a two-level signal like a
-    photodiode, provided it changes in that stretch.
+
+def _level_samples(read, n_samples: int, fs: float) -> np.ndarray:
+    """Short excerpts spread evenly over the whole recording, concatenated.
+
+    Levels from the first minutes alone fail whenever the signal sits still
+    before the task starts; reading every sample twice costs a whole pass. A
+    hundred 3 s excerpts see the whole session for ~5 min of samples.
     """
-    from .._sync import edges
+    width = int(LEVEL_EXCERPT_S * fs)
+    if n_samples <= LEVEL_EXCERPTS * width:
+        return read(0, n_samples)
+    starts = np.linspace(0, n_samples - width, LEVEL_EXCERPTS).astype(np.int64)
+    return np.concatenate([read(int(k), int(k) + width) for k in starts])
 
-    if threshold is None:
-        k1 = min(onebox.n_samples, int(probe_s * onebox.fs))
-        threshold = compare.auto_threshold(read_onebox(onebox, name, 0, k1))
-    return edges.stream_pulse_times(iter_onebox(onebox, name), threshold, onebox.fs), threshold
+
+def detect_onebox_events(
+    onebox: OneBoxAnalog, name: str, levels: compare.EventLevels | None = None,
+    min_gap_s: float = 0.05,
+) -> tuple[np.ndarray, compare.EventLevels]:
+    """Event onsets of one OneBox channel in OneBox seconds, and the levels used.
+
+    An onset is the signal leaving its baseline, up or down (a photodiode may
+    rest high and dip for the target) -- see :func:`compare.stream_event_onsets`.
+    """
+    if levels is None:
+        levels = compare.event_levels(_level_samples(
+            lambda k0, k1: read_onebox(onebox, name, k0, k1), onebox.n_samples, onebox.fs))
+    onsets = compare.stream_event_onsets(iter_onebox(onebox, name), levels, onebox.fs,
+                                         min_gap_s=min_gap_s)
+    return onsets, levels
 
 
 def detect_blackrock_events(
-    br: BlackrockAnalog, name: str, threshold: float | None = None, probe_s: float = 300.0
-) -> tuple[np.ndarray, float]:
-    """Rising edges of one Blackrock channel on the NSP clock, and the threshold used."""
-    from .._sync import edges
+    br: BlackrockAnalog, name: str, levels: compare.EventLevels | None = None,
+    min_gap_s: float = 0.05,
+) -> tuple[np.ndarray, compare.EventLevels]:
+    """Event onsets of one Blackrock channel on the NSP clock, and the levels used.
 
+    Levels are this copy's own, so one recorded inverted still gives onsets.
+    """
     stream = br.streams[name]
-    if threshold is None:
-        s1 = min(stream.n_samples, int(probe_s * stream.fs))
-        threshold = compare.auto_threshold(read_blackrock(br, name, 0, s1))
-    seconds = edges.stream_pulse_times(iter_blackrock(br, name), threshold, stream.fs)
+    if levels is None:
+        levels = compare.event_levels(_level_samples(
+            lambda s0, s1: read_blackrock(br, name, s0, s1), stream.n_samples, stream.fs))
+    seconds = compare.stream_event_onsets(iter_blackrock(br, name), levels, stream.fs,
+                                          min_gap_s=min_gap_s)
     # Detection counts at the nominal rate; the NSP map supplies the real one.
     samples = np.rint(seconds * stream.fs).astype(np.int64)
-    return br.time_map.apply(samples), threshold
+    return br.time_map.apply(samples), levels
 
 
 def source_for(

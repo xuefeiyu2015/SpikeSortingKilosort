@@ -192,7 +192,7 @@ def test_a_constant_filter_delay_reads_as_offset_and_passes(tmp_path, monkeypatc
 
     pd, eye = checks["photodiode"], checks["eye_x"]
     assert pd["status"] == eye["status"] == "consistent"
-    assert pd["method"] == "rising edges" and eye["method"].startswith("cross-corr")
+    assert pd["method"].startswith("event onsets") and eye["method"].startswith("cross-corr")
     # OneBox minus Blackrock: Blackrock is late, so negative. The photodiode adds
     # up to one 1 kHz sample of rounding to Blackrock's edges.
     assert -3.1 < pd["median_offset_ms"] < -1.9
