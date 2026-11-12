@@ -1,7 +1,8 @@
 """How well the OneBox and Blackrock agree, before and after synchronization.
 
 Pure: arrays in, arrays out. The readers that produce the arrays live in
-``_io/analog.py`` and the figures in ``_plots/sync.py``.
+``_io/analog.py``. Only what the pipeline itself runs lives here; the
+notebook's figures and window slicing are written out in the notebook.
 
 **"Before" is what you would have without the fitted map**: OneBox seconds
 (``sample / obSampRate``) plus *one* constant offset, chosen so the first few
@@ -27,14 +28,8 @@ from .burst import match_times
 __all__ = [
     "SyncComparison",
     "compare_event_times",
-    "summarize_asynchrony",
-    "largest_asynchrony",
     "onebox_sample_range",
     "blackrock_sample_range",
-    "normalize_trace",
-    "display_stride",
-    "display_envelope",
-    "auto_threshold",
     "EventLevels",
     "event_levels",
     "stream_event_onsets",
@@ -111,27 +106,6 @@ def compare_event_times(
     )
 
 
-def summarize_asynchrony(comparison: SyncComparison) -> dict[str, float]:
-    """Median, 99th percentile and maximum of |error|, before and after, in ms."""
-    out: dict[str, float] = {"n_pairs": float(comparison.n_pairs)}
-    for which in ("before", "after"):
-        err = np.abs(getattr(comparison, f"{which}_s")) * 1e3
-        out[f"{which}_median_ms"] = float(np.median(err))
-        out[f"{which}_p99_ms"] = float(np.percentile(err, 99))
-        out[f"{which}_max_ms"] = float(err.max())
-    out["improvement_x"] = (
-        out["before_max_ms"] / out["after_max_ms"] if out["after_max_ms"] > 0 else np.inf
-    )
-    return out
-
-
-def largest_asynchrony(comparison: SyncComparison, which: str = "after") -> int:
-    """Index of the pair with the largest |error|, ``before`` or ``after`` sync."""
-    if which not in ("before", "after"):
-        raise ValueError(f"which must be 'before' or 'after', got {which!r}")
-    return int(np.argmax(np.abs(getattr(comparison, f"{which}_s"))))
-
-
 def onebox_sample_range(
     t0_s: float, t1_s: float, fs: float, slope: float, intercept: float, n_samples: int
 ) -> tuple[int, int]:
@@ -162,65 +136,6 @@ def blackrock_sample_range(
             return max(s0, first), min(max(s1, first), first + n)
     first, n, _, _ = segments[-1]
     return first + n, first + n
-
-
-def normalize_trace(values: np.ndarray) -> np.ndarray:
-    """Scale to 0..1 between the 1st and 99th percentile, for overlaying two systems.
-
-    The two systems record the same wire with different gains and units, so
-    shape and timing are what can be compared, not amplitude.
-    """
-    values = np.asarray(values, dtype=np.float64)
-    if values.size == 0:
-        return values
-    lo, hi = _level_range(values)
-    span = hi - lo
-    return (values - lo) / span if span > 0 else values - lo
-
-
-def _level_range(values: np.ndarray) -> tuple[float, float]:
-    """The 1st..99th percentile, or min..max when that range is empty.
-
-    A sparse pulse train -- the burst is high ~0.3% of the time -- has both
-    percentiles at the baseline, which would leave it unscaled and put a
-    threshold on the floor. Min..max is what still sees the pulses.
-    """
-    lo, hi = np.percentile(values, [1, 99])
-    if hi <= lo:
-        lo, hi = float(values.min()), float(values.max())
-    return float(lo), float(hi)
-
-
-def display_stride(n_samples: int, max_points: int) -> int:
-    """Stride that keeps a trace under ``max_points`` for drawing. Never below 1."""
-    return max(1, int(np.ceil(n_samples / max(max_points, 1))))
-
-
-def display_envelope(
-    times: np.ndarray, values: np.ndarray, max_points: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Min and max of each block, interleaved, so a long window draws in few points.
-
-    A plain stride drops anything narrower than the stride -- a 10 ms burst
-    pulse vanishes from a 5-minute window. The envelope keeps every excursion.
-    Short windows come back unchanged.
-    """
-    times = np.asarray(times)
-    values = np.asarray(values)
-    step = display_stride(values.size, max(max_points // 2, 1))
-    if step == 1:
-        return times, values
-    n = values.size // step * step
-    blocks = values[:n].reshape(-1, step)
-    lo, hi = blocks.min(axis=1), blocks.max(axis=1)
-    t = times[:n:step]
-    return np.repeat(t, 2), np.column_stack([lo, hi]).ravel()
-
-
-def auto_threshold(values: np.ndarray) -> float:
-    """Midway between the 1st and 99th percentile: a two-level signal's crossing."""
-    lo, hi = _level_range(np.asarray(values, dtype=np.float64))
-    return (lo + hi) / 2.0
 
 
 @dataclass(frozen=True)

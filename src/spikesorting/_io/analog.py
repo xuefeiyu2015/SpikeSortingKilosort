@@ -5,14 +5,13 @@ stamped with ``onebox_to_blackrock``. The Blackrock side is read straight from
 the ``.nsX`` with its own NSP time map, so both land on NSP seconds -- the axis
 the ``.nev`` markers use.
 
-Reading only; the comparisons are in ``_sync/compare.py`` and the figures in
-``_plots/sync.py``. ``h5py`` and ``neo`` are imported inside the functions, as
+Reading only; the comparisons are in ``_sync/compare.py``. ``h5py`` and ``neo`` are imported inside the functions, as
 everywhere else in this package.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -23,7 +22,6 @@ from .._sync import compare
 __all__ = [
     "OneBoxAnalog",
     "BlackrockAnalog",
-    "WindowTrace",
     "find_onebox_analog",
     "load_onebox_analog",
     "read_onebox",
@@ -35,9 +33,7 @@ __all__ = [
     "get_recording_overlap",
     "detect_onebox_events",
     "detect_blackrock_events",
-    "get_window_traces",
     "measure_lags",
-    "source_for",
 ]
 
 
@@ -77,22 +73,6 @@ class BlackrockAnalog:
             (s.first_sample, s.n_samples, s.slope, s.intercept)
             for s in self.time_map.segments
         ]
-
-
-@dataclass
-class WindowTrace:
-    """One channel over one window, both systems on Blackrock time, ready to draw.
-
-    Normalized to 0..1 (the two systems' units differ) and strided for display;
-    ``None`` on the side that does not record this channel.
-    """
-
-    name: str
-    t_blackrock: np.ndarray | None = None
-    y_blackrock: np.ndarray | None = None
-    t_onebox: np.ndarray | None = None
-    y_onebox: np.ndarray | None = None
-    extra: dict[str, Any] = field(default_factory=dict)
 
 
 def find_onebox_analog(export_dir: str | Path) -> Path:
@@ -290,58 +270,6 @@ def detect_blackrock_events(
     # Detection counts at the nominal rate; the NSP map supplies the real one.
     samples = np.rint(seconds * stream.fs).astype(np.int64)
     return br.time_map.apply(samples), levels
-
-
-def source_for(
-    blackrock: BlackrockAnalog | list[BlackrockAnalog] | None, name: str
-) -> BlackrockAnalog | None:
-    """The Blackrock file that records ``name``, among one or several."""
-    sources = blackrock if isinstance(blackrock, list) else [blackrock]
-    return next((b for b in sources if b is not None and name in b.streams), None)
-
-
-def get_window_traces(
-    onebox: OneBoxAnalog,
-    blackrock: BlackrockAnalog | list[BlackrockAnalog] | None,
-    t0_s: float,
-    t1_s: float,
-    names: list[str] | None = None,
-    max_points: int = 20_000,
-    onebox_offset_s: float | None = None,
-) -> list[WindowTrace]:
-    """Every channel over ``[t0_s, t1_s)`` of Blackrock time, ready to overlay.
-
-    ``onebox_offset_s`` puts the OneBox on the *unsynchronized* axis instead --
-    ``k / fs + offset`` -- for drawing what the recording looks like before the
-    map is applied.
-    """
-    names = list(names) if names is not None else list(onebox.names)
-    traces = []
-    for name in names:
-        trace = WindowTrace(name=name)
-        if name in onebox.index:
-            if onebox_offset_s is None:
-                k0, k1 = compare.onebox_sample_range(
-                    t0_s, t1_s, onebox.fs, onebox.slope, onebox.intercept, onebox.n_samples
-                )
-                t = onebox.blackrock_time(k0, k1)
-            else:
-                k0 = max(int(np.floor((t0_s - onebox_offset_s) * onebox.fs)), 0)
-                k1 = min(max(int(np.ceil((t1_s - onebox_offset_s) * onebox.fs)), 0), onebox.n_samples)
-                t = np.arange(k0, k1) / onebox.fs + onebox_offset_s
-            trace.t_onebox, trace.y_onebox = compare.display_envelope(
-                t, compare.normalize_trace(read_onebox(onebox, name, k0, k1)), max_points
-            )
-        source = source_for(blackrock, name)
-        if source is not None:
-            s0, s1 = compare.blackrock_sample_range(t0_s, t1_s, source.segments)
-            trace.t_blackrock, trace.y_blackrock = compare.display_envelope(
-                source.time_map.apply(np.arange(s0, s1)),
-                compare.normalize_trace(read_blackrock(source, name, s0, s1)),
-                max_points,
-            )
-        traces.append(trace)
-    return traces
 
 
 def measure_lags(
