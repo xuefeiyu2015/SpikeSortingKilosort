@@ -890,7 +890,11 @@ def _fake_kilosort(monkeypatch, seen: list[dict]):
         # The whitened copy of the recording: written beside the results, the size
         # of the input, and not a result. It must not be published.
         (results / "temp_wh.dat").write_bytes(b"\x00" * 64)
-        return {"ops": True}, spike_times, clusters, None, None, None, None, None, None
+        # Kilosort4 returns its spike array before duplicate removal, a row per
+        # spike and three columns: 13 x 3 here, for 12 spikes saved.
+        st = np.column_stack([np.arange(13), np.zeros(13), np.ones(13)])
+        clu = np.append(clusters, 3)
+        return {"ops": True}, st, clu, None, None, None, None, None, None
 
     module = types.ModuleType("kilosort.run_kilosort")
     module.DEFAULT_SETTINGS = {
@@ -2123,3 +2127,25 @@ def test_a_long_read_reports_its_progress(caplog):
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("waveforms:")]
     assert len(lines) == 9                       # 10% .. 90%; the stage's own line ends it
     assert "50% of 100 reads" in lines[4] and "left" in lines[4]
+
+
+def test_an_old_run_info_spike_count_is_corrected_from_the_sorting(tmp_path):
+    from spikesorting import pipeline
+
+    np.save(tmp_path / "spike_times.npy", np.arange(10))
+    (tmp_path / "run_info.json").write_text(json.dumps({"n_spikes": 30}), encoding="utf-8")
+    info = pipeline._corrected_run_info(tmp_path)
+    assert info["n_spikes"] == 10 and info["n_spikes_recorded"] == 30
+    assert json.loads((tmp_path / "run_info.json").read_text())["n_spikes"] == 10
+
+
+def test_the_waveform_record_names_catgt_then_kilosort(tmp_path):
+    from spikesorting import pipeline
+
+    ks = {"highpass_cutoff": 300.0, "do_CAR": False, "invert_sign": False}
+    chain = pipeline._waveform_chain(
+        {"preprocessing": {"engine": "catgt", "steps": ["CatGT -gblcar"]}}, tmp_path / "x.bin", ks)
+    assert chain["input_preprocessed_by"] == "catgt"
+    assert chain["summary"].startswith("catgt, then kilosort reader: 300 Hz")
+    raw = pipeline._waveform_chain({}, tmp_path / "x.bin", ks)
+    assert raw["input_preprocessed_by"].startswith("none")

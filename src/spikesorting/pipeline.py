@@ -861,7 +861,7 @@ def sort_with_kilosort(
     result = SortSummary(
         results_dir=final_dir,
         n_units=int(np.unique(clusters).size),
-        n_spikes=int(np.asarray(spike_times).size),
+        n_spikes=_saved_spike_count(final_dir),
         fs=binary.fs,
         binary=binary.path,
         settings=settings,
@@ -1280,11 +1280,7 @@ def _write_summary(
     time map its spike times are on.
     """
     results_dir = config.paths.sorted_for(system)
-    run_info_path = results_dir / "run_info.json"
-    run_info = {}
-    if run_info_path.exists():
-        with open(run_info_path, "r", encoding="utf-8") as handle:
-            run_info = json.load(handle)
+    run_info = _corrected_run_info(results_dir)
 
     aligned_dir = config.paths.aligned
     payload = {
@@ -1304,7 +1300,7 @@ def _write_summary(
                 "n_dropped": measured["n_dropped"],
                 "snippets_kept": measured["snippets_kept"],
                 "units": measured.get("mean_units"),
-                "preprocessing": {"by": "kilosort", **measured.get("preprocessing", {})},
+                "preprocessing": measured.get("chain", {}),
                 "timebase": measured.get("timebase"),
             }
             if measured
@@ -1323,6 +1319,67 @@ def _write_summary(
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, default=str)
     return path
+
+
+def _saved_spike_count(results_dir: Path) -> int:
+    """Spikes in the sorting as saved: rows of ``spike_times.npy``.
+
+    Not Kilosort's returned array, which has a row per spike *before* duplicate
+    removal and three columns (time, template, amplitude) -- counting its
+    entries once reported 32.5 M spikes for a 10.8 M-spike sort.
+    """
+    return int(np.load(Path(results_dir) / "spike_times.npy", mmap_mode="r").shape[0])
+
+
+def _corrected_run_info(results_dir: Path) -> dict[str, Any]:
+    """``run_info.json``, with ``n_spikes`` recounted from the saved sorting.
+
+    A record written before the count was fixed is corrected on disk, keeping
+    the old number as ``n_spikes_recorded``, so the copy in ``export/`` and the
+    manifest agree with the arrays beside them.
+    """
+    path = Path(results_dir) / "run_info.json"
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as handle:
+        run_info = json.load(handle)
+    if not (Path(results_dir) / "spike_times.npy").exists():
+        return run_info
+    count = _saved_spike_count(results_dir)
+    if run_info.get("n_spikes") != count:
+        log.info("run_info.json: n_spikes %s -> %d, recounted from spike_times.npy",
+                 run_info.get("n_spikes"), count)
+        run_info["n_spikes_recorded"] = run_info.get("n_spikes")
+        run_info["n_spikes"] = count
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(run_info, handle, indent=2, default=str)
+    return run_info
+
+
+def _waveform_chain(
+    run_info: dict[str, Any], binary: Path, kilosort: dict[str, Any]
+) -> dict[str, Any]:
+    """Everything the waveform signal went through, in order.
+
+    Two stages: whatever made the binary Kilosort sorted (CatGT or SpikeInterface,
+    as its ``preprocess.json`` recorded -- or nothing, the raw recording), then
+    Kilosort's reader, which this export cuts through.
+    """
+    record = run_info.get("preprocessing") or {}
+    engine = record.get("engine") or "none (the raw recording)"
+    reader = (
+        f"kilosort reader: {kilosort['highpass_cutoff']:g} Hz FFT high-pass, "
+        f"CAR {'on' if kilosort['do_CAR'] else 'off'}, whitening undone, "
+        "no drift correction"
+    )
+    return {
+        "summary": f"{engine}, then {reader}",
+        "input": str(binary),
+        "input_preprocessed_by": engine,
+        "input_steps": record.get("steps"),
+        "then": reader,
+        **kilosort,
+    }
 
 
 def _write_run_info(
@@ -2689,6 +2746,7 @@ def export_waveforms(
         )
         return None
     preprocessing = _kilosort_preprocessing(results_dir)
+    chain = _waveform_chain(run_info, binary, preprocessing)
 
     phy = load_phy_results(results_dir)
     unit_ids = select_units(phy)
@@ -2789,7 +2847,10 @@ def export_waveforms(
                 "max_spikes_per_unit": (
                     float(wf.max_spikes) if wf.max_spikes is not None else np.nan
                 ),
-                "preprocessing": "kilosort",
+                # What the signal went through: the sorted binary's own
+                # preprocessing (CatGT, SpikeInterface or none), then Kilosort's
+                # reader on top of it.
+                "preprocessing": chain["summary"],
                 "highpass_cutoff_hz": preprocessing["highpass_cutoff"],
                 "do_CAR": float(preprocessing["do_CAR"]),
                 "invert_sign": float(preprocessing["invert_sign"]),
@@ -2829,6 +2890,7 @@ def export_waveforms(
         "samples_before": int(before),
         "fs": fs,
         "preprocessing": preprocessing,
+        "chain": chain,
         "timebase": timebase,
         "result": result,
     }
