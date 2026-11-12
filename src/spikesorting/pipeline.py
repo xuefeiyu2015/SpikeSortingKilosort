@@ -82,6 +82,7 @@ __all__ = [
     "validate_remapping",
     "export_results",
     "export_waveforms",
+    "record_timing",
     "stamp_lfp_timebase",
     "stamp_analog_timebase",
     "Binary",
@@ -124,6 +125,7 @@ def skip_reason(config: SessionConfig, verb: Any, system: str | None = None) -> 
         "extract_analog",
         "export_results",
         "export_waveforms",
+        "record_timing",
     }:
         if not config.has_data(system):
             return f"no {system} paths declared in the session"
@@ -432,11 +434,23 @@ def _binary_for(config: SessionConfig, system: str) -> Binary:
         )
         return _binary_from_record(recorded)
 
+    import time
+    from datetime import datetime
+
     directory = config.paths.preprocessed_for(system)
     log.info("preprocessing %s (%s)", system, "; ".join(reasons))
     provenance.discard(directory)
+    started = time.perf_counter()
     record = _run_preprocessing(config, system, directory)
     record.update(_preprocess_expected(config, system))
+    # How long it took and where, so a sort that reuses this binary -- on this
+    # machine or after copying it to another -- can still report the cost.
+    # Not one of provenance's deciding keys: it never makes a binary stale.
+    record["timing"] = {
+        "seconds": round(time.perf_counter() - started, 2),
+        "machine": config.machine.name,
+        "finished": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
     provenance.write(directory, record)
     log.info("preprocessed -> %s", record["binary"])
     return _binary_from_record(record)
@@ -680,11 +694,15 @@ def _export_stem(config: SessionConfig, system: str) -> str:
     return Path(path).stem if path is not None else config.session
 
 
-def _check_input_reachable(config: SessionConfig, system: str) -> None:
-    """Fail fast, and loudly, when the recording's filesystem is not answering."""
+def _check_input_reachable(config: SessionConfig, system: str) -> reachable.ReadProbe | None:
+    """Fail fast, and loudly, when the recording's filesystem is not answering.
+
+    Returns the read probe -- the file's size and measured read rate, which the
+    timing table reports beside the steps that read it.
+    """
     path = _input_path(config, system)
     if path is None:
-        return                             # nothing named; the caller reports that
+        return None                        # nothing named; the caller reports that
 
     probe = reachable.check_reachable(path)
     log.info("%s: %s", path, probe.summary())
@@ -695,6 +713,7 @@ def _check_input_reachable(config: SessionConfig, system: str) -> None:
             "machine's cache_dir first.",
             path.name, probe.bytes_per_s / 1e6, probe.estimated_seconds() / 60,
         )
+    return probe
 
 
 # ----------------------------------------------------------------------------
@@ -812,18 +831,19 @@ def sort_with_kilosort(
     if not getattr(config, f"sorts_{system}"):
         return None
 
-    _check_input_reachable(config, system)
+    import time
+    from datetime import datetime
 
+    started, t0 = datetime.now().astimezone(), time.perf_counter()
+    read_probe = _check_input_reachable(config, system)
+    t_reachable = time.perf_counter()
     probe = setup_probe(config, system)
+    t_probe = time.perf_counter()
     final_dir = config.paths.sorted_for(system)
 
     if dry_run:
         return _dry_run(config, system, probe, final_dir)
 
-    import time
-    from datetime import datetime
-
-    started, t0 = datetime.now().astimezone(), time.perf_counter()
     reused = not _stale_reasons(config, system)[0]
     binary = _binary_for(config, system)
     t_preprocessed = time.perf_counter()
@@ -840,7 +860,8 @@ def sort_with_kilosort(
         _clear_previous_curation(final_dir)
 
     try:
-        _ops, spike_times, clusters, *_rest = run_kilosort(
+        t_kilosort = time.perf_counter()
+        ops, spike_times, clusters, *_rest = run_kilosort(
             settings=settings,
             probe=probe,
             filename=binary.path,
@@ -857,6 +878,7 @@ def sort_with_kilosort(
     finally:
         if work_dir != final_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
+    t_published = time.perf_counter()
 
     result = SortSummary(
         results_dir=final_dir,
@@ -866,17 +888,6 @@ def sort_with_kilosort(
         binary=binary.path,
         settings=settings,
     )
-    t_done = time.perf_counter()
-    timing = {
-        "started": started.isoformat(timespec="seconds"),
-        "finished": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "preprocessing": "reused" if reused else "made",
-        "preprocess_s": round(t_preprocessed - t0, 1),
-        "kilosort_s": round(t_sorted - t_preprocessed, 1),
-        "publish_s": round(t_done - t_sorted, 1),
-        "total_s": round(t_done - t0, 1),
-    }
-    _write_run_info(config, system, result, kwargs, timing)
 
     # Blackrock only: record what turns these sample indices into NSP-clock
     # seconds, beside the sorting, while the file that produced them is known.
@@ -889,7 +900,83 @@ def sort_with_kilosort(
                 "export in the sorter's own timebase",
                 config.blackrock.spike_file, type(error).__name__, error,
             )
+    t_done = time.perf_counter()
+
+    timing = _sort_timing(
+        config, system, read_probe, started,
+        loading={"reachability check (read-rate probe)": t_reachable - t0,
+                 "channel map": t_probe - t_reachable},
+        reused=reused,
+        reuse_check_s=t_preprocessed - t_probe,
+        ops=ops if isinstance(ops, dict) else {},
+        kilosort_wall_s=t_sorted - t_kilosort,
+        postprocessing={
+            "copy results out of the cache": t_published - t_sorted,
+            **({"NSP clock map": t_done - t_published} if system == "blackrock" else {}),
+        },
+    )
+    _write_run_info(config, system, result, kwargs, timing)
     return result
+
+
+def _sort_timing(
+    config: SessionConfig,
+    system: str,
+    read_probe: reachable.ReadProbe | None,
+    started: Any,
+    *,
+    loading: dict[str, float],
+    reused: bool,
+    reuse_check_s: float,
+    ops: dict[str, Any],
+    kilosort_wall_s: float,
+    postprocessing: dict[str, float],
+) -> dict[str, Any]:
+    """The sorting run's half of the timing table (see ``_export/timing.py``).
+
+    Preprocessing is usually done by the time the sort starts -- the driver runs
+    :func:`preprocess` first, or the binary was made on another machine and
+    copied -- so its time comes from ``preprocess.json``, where
+    :func:`_binary_for` recorded it, with the machine it was made on.
+    """
+    from datetime import datetime
+
+    from ._export import timing as tm
+
+    record = provenance.read(config.paths.preprocessed_for(system)) or {}
+    made = record.get("timing") or {}
+    label = f"{record.get('engine', 'preprocessing')} (band-pass, CAR, ...)"
+    if reused:
+        seconds = made.get("seconds")
+        note = (
+            f"made {made.get('finished')} on {made.get('machine')}"
+            if made else "made before preprocessing times were recorded"
+        )
+    else:
+        seconds, note = reuse_check_s, "made by this sort"
+
+    steps: list[tm.Step] = [("loading", k, v) for k, v in loading.items()]
+    steps.append(("preprocessing", label, seconds))
+    steps += tm.kilosort_steps(ops, kilosort_wall_s)
+    steps += [("postprocessing", k, v) for k, v in postprocessing.items()]
+
+    source = None
+    if read_probe is not None:
+        source = {
+            "path": str(read_probe.path),
+            "gb": round(read_probe.total_bytes / 1e9, 3),
+            "read_mb_per_s": round(read_probe.bytes_per_s / 1e6, 1),
+            "open_latency_s": round(read_probe.latency_s, 3),
+        }
+    run = {
+        "machine": config.machine.name,
+        "device": config.machine.device,
+        "started": started.isoformat(timespec="seconds"),
+        "finished": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    return tm.build_timing(
+        steps, run, notes={label: note}, extra={"input": source} if source else None
+    )
 
 
 def _work_dir(config: SessionConfig, system: str) -> Path | None:
@@ -2989,6 +3076,16 @@ def export_results(
         log.info("no sorting results in %s", results_dir)
         return None
 
+    import time
+
+    clock = [time.perf_counter()]
+    timing: dict[str, float] = {}
+
+    def lap(step: str) -> None:
+        now = time.perf_counter()
+        timing[step] = round(now - clock[0], 2)
+        clock[0] = now
+
     phy = load_phy_results(results_dir)
     unit_ids = select_units(phy)
     log.info(
@@ -3002,6 +3099,7 @@ def export_results(
     if seconds is not None:
         spike_times_s = {int(uid): seconds[phy.spike_clusters == uid] for uid in unit_ids}
     log.info("timebase: %s", timebase)
+    lap("load sorting & spike times")
 
     # One folder per stream holding only what an analysis copies away: the .mat
     # files, units.csv, the figures, the manifest, and copies of the small
@@ -3011,6 +3109,7 @@ def export_results(
     # Measured first: units.csv's shape columns come from these means (in uV),
     # never from Kilosort's whitened templates.
     measured = export_waveforms(config, system)
+    lap("measure waveforms (reads the binary)")
     table = final.build_unit_table(
         phy, unit_ids, spike_times_s, **_measured_means(measured))
     units_csv = final.export_unit_table(out_dir, table)
@@ -3038,6 +3137,7 @@ def export_results(
     )
     paths = {"units": units_csv, "sorted_spikes": mat_path, "summary": summary}
     paths.update(_copy_records(config, system, out_dir))
+    lap("write .mat, units.csv, manifest")
 
     if figures and unit_ids.size:
         figure_dir = config.paths.figures_for(system)
@@ -3057,8 +3157,82 @@ def export_results(
                 "only the first %d of %d units were plotted (max_unit_figures)",
                 len(units), unit_ids.size,
             )
+        lap("figures")
 
-    return {"paths": paths, "timebase": timebase, "n_units": int(unit_ids.size)}
+    # Not printed by the runner (a dict); record_timing puts it in the table.
+    return {"paths": paths, "timebase": timebase, "n_units": int(unit_ids.size),
+            "timing": timing}
+
+
+def record_timing(
+    config: SessionConfig, system: str, stages: list[dict[str, Any]]
+) -> dict | None:
+    """Add the exporting run's times to ``run_info.json`` and write ``timing.txt``.
+
+    ``stages`` is one entry per exporting stage that ran for this stream, in
+    order: ``{"stage", "seconds", "started"}`` and optionally ``"steps"``, a
+    breakdown the stage returned (``export_results`` does). The runner measures
+    them, because only it sees every stage.
+
+    The sorting run's phases are already in ``run_info.json``; this adds the
+    ``exporting`` phase (replacing an earlier export's) and re-copies the record
+    into ``export/``, along with ``timing.txt`` -- the table, one row per step --
+    and the ``sorting.timing`` of ``sorting_summary_info.json``, so the three
+    agree.
+
+    Returns ``None`` when there is no sorting with a ``run_info.json`` to add to.
+    """
+    _check(system)
+    from datetime import datetime
+
+    from ._export import timing as tm
+
+    sorted_dir = config.paths.sorted_for(system)
+    info_path = sorted_dir / "run_info.json"
+    if not info_path.exists():
+        return None
+    with open(info_path, "r", encoding="utf-8") as handle:
+        run_info = json.load(handle)
+
+    steps: list[tm.Step] = []
+    for stage in stages:
+        if stage.get("steps"):
+            steps += [("exporting", f"{stage['stage']}: {name}", seconds)
+                      for name, seconds in stage["steps"].items()]
+        else:
+            steps.append(("exporting", stage["stage"], stage.get("seconds")))
+    started = [s["started"] for s in stages if s.get("started")]
+    run = {
+        "machine": config.machine.name,
+        "started": min(started) if started else None,
+        "finished": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    run_info["timing"] = tm.with_exporting(run_info.get("timing"), steps, run)
+    with open(info_path, "w", encoding="utf-8") as handle:
+        json.dump(run_info, handle, indent=2, default=str)
+
+    out_dir = config.paths.export_for(system)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(info_path, out_dir / info_path.name)
+    summary_path = out_dir / "sorting_summary_info.json"
+    if summary_path.exists():
+        with open(summary_path, "r", encoding="utf-8") as handle:
+            summary = json.load(handle)
+        summary.setdefault("sorting", {})["timing"] = run_info["timing"]
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2, default=str)
+
+    title = f"{config.session} | {stream_label(system)}"
+    if system == "neuropixels" and config.probe_tag is not None:
+        title += f" {config.probe_tag}"
+    text = tm.render_timing(run_info["timing"], title)
+    table_path = out_dir / "timing.txt"
+    table_path.write_text(text, encoding="utf-8")
+    return {
+        "path": table_path,
+        "total": tm.format_seconds(run_info["timing"]["total_s"]),
+        "_text": text,                     # the table, for the driver to print
+    }
 
 
 def _write_overview(phy, unit_ids: np.ndarray, path: Path) -> Path | None:

@@ -110,3 +110,26 @@ def test_a_mistyped_directory_is_never_created(tmp_path, require_inputs):
         load(_args(config=str(session), machine="mac", probe=None),
              require_inputs=require_inputs)
     assert not (tmp_path / "SGL_DATA").exists()          # not even the parent
+
+
+def test_the_runner_keeps_each_stages_time_and_breakdown(monkeypatch):
+    from types import SimpleNamespace
+
+    import _cli
+    from _cli import Runner
+
+    def export_results(config, system):
+        return {"n_units": 3, "timing": {"figures": 1.0}}
+
+    def extract_sync(config, system):
+        return None
+
+    monkeypatch.setattr(_cli, "skip_reason", lambda *a, **k: None)
+    run = Runner(SimpleNamespace())
+    run(extract_sync, None, "blackrock", system="blackrock")
+    run(export_results, None, "neuropixels", system="neuropixels", label="neuropixels imec1")
+
+    (stage,) = run.stages_for("neuropixels imec1")
+    assert stage["stage"] == "export_results" and stage["status"] == "ok"
+    assert stage["steps"] == {"figures": 1.0}
+    assert run.stages_for("blackrock")[0]["status"] == "nothing to do"

@@ -894,7 +894,9 @@ def _fake_kilosort(monkeypatch, seen: list[dict]):
         # spike and three columns: 13 x 3 here, for 12 spikes saved.
         st = np.column_stack([np.arange(13), np.zeros(13), np.ones(13)])
         clu = np.append(clusters, 3)
-        return {"ops": True}, st, clu, None, None, None, None, None, None
+        # Kilosort's own per-stage timers, as run_kilosort leaves them in ops.
+        ops = {"ops": True, "runtime_drift": 1.5, "runtime_postproc": 0.5}
+        return ops, st, clu, None, None, None, None, None, None
 
     module = types.ModuleType("kilosort.run_kilosort")
     module.DEFAULT_SETTINGS = {
@@ -2163,6 +2165,61 @@ def test_run_info_records_the_source_and_how_long_the_sort_took(tmp_path):
     info = json.loads((tmp_path / "run_info.json").read_text())
     assert info["timing"]["kilosort_s"] == 12.5
     assert info["source_recording"].endswith("x.bin")
+
+
+def test_a_sort_records_its_time_by_phase(tmp_path, monkeypatch):
+    # Loading, preprocessing, sorting, postprocessing: the table the user
+    # compares a local-disk run against a share run with.
+    _fake_kilosort(monkeypatch, [])
+    session = _npx_session(tmp_path)
+
+    result = ss.sort_with_kilosort(session, "neuropixels")
+
+    timing = json.loads((result.results_dir / "run_info.json").read_text())["timing"]
+    assert list(timing["phases"]) == ["loading", "preprocessing", "sorting", "postprocessing"]
+    sorting = {r["step"]: r["seconds"] for r in timing["phases"]["sorting"]["steps"]}
+    assert sorting["kilosort: drift correction"] == 1.5
+    post = [r["step"] for r in timing["phases"]["postprocessing"]["steps"]]
+    assert post[0] == "kilosort: saving results"
+    assert timing["sorting_run"]["machine"] == session.machine.name
+    assert timing["total_s"] == pytest.approx(
+        sum(p["seconds"] for p in timing["phases"].values()), abs=0.05)
+
+
+def test_record_timing_adds_the_export_phase_and_writes_the_table(tmp_path):
+    session = _session(tmp_path)
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    sorted_dir.mkdir(parents=True)
+    sort_timing = {
+        "sorting_run": {"machine": "hpc", "device": "cuda"},
+        "phases": {"sorting": {"seconds": 100.0,
+                               "steps": [{"step": "kilosort", "seconds": 100.0}]}},
+        "total_s": 100.0,
+    }
+    (sorted_dir / "run_info.json").write_text(json.dumps({"timing": sort_timing}))
+    stages = [
+        {"stage": "extract_sync", "seconds": 20.0, "started": "2026-11-12T10:00:00+00:00"},
+        {"stage": "export_results", "seconds": 30.0, "started": "2026-11-12T10:01:00+00:00",
+         "steps": {"load sorting & spike times": 5.0, "figures": 25.0}},
+    ]
+
+    report = ss.record_timing(session, "neuropixels", stages)
+
+    timing = json.loads((sorted_dir / "run_info.json").read_text())["timing"]
+    export = timing["phases"]["exporting"]
+    assert export["seconds"] == 50.0
+    assert [r["step"] for r in export["steps"]] == [
+        "extract_sync", "export_results: load sorting & spike times", "export_results: figures"]
+    assert timing["total_s"] == 150.0
+    assert timing["exporting_run"]["started"] == "2026-11-12T10:00:00+00:00"
+    out = session.paths.export_for("neuropixels")
+    assert json.loads((out / "run_info.json").read_text())["timing"] == timing
+    assert "exporting" in (out / "timing.txt").read_text()
+    assert report["path"] == out / "timing.txt"
+
+
+def test_record_timing_without_a_sorting_does_nothing(tmp_path):
+    assert ss.record_timing(_session(tmp_path), "neuropixels", []) is None
 
 
 def test_a_long_read_reports_its_progress(caplog):

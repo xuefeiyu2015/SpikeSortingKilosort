@@ -21,6 +21,8 @@
                          were held out of the fit. Non-zero past tolerance, so it
                          can gate a batch job.
     export_results       aligned spike times, metrics, waveforms, figures.
+    record_timing        how long each step took, sorting and exporting, as a
+                         table: run_info.json["timing"] and export/timing.txt.
 
 Every stage runs, in that order, on every stream the session names. A stage
 with nothing to do yet reports why and the run carries on -- so running this
@@ -142,6 +144,21 @@ def main() -> int:
     # Measures the waveforms too (sorted_spikes.mat carries the mean), so there
     # is no separate waveform pass over the binary.
     per_stream(ss.export_results)
+
+    # Last: how long every stage took, on top of the sort's own times, into each
+    # stream's run_info.json and export/timing.txt -- the one table that
+    # compares a run from a local disk against one from the share.
+    tables = []
+    streams = [*per_probe_config(), ("blackrock", config)]
+    for label, stream_config in streams:
+        system = "blackrock" if label == "blackrock" else "neuropixels"
+        report = run(ss.record_timing, stream_config, system, run.stages_for(label),
+                     system=system, label=label, config=stream_config)
+        if report:
+            tables.append(report["_text"])
+    for table in tables:
+        print()
+        print(table, end="")
 
     return run.finish("exporting pipeline")
 

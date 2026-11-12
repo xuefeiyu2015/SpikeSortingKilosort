@@ -180,6 +180,9 @@ class Runner:
         self.stopped = False
         #: True when the last call raised, so a caller can skip what depended on it.
         self.last_failed = False
+        #: Every stage that ran, in order: ``{"label", "stage", "status",
+        #: "seconds", "started", "steps"}``. What ``record_timing`` is given.
+        self.stages: list[dict] = []
 
     def __call__(self, verb, *args, system: str | None = None, label: str | None = None,
                  config: SessionConfig | None = None, **kwargs):
@@ -201,23 +204,42 @@ class Runner:
             print(f"[--] {label}\n       {why}")
             return None
 
+        from datetime import datetime
+
+        wall = datetime.now().astimezone().isoformat(timespec="seconds")
         started = time.perf_counter()
         try:
             value = verb(*args, **kwargs)
         except Exception as error:  # a stage that blows up must not hide the rest
             self.failures += 1
             self.last_failed = True
+            self._record(shown, verb, "failed", time.perf_counter() - started, wall, None)
             took = _elapsed(time.perf_counter() - started)
             print(f"[!!] {label}  ({took})\n       {type(error).__name__}: {error}")
             self.stopped = True
             return None
 
-        took = _elapsed(time.perf_counter() - started)
+        seconds = time.perf_counter() - started
+        took = _elapsed(seconds)
+        self._record(shown, verb, "nothing to do" if value is None else "ok",
+                     seconds, wall, value)
         if value is None:
             print(f"[--] {label}  ({took})\n       nothing to do")
         else:
             print(f"[ok] {label}  ({took})\n       {_describe(value)}")
         return value
+
+    def _record(self, shown, verb, status, seconds, wall, value) -> None:
+        steps = value.get("timing") if isinstance(value, dict) else None
+        self.stages.append({
+            "label": shown, "stage": verb.__name__, "status": status,
+            "seconds": round(seconds, 2), "started": wall,
+            "steps": steps if isinstance(steps, dict) else None,
+        })
+
+    def stages_for(self, label: str) -> list[dict]:
+        """The stages that ran for one stream (``label`` as printed), in order."""
+        return [s for s in self.stages if s["label"] == label]
 
     def finish(self, name: str) -> int:
         print()
