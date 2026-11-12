@@ -152,7 +152,7 @@ def compute_waveform_features(mean_waveform: np.ndarray, fs: float) -> dict[str,
     the feature most worth carrying into downstream analysis.
     """
     wave = np.asarray(mean_waveform, dtype=np.float64).reshape(-1)
-    if wave.size == 0 or fs <= 0:
+    if wave.size == 0 or fs <= 0 or not np.isfinite(wave).all():
         return {
             "trough_amplitude": float("nan"),
             "peak_amplitude": float("nan"),
@@ -165,9 +165,7 @@ def compute_waveform_features(mean_waveform: np.ndarray, fs: float) -> dict[str,
     peak_idx = trough_idx + int(np.argmax(after)) if after.size else trough_idx
 
     trough = float(wave[trough_idx])
-    half = trough / 2.0
-    below = np.flatnonzero(wave <= half)
-    half_width = (below[-1] - below[0]) / fs * 1000.0 if below.size > 1 else float("nan")
+    half_width = _trough_half_width(wave, trough_idx) / fs * 1000.0
 
     return {
         "trough_amplitude": trough,
@@ -175,6 +173,30 @@ def compute_waveform_features(mean_waveform: np.ndarray, fs: float) -> dict[str,
         "peak_to_trough_ms": (peak_idx - trough_idx) / fs * 1000.0,
         "half_width_ms": float(half_width),
     }
+
+
+def _trough_half_width(wave: np.ndarray, trough_idx: int) -> float:
+    """Width in samples of the trough at half its depth, crossings interpolated.
+
+    Only the trough's own lobe counts: walk outward from it to the first sample
+    above half depth on each side. A spike is 4-8 samples wide at half depth, so
+    whole samples would quantise it to steps of a quarter of its width.
+    """
+    half = wave[trough_idx] / 2.0
+    if not half < 0:
+        return float("nan")
+    left = trough_idx
+    while left > 0 and wave[left - 1] <= half:
+        left -= 1
+    right = trough_idx
+    while right < wave.size - 1 and wave[right + 1] <= half:
+        right += 1
+    if left == 0 or right == wave.size - 1:
+        return float("nan")                    # the lobe runs off the window
+    # Linear interpolation between the last sample inside and the first outside.
+    left_x = left - (half - wave[left]) / (wave[left - 1] - wave[left])
+    right_x = right + (half - wave[right]) / (wave[right + 1] - wave[right])
+    return float(right_x - left_x)
 
 
 def compute_unit_metrics(

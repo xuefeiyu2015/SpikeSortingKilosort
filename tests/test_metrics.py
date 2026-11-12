@@ -114,3 +114,17 @@ def test_compute_unit_metrics_assembles_everything():
     assert result["presence_ratio"] == pytest.approx(1.0)
     assert result["isi_fraction"] == pytest.approx(0.0)
     assert "amp_cv" in result
+
+
+def test_half_width_interpolates_the_crossings_of_the_trough_lobe():
+    fs = 30000.0
+    wave = np.zeros(60)
+    wave[28:33] = [-2.0, -6.0, -10.0, -6.0, -2.0]    # half depth -5 crossed at 28.75, 31.25
+    wave[45] = -8.0                                   # a later dip below half depth
+    features = metrics.compute_waveform_features(wave, fs)
+    assert features["half_width_ms"] == pytest.approx(2.5 / fs * 1000.0)
+
+
+def test_waveform_features_of_a_nan_mean_are_nan():
+    features = metrics.compute_waveform_features(np.full(60, np.nan), 30000.0)
+    assert all(np.isnan(v) for v in features.values())

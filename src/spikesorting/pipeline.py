@@ -1131,6 +1131,24 @@ def _planned_steps(config: SessionConfig, system: str) -> list[str]:
     return steps
 
 
+def _measured_means(measured: dict | None) -> dict:
+    """``build_unit_table``'s waveform arguments: each unit's measured mean.
+
+    A unit with no measured spike (all of them near a file end, or in blanked
+    batches) has a NaN mean and is left out, so its shape columns are NaN.
+    """
+    if measured is None:
+        return {}
+    result = measured["result"]
+    means = {
+        int(uid): np.asarray(mean)
+        for uid, mean in zip(result.unit_ids, result.mean.T)   # mean: (width, n_units)
+        if np.isfinite(mean).all()
+    }
+    return {"mean_waveforms": means,
+            "waveform_units": measured.get("mean_units", "ADC")}
+
+
 def _waveform_fields(measured: dict | None) -> dict | None:
     """The waveform arrays in the shape the .mat writer wants, or None."""
     if measured is None:
@@ -2965,12 +2983,15 @@ def export_results(
     # records that explain them (_copy_records). Kilosort's arrays stay in the
     # sorting folder above.
     out_dir = config.paths.export_for(system)
-    table = final.build_unit_table(phy, unit_ids, spike_times_s)
+    # Measured first: units.csv's shape columns come from these means (in uV),
+    # never from Kilosort's whitened templates.
+    measured = export_waveforms(config, system)
+    table = final.build_unit_table(
+        phy, unit_ids, spike_times_s, **_measured_means(measured))
     units_csv = final.export_unit_table(out_dir, table)
 
     # The spikes in the format the lab's online-spike code already reads, plus
     # the measured waveform when the recording was reachable.
-    measured = export_waveforms(config, system)
     mat_path = final.export_sorted_spikes_mat(
         out_dir,
         phy,

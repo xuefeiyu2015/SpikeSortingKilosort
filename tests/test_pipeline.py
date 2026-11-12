@@ -2149,3 +2149,40 @@ def test_the_waveform_record_names_catgt_then_kilosort(tmp_path):
     assert chain["summary"].startswith("catgt, then kilosort reader: 300 Hz")
     raw = pipeline._waveform_chain({}, tmp_path / "x.bin", ks)
     assert raw["input_preprocessed_by"].startswith("none")
+
+
+def test_units_csv_shape_columns_come_from_the_measured_waveforms(
+        tmp_path, kilosort_results, raw_reader):
+    # The trough planted in the recording, not Kilosort's whitened template.
+    import shutil
+
+    import pandas as pd
+
+    session = _session(
+        tmp_path,
+        "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/HUB.ns6'\n"
+        "  waveforms:\n    window_ms: 2.0\n",
+    )
+    sorted_dir = session.paths.sorted_for("blackrock")
+    sorted_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(kilosort_results, sorted_dir, dirs_exist_ok=True)
+    n_chan = 8
+    spikes = np.load(sorted_dir / "spike_times.npy")
+    clusters = np.load(sorted_dir / "spike_clusters.npy")
+    peak_channel = {0: 2, 1: 5, 2: 7}
+    binary = tmp_path / "br" / "HUB.bin"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    samples = np.zeros((int(spikes.max()) + 5000, n_chan), dtype=np.int16)
+    for s, c in zip(spikes, clusters):
+        samples[int(s), peak_channel[int(c)]] = -400
+    binary.write_bytes(samples.tobytes())
+    (sorted_dir / "run_info.json").write_text(
+        json.dumps({"binary": str(binary), "settings": {"n_chan_bin": n_chan, "fs": 30000.0}}),
+        encoding="utf-8",
+    )
+
+    out = ss.export_results(session, "blackrock")
+
+    table = pd.read_csv(out["paths"]["units"])
+    assert (table["trough_amplitude"] <= -400).all()     # the planted trough, at least
+    assert set(table["waveform_units"]) == {"ADC"}       # no .ns6 header to give a gain
