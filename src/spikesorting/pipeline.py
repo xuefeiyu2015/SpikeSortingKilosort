@@ -1774,6 +1774,7 @@ def time_remapping(
     # 1. Coarse map from the 14 s coded bursts, paired by code so drift cannot
     #    pick the wrong cycle -- and a line, so it holds at both ends of hours.
     match = None
+    vote = None
     if br_burst is not None and npx_burst is not None and br_burst.size and npx_burst.size:
         match = burst.match_bursts(br_burst, npx_burst, min_gap_s=config.burst_interval_s / 2)
         offset = match.offset_s
@@ -1829,7 +1830,7 @@ def time_remapping(
     if not spike_times_path.exists():
         log.info("no sorting at %s; wrote the time map only", results_dir)
         _save_map(aligned_dir, mapping, offset, config, obx_map, method="map_only",
-                  cycles_from=cycles_from)
+                  cycles_from=cycles_from, cycle_vote=vote)
         _stamp_exports(config, mapping, obx_map)
         return TimeMap(mapping, offset, "map_only", burst_match=match)
 
@@ -1874,7 +1875,7 @@ def time_remapping(
             )
 
     _save_map(aligned_dir, mapping, offset, config, obx_map, method=method,
-              cycles_from=cycles_from, tprime_error=tprime_error)
+              cycles_from=cycles_from, tprime_error=tprime_error, cycle_vote=vote)
     _stamp_exports(config, mapping, obx_map)
     return TimeMap(mapping, offset, method, aligned_path=out_path, burst_match=match)
 
@@ -2041,6 +2042,7 @@ def _save_map(
     method: str | None = None,
     cycles_from: str | None = None,
     tprime_error: str | None = None,
+    cycle_vote: Any = None,
 ) -> None:
     obx_to_br = None if obx_map is None else align.compose_linear_maps(mapping, obx_map)
     # Only a burst is held out of the fit; without one nothing validates the map
@@ -2053,6 +2055,18 @@ def _save_map(
         # What picked which 1 Hz cycle pairs with which: "burst", "photodiode",
         # an eye channel's label, or "1hz_only" (ambiguous by whole seconds).
         "cycles_from": cycles_from,
+        # Without a burst: the vote that chose the whole-second offset in its
+        # place. Photodiode votes count flashes, the others correlation windows.
+        "sync_period_s": config.sync_period_s,
+        "cycle_vote": None if cycle_vote is None else {
+            "source": cycles_from,
+            "shift_s": cycle_vote.shift_s,
+            "n_periods": cycle_vote.n_periods,
+            "n_support": cycle_vote.n_support,
+            "n_runner_up": cycle_vote.n_runner_up,
+            "n_total": cycle_vote.n_total,
+            "counted": "flashes" if cycles_from == "photodiode" else "windows",
+        },
         "slope": mapping.slope,
         "intercept": mapping.intercept,
         "drift_ppm": mapping.drift_ppm,
@@ -2135,14 +2149,19 @@ def _clock_definitions(config: SessionConfig) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class Unvalidated:
-    """``validate_remapping`` ran, wrote the sync report, and had nothing held out."""
+    """``validate_remapping`` ran, wrote the sync report, and had no burst to hold out.
+
+    ``verdict`` is the report's: ``CONSISTENT (no burst)`` when the channels
+    recorded on both systems agree, ``NOT VALIDATED`` otherwise.
+    """
 
     report_path: Path | None
     reason: str
+    verdict: str = "NOT VALIDATED"
 
     def summary(self) -> str:
         where = f"; sync report at {self.report_path}" if self.report_path else ""
-        return f"NOT VALIDATED ({self.reason}){where}"
+        return f"{self.verdict} ({self.reason}){where}"
 
 
 def validate_remapping(
@@ -2181,12 +2200,15 @@ def validate_remapping(
     )
     if br_burst is None or npx_burst is None or not br_burst.size or not npx_burst.size:
         log.warning(
-            "no 14 s burst edges on one or both systems, so the alignment cannot be "
-            "independently validated. The 1 Hz fit residuals in time_map.json are the "
-            "only available quality measure, and they are not held-out data."
+            "no 14 s burst edges on one or both systems, so nothing held out checks "
+            "the map; comparing the channels recorded on both systems instead"
         )
-        return Unvalidated(_write_sync_report(config, None),
-                           "no 14 s burst on one or both systems")
+        path = _write_sync_report(config, None)
+        verdict = "NOT VALIDATED"
+        if path is not None:
+            with open(path, "r", encoding="utf-8") as handle:
+                verdict = json.load(handle)["verdict"]
+        return Unvalidated(path, "no 14 s burst on one or both systems", verdict)
 
     with open(map_path, "r", encoding="utf-8") as handle:
         payload = json.load(handle)

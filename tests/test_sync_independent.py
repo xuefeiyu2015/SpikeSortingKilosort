@@ -256,7 +256,7 @@ def _plant_1hz_without_burst(session):
             catgt.write_edge_file(folder / f"{name}.txt", times)
 
 
-def _remap_with_a_planted_cycle_error(tmp_path, monkeypatch, drop=()):
+def _remap_with_a_planted_cycle_error(tmp_path, monkeypatch, drop=(), with_session=False):
     import json
     from dataclasses import replace
 
@@ -276,7 +276,7 @@ def _remap_with_a_planted_cycle_error(tmp_path, monkeypatch, drop=()):
 
     result = ss.time_remapping(session, "neuropixels")
     payload = json.loads((session.paths.aligned / "time_map.json").read_text())
-    return result, payload
+    return (result, payload, session) if with_session else (result, payload)
 
 
 def test_without_a_burst_the_photodiode_picks_the_cycle(tmp_path, monkeypatch):
@@ -306,3 +306,26 @@ def test_with_nothing_to_pick_the_cycle_the_map_says_so(tmp_path, monkeypatch):
     report = build_sync_report(payload, None, [])
     assert report["verdict"] == "NOT VALIDATED"
     assert "off by whole seconds" in report["verdict_note"]
+
+
+def test_without_a_burst_agreeing_channels_make_the_map_consistent(tmp_path, monkeypatch):
+    # The photodiode picks the offset; the eye, never used for it, agrees.
+    import json
+
+    import spikesorting as ss
+
+    _, payload, session = _remap_with_a_planted_cycle_error(
+        tmp_path, monkeypatch, with_session=True)
+    vote = payload["cycle_vote"]
+    assert vote["source"] == "photodiode" and vote["shift_s"] == pytest.approx(-3.0)
+    assert vote["counted"] == "flashes" and vote["n_support"] > vote["n_runner_up"]
+
+    outcome = ss.validate_remapping(session, figures=False)
+    assert outcome.verdict == "CONSISTENT (no burst)"
+    sync = json.loads((session.paths.export_for("neuropixels") / "sync_report.json").read_text())
+    assert sync["verdict"] == "CONSISTENT (no burst)"
+    assert "coarse match by photodiode in place of the burst" in sync["verdict_note"]
+    text = (session.paths.export_for("neuropixels") / "sync_report.txt").read_text()
+    assert "14 s coded burst                 not recorded" in text
+    assert "coarse match (photodiode)" in text and "-3.000 s" in text
+    assert "14 s burst: same OneBox clock" not in text

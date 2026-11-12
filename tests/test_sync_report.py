@@ -58,3 +58,43 @@ def test_without_the_onebox_fit_the_analog_channels_are_not_synchronized():
     assert report["channels"][0]["aligned_by"].startswith("not synchronized")
     assert len(report["signals"]) == 2              # no OneBox 1 Hz row
     assert "OneBox drift" in report["verdict_note"]
+
+
+NO_BURST = dict(TIME_MAP, burst_clock=None, cycles_from="eye_x", sync_period_s=1.0,
+                cycle_vote={"source": "eye_x", "shift_s": 4.0, "n_periods": 4,
+                            "n_support": 20, "n_runner_up": 0, "n_total": 20,
+                            "counted": "windows"})
+
+
+def _check(name, drift=0.01, offset=0.0, status="consistent"):
+    return {"channel": name, "status": status, "drift_ms": drift, "median_offset_ms": offset,
+            "spread_p95_ms": 0.2, "span_min": 127, "n": 60, "method": "m", "blackrock": "b"}
+
+
+def test_without_a_burst_an_independent_channel_makes_it_consistent():
+    report = build_sync_report(NO_BURST, None, ["eye_x", "photodiode"],
+                               checks=[_check("eye_x"), _check("photodiode", offset=-0.004)])
+    assert report["verdict"] == "CONSISTENT (no burst)"
+    assert "coarse match by eye_x in place of the burst: shift +4.000 s" in report["verdict_note"]
+    assert "photodiode agree" in report["verdict_note"]
+    text = render_sync_report(report)
+    assert "14 s coded burst                 not recorded" in text
+    assert "coarse match (eye_x)" in text and "20 of 20 windows agree, runner-up 0" in text
+    assert "error from: independent check of this channel" in text
+    assert "14 s burst: same OneBox clock" not in text
+
+
+def test_the_channel_that_picked_the_offset_cannot_confirm_it_alone():
+    report = build_sync_report(NO_BURST, None, ["eye_x"], checks=[_check("eye_x")])
+    assert report["verdict"] == "NOT VALIDATED"
+    assert "no channel besides eye_x" in report["verdict_note"]
+
+
+@pytest.mark.parametrize("check", [
+    _check("photodiode", offset=1000.0),             # a whole second off: wrong pick
+    _check("photodiode", drift=5.0, status="DRIFT"),
+])
+def test_a_channel_that_disagrees_keeps_it_not_validated(check):
+    report = build_sync_report(NO_BURST, None, [], checks=[_check("eye_y"), check]
+                               if check["status"] == "DRIFT" else [check])
+    assert report["verdict"] == "NOT VALIDATED"

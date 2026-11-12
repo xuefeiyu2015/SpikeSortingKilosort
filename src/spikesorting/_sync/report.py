@@ -17,13 +17,25 @@ burst's pulses never enter a fit, so how far they land from Blackrock's copies
 is the real accuracy. It is sampled on the OneBox clock and travels exactly the
 analog channels' two 1 Hz fits, so its error *is* theirs; spikes use one of
 those two fits, so it bounds theirs too.
+
+**Without a burst**, both of its jobs pass to channels recorded on both
+systems. One of them (``time_map.json["cycle_vote"]``) picks the whole-second
+offset in the burst's place; the 1 Hz still sets the map. The rest are the
+independent checks: never fitted, and judged on drift. When at least one
+channel *other than the one that picked the offset* agrees -- no drift past
+tolerance, and an offset well under half a period, which a wrong whole-second
+pick could not give -- the verdict is ``CONSISTENT (no burst)``. That is not a
+``PASS``: no held-out pulse train was measured.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["build_sync_report", "render_sync_report"]
+__all__ = ["build_sync_report", "render_sync_report", "CONSISTENT_NO_BURST"]
+
+#: The verdict without a burst when independent channels agree.
+CONSISTENT_NO_BURST = "CONSISTENT (no burst)"
 
 
 def _ms(seconds: float | None) -> float | None:
@@ -45,10 +57,16 @@ def build_sync_report(
     tolerance_ms = _ms(validation["tolerance_s"]) if validation else None
     obx = time_map.get("onebox_to_probe")
     burst_on_probe = time_map.get("burst_clock") == "probe"
+    cycles_from = time_map.get("cycles_from")
+    vote = time_map.get("cycle_vote")
+    no_burst = cycles_from not in (None, "burst")
+    checks = list(checks or [])
+    measured = {c["channel"]: c for c in checks if c.get("status") in ("consistent", "DRIFT")}
 
     if validation is None or not validation.get("n_checked"):
-        verdict = "NOT VALIDATED"
-        verdict_note = "no 14 s bursts to check against; only fit residuals are available"
+        verdict, verdict_note = _verdict_without_burst(
+            cycles_from, vote, measured, time_map, no_burst
+        )
     elif not burst_on_probe:
         verdict = "FAIL" if not validation["passed"] else "PASS"
         verdict_note = (
@@ -93,12 +111,39 @@ def build_sync_report(
             "rms_ms": _ms(obx.get("fit_rms_residual_s")),
             "drift_ppm": float(obx["drift_ppm"]),
         })
-    signals.append({
-        "signal": "14 s coded burst",
-        "path": "OneBox XA0 -> probe -> Blackrock .ns5 ch 2",
-        "role": "held-out check (picks the 1 Hz cycles, never fitted)",
-        **(held_out or {"n": 0, "max_ms": None, "median_ms": None, "passed": None}),
-    })
+    if no_burst:
+        signals.append({
+            "signal": "14 s coded burst",
+            "path": "OneBox XA0 -> probe -> Blackrock .ns5 ch 2",
+            "role": "not recorded on one or both systems",
+            "n": 0, "max_ms": None, "median_ms": None, "passed": None,
+            "absent": True,
+        })
+        if vote is not None:
+            signals.append({
+                "signal": f"coarse match ({vote['source']})",
+                "path": f"OneBox {vote['source']} -> Blackrock .ns2",
+                "role": "in place of the 14 s burst: picks the whole-second offset, "
+                        "never fitted",
+                "n": int(vote["n_total"]),
+                "vote": vote,
+            })
+    else:
+        signals.append({
+            "signal": "14 s coded burst",
+            "path": "OneBox XA0 -> probe -> Blackrock .ns5 ch 2",
+            "role": "held-out check (picks the 1 Hz cycles, never fitted)",
+            **(held_out or {"n": 0, "max_ms": None, "median_ms": None, "passed": None}),
+        })
+
+    def error_without_burst(name: str) -> tuple[str, dict[str, Any] | None]:
+        check = measured.get(name)
+        if check is not None:
+            return "independent check of this channel (below)", check
+        unmeasured = next((c for c in checks if c["channel"] == name), None)
+        if unmeasured is not None:
+            return f"not measured: {unmeasured.get('note', 'its check failed')}", None
+        return "not measured: no burst, and no copy of it on Blackrock to compare", None
 
     channels: list[dict[str, Any]] = []
     for name in analog_names or []:
@@ -108,6 +153,13 @@ def build_sync_report(
                 "aligned_by": "not synchronized: no OneBox 1 Hz edges",
                 "error_from": None,
             })
+        elif no_burst:
+            error_from, check = error_without_burst(name)
+            channels.append({
+                "channel": name, "max_ms": None,
+                "aligned_by": "1 Hz OneBox->probe, then 1 Hz probe->Blackrock",
+                "error_from": error_from, "check": check,
+            })
         else:
             channels.append({
                 "channel": name,
@@ -116,23 +168,24 @@ def build_sync_report(
                 "aligned_by": "1 Hz OneBox->probe, then 1 Hz probe->Blackrock",
                 "error_from": "14 s burst: same OneBox clock, same two fits",
             })
-    channels.append({
-        "channel": f"spikes ({stream})",
-        "max_ms": held_out["max_ms"] if held_out else None,
-        "median_ms": held_out["median_ms"] if held_out else None,
-        "aligned_by": "1 Hz probe->Blackrock",
-        "error_from": "14 s burst: passes through this fit",
-    })
-
-    cycles_from = time_map.get("cycles_from")
-    if cycles_from == "1hz_only":
-        verdict_note += ("; WARNING: no burst, photodiode or eye picked the 1 Hz cycle, "
-                         "so the map may be off by whole seconds")
-    elif cycles_from and cycles_from != "burst":
-        verdict_note += f"; the 1 Hz cycle was picked by the {cycles_from} (no burst)"
+    if no_burst:
+        channels.append({
+            "channel": f"spikes ({stream})", "max_ms": None,
+            "aligned_by": "1 Hz probe->Blackrock",
+            "error_from": "no held-out measure; the independent checks pass through "
+                          "this same fit, so their drift bounds it",
+        })
+    else:
+        channels.append({
+            "channel": f"spikes ({stream})",
+            "max_ms": held_out["max_ms"] if held_out else None,
+            "median_ms": held_out["median_ms"] if held_out else None,
+            "aligned_by": "1 Hz probe->Blackrock",
+            "error_from": "14 s burst: passes through this fit",
+        })
 
     composed = time_map.get("onebox_to_blackrock")
-    drifting = [c["channel"] for c in checks or [] if c.get("status") == "DRIFT"]
+    drifting = [c["channel"] for c in checks if c.get("status") == "DRIFT"]
     if drifting:
         verdict_note += f"; WARNING: {', '.join(drifting)} drift against Blackrock's copy"
     return {
@@ -149,12 +202,51 @@ def build_sync_report(
             "slope": composed["slope"], "intercept_s": composed["intercept"],
             "drift_ppm": composed["drift_ppm"],
         },
+        "cycle_vote": vote,
+        "no_burst": no_burst,
         "signals": signals,
         "channels": channels,
         # Behavioural channels recorded on both systems, compared after sync.
         # Not part of the verdict: they are judged on drift, and warn.
-        "independent_checks": list(checks or []),
+        "independent_checks": checks,
     }
+
+
+#: An agreeing channel's offset must be under this fraction of a sync period:
+#: a wrong whole-second pick would put it a full period off.
+_MAX_OFFSET_PERIODS = 0.25
+
+
+def _verdict_without_burst(
+    cycles_from: str | None,
+    vote: dict[str, Any] | None,
+    measured: dict[str, dict[str, Any]],
+    time_map: dict[str, Any],
+    no_burst: bool,
+) -> tuple[str, str]:
+    """``CONSISTENT (no burst)`` or ``NOT VALIDATED``, and why."""
+    if not no_burst:
+        return "NOT VALIDATED", "no 14 s bursts to check against; only fit residuals are available"
+    if cycles_from == "1hz_only" or vote is None:
+        return "NOT VALIDATED", (
+            "no 14 s burst; WARNING: no burst, photodiode or eye picked the whole-second "
+            "offset, so the map may be off by whole seconds")
+    coarse = (f"coarse match by {vote['source']} in place of the burst: shift "
+              f"{vote['shift_s']:+.3f} s, {vote['n_support']} of {vote['n_total']} "
+              f"{vote.get('counted', 'votes')} agree (runner-up {vote['n_runner_up']}); "
+              "fine fit: 1 Hz")
+    period_ms = 1e3 * float(time_map.get("sync_period_s", 1.0))
+    agreeing = [
+        name for name, c in measured.items()
+        if name != vote["source"] and c["status"] == "consistent"
+        and abs(c.get("median_offset_ms", 0.0)) < _MAX_OFFSET_PERIODS * period_ms
+    ]
+    if agreeing and not any(c["status"] == "DRIFT" for c in measured.values()):
+        return CONSISTENT_NO_BURST, (
+            f"no 14 s burst; {coarse}; {', '.join(agreeing)} agree with Blackrock's "
+            "copies (never fitted)")
+    return "NOT VALIDATED", (
+        f"no 14 s burst; {coarse}; no channel besides {vote['source']} confirms it")
 
 
 def _fmt(value: float | None, digits: int = 3) -> str:
@@ -183,21 +275,48 @@ def render_sync_report(report: dict[str, Any], title: str = "") -> str:
 
     lines += ["", "Sync signals (ms)", "-" * 60]
     for s in report["signals"]:
-        extra = (f"rms {_fmt(s.get('rms_ms'), 4)}" if "rms_ms" in s
-                 else f"median {_fmt(s.get('median_ms'), 4)}")
-        lines.append(
-            f"{s['signal']:<32} n={s['n']:<6} max {_fmt(s['max_ms'], 4)}  {extra}"
-        )
+        if s.get("absent"):
+            lines.append(f"{s['signal']:<32} not recorded")
+        elif s.get("vote"):
+            v = s["vote"]
+            lines.append(
+                f"{s['signal']:<32} shift {v['shift_s']:+.3f} s  {v['n_support']} of "
+                f"{v['n_total']} {v.get('counted', 'votes')} agree, runner-up "
+                f"{v['n_runner_up']}"
+            )
+        else:
+            extra = (f"rms {_fmt(s.get('rms_ms'), 4)}" if "rms_ms" in s
+                     else f"median {_fmt(s.get('median_ms'), 4)}")
+            lines.append(
+                f"{s['signal']:<32} n={s['n']:<6} max {_fmt(s['max_ms'], 4)}  {extra}"
+            )
         lines.append(f"    {s['path']}  [{s['role']}]")
 
-    lines += [
-        "", "Maximum misalignment per channel (ms)", "-" * 60,
-        "Aligned by the 1 Hz; the 14 s burst only picks the cycles. The error",
-        "is measured on the burst, which never enters a fit.",
-        "",
-    ]
+    if report.get("no_burst"):
+        lines += [
+            "", "Misalignment per channel (ms)", "-" * 60,
+            "Aligned by the 1 Hz. With no 14 s burst there is no held-out maximum;",
+            "a channel's error comes from its own independent check where there is one.",
+            "",
+        ]
+    else:
+        lines += [
+            "", "Maximum misalignment per channel (ms)", "-" * 60,
+            "Aligned by the 1 Hz; the 14 s burst only picks the cycles. The error",
+            "is measured on the burst, which never enters a fit.",
+            "",
+        ]
     for c in report["channels"]:
-        lines.append(f"{c['channel']:<32} max {_fmt(c['max_ms'], 4)}")
+        check = c.get("check")
+        if check is not None:
+            lines.append(
+                f"{c['channel']:<32} drift {check['drift_ms']:+.3f}  spread(95%) "
+                f"{check['spread_p95_ms']:.3f}  [{check['status']}]"
+            )
+        elif report.get("no_burst"):
+            lines.append(f"{c['channel']:<32} no held-out measure")
+        else:
+            lines.append(f"{c['channel']:<32} max {_fmt(c['max_ms'], 4)}")
         lines.append(f"    aligned by: {c['aligned_by']}")
         if c.get("error_from"):
             lines.append(f"    error from: {c['error_from']}")
@@ -206,9 +325,10 @@ def render_sync_report(report: dict[str, Any], title: str = "") -> str:
     if checks:
         lines += [
             "", "Independent checks: channels recorded on both systems (ms)", "-" * 60,
-            "Never fitted (without a burst they only pick the 1 Hz cycle). Judged on",
-            "DRIFT across the session; a constant offset is Blackrock's filter delay",
-            "on its 1 kHz stream, not a sync error.",
+            "Never fitted. Without a burst, one of them stands in for it to choose",
+            "the whole-second offset; the 1 Hz still sets the map. Judged on DRIFT",
+            "across the session; a constant offset is Blackrock's filter delay on",
+            "its 1 kHz stream, not a sync error.",
             "",
         ]
         for c in checks:
