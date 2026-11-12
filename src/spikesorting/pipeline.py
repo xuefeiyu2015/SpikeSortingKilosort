@@ -1850,30 +1850,72 @@ def time_remapping(
     np.save(seconds_path, spike_seconds)
 
     out_path = _aligned_spike_path(config, system)
+    method, tprime_error = "linear_fit", None
     if config.machine.has_tprime:
-        args = tprime_mod.build_tprime_args(
-            to_stream=br_trim_path,
-            from_streams={1: npx_trim_path},
-            events=[tprime_mod.TPrimeEvent(1, seconds_path, out_path)],
-            sync_period_s=config.sync_period_s,
-        )
-        log.info("TPrime command: %s", " ".join(args))
-        tprime_mod.run_tprime(config.machine.tprime_dir, args)
-        log.info("TPrime mapped %d spike times -> %s", spike_seconds.size, out_path.name)
-        method = "tprime"
-    else:
+        try:
+            _run_tprime_shifted(config, br_trim, npx_trim, npx_trim_path,
+                                seconds_path, out_path, spike_seconds.size)
+        except RuntimeError as error:          # TPrimeTimeout included
+            # The least-squares map is the same 1 Hz pairing fitted as a line;
+            # for linear drift it agrees with TPrime to well under a millisecond.
+            tprime_error = str(error).splitlines()[0]
+            log.warning("TPrime did not finish; using the least-squares map instead\n%s",
+                        error)
+        else:
+            log.info("TPrime mapped %d spike times -> %s", spike_seconds.size, out_path.name)
+            method = "tprime"
+    if method == "linear_fit":
         np.save(out_path, mapping.apply(spike_seconds))
-        log.info(
-            "TPrime not available on machine '%s'; applied the least-squares map to "
-            "%d spike times instead",
-            config.machine.name, spike_seconds.size,
-        )
-        method = "linear_fit"
+        if tprime_error is None:
+            log.info(
+                "TPrime not available on machine '%s'; applied the least-squares map to "
+                "%d spike times instead",
+                config.machine.name, spike_seconds.size,
+            )
 
     _save_map(aligned_dir, mapping, offset, config, obx_map, method=method,
-              cycles_from=cycles_from)
+              cycles_from=cycles_from, tprime_error=tprime_error)
     _stamp_exports(config, mapping, obx_map)
     return TimeMap(mapping, offset, method, aligned_path=out_path, burst_match=match)
+
+
+def _run_tprime_shifted(
+    config: SessionConfig,
+    br_trim: np.ndarray,
+    npx_trim: np.ndarray,
+    npx_trim_path: Path,
+    seconds_path: Path,
+    out_path: Path,
+    n_events: int,
+) -> None:
+    """TPrime on a Blackrock reference moved next to the SpikeGLX one, then moved back.
+
+    Blackrock edges are on the NSP's PTP clock (~1.8e9 s) and SpikeGLX's count
+    from the run start; TPrime expects streams that start together and spent
+    hours on that gap. The trimmed trains are already paired edge for edge, so
+    subtracting their first difference leaves TPrime its usual case -- streams
+    within the drift of each other -- and adding it back to its output is exact.
+    The constant carries no information TPrime could use: the coarse step
+    already chose the pairing.
+    """
+    from ._sync import catgt, tprime as tprime_mod
+
+    origin = float(br_trim[0] - npx_trim[0])
+    to_path = catgt.write_edge_file(
+        out_path.parent / "blackrock_1hz_trimmed_tprime.txt", br_trim - origin
+    )
+    args = tprime_mod.build_tprime_args(
+        to_stream=to_path,
+        from_streams={1: npx_trim_path},
+        events=[tprime_mod.TPrimeEvent(1, seconds_path, out_path)],
+        sync_period_s=config.sync_period_s,
+    )
+    log.info("TPrime command (Blackrock reference shifted by %.6f s): %s",
+             origin, " ".join(args))
+    tprime_mod.run_tprime(config.machine.tprime_dir, args,
+                          timeout_s=tprime_mod.tprime_timeout_s(n_events))
+    mapped = np.load(out_path).astype(np.float64)
+    np.save(out_path, mapped + origin)
 
 
 def _fit_1hz(
@@ -1969,6 +2011,7 @@ def _cycle_from_behaviour(
         if vote is not None:
             return vote, "photodiode"
         reasons.append(f"photodiode: {note}")
+        log.info("the photodiode did not pick the cycle: %s", note)
 
     for name in [n for n in shared if n != "photodiode"]:
         try:
@@ -1978,11 +2021,14 @@ def _cycle_from_behaviour(
             )
         except (OSError, ValueError) as error:
             reasons.append(f"{name}: {error}")
+            log.info("the %s did not pick the cycle: %s", name, error)
             continue
         vote = cycles.cycle_shift_from_lags(lags, period_s=period)
         if vote is not None:
             return vote, name
         reasons.append(f"{name}: {lags.size} windows locked, no clear winner")
+        log.info("the %s did not pick the cycle: %d windows locked, no clear winner",
+                 name, lags.size)
     return None, "could not pick the cycle: " + "; ".join(reasons)
 
 
@@ -1994,8 +2040,9 @@ def _save_map(
     obx_map: align.LinearMap | None = None,
     method: str | None = None,
     cycles_from: str | None = None,
+    tprime_error: str | None = None,
 ) -> None:
-    obx_to_br = None if obx_map is None else align.compose_linear_maps(mapping, obx_map)
+    obx_to_br =None if obx_map is None else align.compose_linear_maps(mapping, obx_map)
     payload = {
         "session": config.session,
         "reference_timebase": "blackrock",
@@ -2011,6 +2058,8 @@ def _save_map(
         "fit_rms_residual_s": float(np.sqrt(np.mean(mapping.residuals_s ** 2))),
         # tprime, linear_fit, or map_only when there was no sorting to map yet.
         "method": method,
+        # Why TPrime was set aside for the least-squares map, when it was.
+        "tprime_error": tprime_error,
         "formula": "blackrock_time = slope * spikeglx_time + intercept",
         # Which clock the burst was on when it picked the coarse offset.
         "burst_clock": "probe" if obx_map is not None else "onebox",

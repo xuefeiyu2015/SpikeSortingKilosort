@@ -22,6 +22,8 @@ Reference: https://billkarsh.github.io/SpikeGLX/help/syncEdges/Sync_edges/
 from __future__ import annotations
 
 import subprocess
+import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +34,8 @@ __all__ = [
     "tprime_executable",
     "build_tprime_args",
     "run_tprime",
+    "TPrimeTimeout",
+    "tprime_timeout_s",
     "spike_times_to_seconds",
     "seconds_to_spike_times",
 ]
@@ -83,31 +87,84 @@ def build_tprime_args(
     return args
 
 
+class TPrimeTimeout(RuntimeError):
+    """TPrime ran past its deadline and was stopped."""
+
+
+def tprime_timeout_s(n_events: int) -> float:
+    """A deadline no healthy run comes near: 10 min plus 1 min per million events.
+
+    TPrime maps millions of events in seconds. One that is still computing
+    after this is stuck, as it was for hours on edges 1.8e9 s apart.
+    """
+    return 600.0 + 60.0 * n_events / 1e6
+
+
 def run_tprime(
     tprime_dir: str | Path,
     args: list[str],
     timeout_s: float | None = None,
+    poll_s: float = 0.5,
 ) -> subprocess.CompletedProcess:
-    """Run TPrime, raising with its own output on failure."""
+    """Run TPrime, raising with its own output on failure.
+
+    Waits in short polls rather than one blocking wait, so Ctrl+C reaches
+    Python on Windows; whatever ends the wait -- a deadline, Ctrl+C, an error --
+    kills TPrime, so no orphan is left holding the output file open. Its
+    output goes to a file, not a pipe, so a chatty run cannot fill a pipe and
+    stall.
+    """
     executable = tprime_executable(tprime_dir)
     command = [str(executable), *args]
-    result = subprocess.run(
-        command,
-        cwd=str(Path(tprime_dir)),
-        capture_output=True,
-        text=True,
-        timeout=timeout_s,
-    )
-    if result.returncode != 0:
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    with tempfile.TemporaryFile() as out:
+        proc = subprocess.Popen(
+            command,
+            cwd=str(Path(tprime_dir)),
+            # Nothing to read from: TPrime can never sit waiting on a keyboard.
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=poll_s)
+                    break
+                except subprocess.TimeoutExpired:
+                    if deadline is not None and time.monotonic() > deadline:
+                        raise TPrimeTimeout(
+                            "TPrime still running after {t:.0f} s; stopped it\n"
+                            "command: {cmd}\n{log}".format(
+                                t=timeout_s, cmd=subprocess.list2cmdline(command),
+                                log=_log_tail(Path(tprime_dir) / "TPrime.log"),
+                            )
+                        ) from None
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        out.seek(0)
+        text = out.read().decode("utf-8", errors="replace")
+    if proc.returncode != 0:
         raise RuntimeError(
-            "TPrime failed (exit {code})\ncommand: {cmd}\nstdout:\n{out}\nstderr:\n{err}".format(
-                code=result.returncode,
-                cmd=" ".join(command),
-                out=result.stdout,
-                err=result.stderr,
+            "TPrime failed (exit {code})\ncommand: {cmd}\noutput:\n{out}\n{log}".format(
+                code=proc.returncode,
+                cmd=subprocess.list2cmdline(command),
+                out=text,
+                log=_log_tail(Path(tprime_dir) / "TPrime.log"),
             )
         )
-    return result
+    return subprocess.CompletedProcess(command, proc.returncode, text, "")
+
+
+def _log_tail(path: Path, lines: int = 20) -> str:
+    """The last ``lines`` of TPrime's log, labelled -- or say there is none."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return f"{path.name}: not found at {path}"
+    return f"{path} (last {lines} lines):\n" + "\n".join(text[-lines:])
 
 
 def spike_times_to_seconds(spike_times: np.ndarray, fs: float) -> np.ndarray:

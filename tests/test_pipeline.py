@@ -1422,6 +1422,76 @@ def test_the_neuropixels_side_writes_nothing_into_the_blackrock_folder(tmp_path)
     assert (sorted_dir / "npx_1hz_trimmed.txt").exists()
     assert {p.name for p in br_dir.iterdir()} == before
 
+def _ptp_session_with_a_sorting(tmp_path):
+    """Blackrock 1 Hz on a PTP clock (~1.8e9 s), SpikeGLX from zero, TPrime "installed"."""
+    import dataclasses
+
+    from spikesorting._sync import catgt
+
+    session = _session(tmp_path)
+    session = dataclasses.replace(
+        session, machine=dataclasses.replace(session.machine, tprime_dir=tmp_path / "tp")
+    )
+    for system in ("blackrock", "neuropixels"):
+        session.paths.sync_for(system).mkdir(parents=True, exist_ok=True)
+    origin = 1_792_273_300.0
+    npx = np.arange(0.0, 600.0, 1.0) + 5.0
+    catgt.write_edge_file(session.paths.sync_for("neuropixels") / "npx_1hz.txt", npx)
+    catgt.write_edge_file(session.paths.sync_for("blackrock") / "blackrock_1hz.txt",
+                          npx + origin)
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    sorted_dir.mkdir(parents=True, exist_ok=True)
+    np.save(sorted_dir / "spike_times.npy", np.array([300_000, 600_000, 900_000]))
+    (sorted_dir / "params.py").write_text("sample_rate = 30000.0\n", encoding="utf-8")
+    return session, origin
+
+
+def test_tprime_sees_the_blackrock_reference_beside_the_spikeglx_one(tmp_path, monkeypatch):
+    # TPrime spent hours on a PTP reference 1.8e9 s from SpikeGLX's. It must be
+    # handed streams that start together, and the shift must come back off.
+    from spikesorting._sync import catgt, tprime
+
+    session, origin = _ptp_session_with_a_sorting(tmp_path)
+    seen = {}
+
+    def fake_tprime(tprime_dir, args, timeout_s=None):
+        flags = dict(a.lstrip("-").split("=", 1) for a in args)
+        to = catgt.read_edge_file(flags["tostream"])
+        frm = catgt.read_edge_file(flags["fromstream"].split(",", 1)[1])
+        _, src, dst = flags["events"].split(",")
+        seen["gap"] = float(np.abs(to - frm).max())
+        seen["timeout_s"] = timeout_s
+        np.save(dst, np.interp(np.load(src), frm, to))   # TPrime's piecewise map
+
+    monkeypatch.setattr(tprime, "run_tprime", fake_tprime)
+    result = ss.time_remapping(session, "neuropixels")
+
+    assert seen["gap"] < 1e-3
+    assert seen["timeout_s"] is not None
+    assert result.method == "tprime"
+    assert np.allclose(np.load(result.aligned_path), origin + np.array([10.0, 20.0, 30.0]),
+                       rtol=0, atol=1e-6)
+
+
+def test_a_stuck_tprime_falls_back_to_the_fitted_line(tmp_path, monkeypatch):
+    from spikesorting._sync import tprime
+
+    session, origin = _ptp_session_with_a_sorting(tmp_path)
+
+    def stuck(tprime_dir, args, timeout_s=None):
+        raise tprime.TPrimeTimeout("TPrime still running after 600 s; stopped it")
+
+    monkeypatch.setattr(tprime, "run_tprime", stuck)
+    result = ss.time_remapping(session, "neuropixels")
+
+    assert result.method == "linear_fit"
+    assert np.allclose(np.load(result.aligned_path), origin + np.array([10.0, 20.0, 30.0]),
+                       rtol=0, atol=1e-6)
+    saved = json.loads((session.paths.aligned / "time_map.json").read_text())
+    assert saved["method"] == "linear_fit"
+    assert "still running" in saved["tprime_error"]
+
+
 def _plant_burst_on_the_onebox_clock(session, with_onebox_1hz):
     """Three hours: a probe 50 ppm off Blackrock, a OneBox 30 ppm off the probe.
 
