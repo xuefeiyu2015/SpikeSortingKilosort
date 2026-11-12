@@ -319,6 +319,7 @@ def test_without_a_burst_agreeing_channels_make_the_map_consistent(tmp_path, mon
     vote = payload["cycle_vote"]
     assert vote["source"] == "photodiode" and vote["shift_s"] == pytest.approx(-3.0)
     assert vote["counted"] == "flashes" and vote["n_support"] > vote["n_runner_up"]
+    assert payload["coarse_match_tried"] == [{"channel": "photodiode", "result": "picked"}]
 
     outcome = ss.validate_remapping(session, figures=False)
     assert outcome.verdict == "CONSISTENT (no burst)"
@@ -328,4 +329,5 @@ def test_without_a_burst_agreeing_channels_make_the_map_consistent(tmp_path, mon
     text = (session.paths.export_for("neuropixels") / "sync_report.txt").read_text()
     assert "14 s coded burst                 not recorded" in text
     assert "coarse match (photodiode)" in text and "-3.000 s" in text
+    assert "Coarse match:        photodiode, shift -3.000 s" in text
     assert "14 s burst: same OneBox clock" not in text

@@ -60,6 +60,15 @@ def build_sync_report(
     cycles_from = time_map.get("cycles_from")
     vote = time_map.get("cycle_vote")
     no_burst = cycles_from not in (None, "burst")
+    tried = time_map.get("coarse_match_tried") or []
+    source = vote["source"] if vote else None
+    # Every OneBox channel and the spikes reach Blackrock through the same
+    # chain; without a burst its whole-second step came from the vote.
+    whole_seconds = (
+        f"whole seconds: {source} coarse match ({vote['shift_s']:+.3f} s); fine: "
+        if no_burst and vote else
+        "whole seconds: none picked (may be off by whole seconds); fine: "
+        if no_burst else "")
     checks = list(checks or [])
     measured = {c["channel"]: c for c in checks if c.get("status") in ("consistent", "DRIFT")}
 
@@ -138,6 +147,9 @@ def build_sync_report(
 
     def error_without_burst(name: str) -> tuple[str, dict[str, Any] | None]:
         check = measured.get(name)
+        if check is not None and name == source:
+            return ("its own check (below); it chose the whole-second shift, so it "
+                    "cannot confirm that shift, only the 1 Hz drift"), check
         if check is not None:
             return "independent check of this channel (below)", check
         unmeasured = next((c for c in checks if c["channel"] == name), None)
@@ -157,8 +169,10 @@ def build_sync_report(
             error_from, check = error_without_burst(name)
             channels.append({
                 "channel": name, "max_ms": None,
-                "aligned_by": "1 Hz OneBox->probe, then 1 Hz probe->Blackrock",
+                "aligned_by": whole_seconds
+                + "1 Hz OneBox->probe, then 1 Hz probe->Blackrock",
                 "error_from": error_from, "check": check,
+                "coarse_source": name == source,
             })
         else:
             channels.append({
@@ -171,7 +185,7 @@ def build_sync_report(
     if no_burst:
         channels.append({
             "channel": f"spikes ({stream})", "max_ms": None,
-            "aligned_by": "1 Hz probe->Blackrock",
+            "aligned_by": whole_seconds + "1 Hz probe->Blackrock",
             "error_from": "no held-out measure; the independent checks pass through "
                           "this same fit, so their drift bounds it",
         })
@@ -203,6 +217,7 @@ def build_sync_report(
             "drift_ppm": composed["drift_ppm"],
         },
         "cycle_vote": vote,
+        "coarse_match_tried": tried,
         "no_burst": no_burst,
         "signals": signals,
         "channels": channels,
@@ -243,8 +258,9 @@ def _verdict_without_burst(
     ]
     if agreeing and not any(c["status"] == "DRIFT" for c in measured.values()):
         return CONSISTENT_NO_BURST, (
-            f"no 14 s burst; {coarse}; {', '.join(agreeing)} agree with Blackrock's "
-            "copies (never fitted)")
+            f"no 14 s burst; {coarse}; {', '.join(agreeing)} "
+            f"{'agrees' if len(agreeing) == 1 else 'agree'} with Blackrock's "
+            f"cop{'y' if len(agreeing) == 1 else 'ies'} (never fitted)")
     return "NOT VALIDATED", (
         f"no 14 s burst; {coarse}; no channel besides {vote['source']} confirms it")
 
@@ -273,6 +289,15 @@ def render_sync_report(report: dict[str, Any], title: str = "") -> str:
             f"intercept {o2b['intercept_s']:.6f} s"
         )
 
+    if report.get("no_burst"):
+        vote = report.get("cycle_vote")
+        lines.append(
+            f"Coarse match:        {vote['source']}, shift {vote['shift_s']:+.3f} s "
+            "(in place of the 14 s burst)" if vote else
+            "Coarse match:        none -- no channel picked the whole-second offset")
+        for t in report.get("coarse_match_tried") or []:
+            lines.append(f"    tried {t['channel']:<12} {t['result']}")
+
     lines += ["", "Sync signals (ms)", "-" * 60]
     for s in report["signals"]:
         if s.get("absent"):
@@ -295,7 +320,8 @@ def render_sync_report(report: dict[str, Any], title: str = "") -> str:
     if report.get("no_burst"):
         lines += [
             "", "Misalignment per channel (ms)", "-" * 60,
-            "Aligned by the 1 Hz. With no 14 s burst there is no held-out maximum;",
+            "Whole seconds from the coarse match, the rest from the 1 Hz. With no",
+            "14 s burst there is no held-out maximum;",
             "a channel's error comes from its own independent check where there is one.",
             "",
         ]
@@ -311,7 +337,8 @@ def render_sync_report(report: dict[str, Any], title: str = "") -> str:
         if check is not None:
             lines.append(
                 f"{c['channel']:<32} drift {check['drift_ms']:+.3f}  spread(95%) "
-                f"{check['spread_p95_ms']:.3f}  [{check['status']}]"
+                f"{check['spread_p95_ms']:.3f}  [{check['status']}"
+                + ("; chose the coarse shift]" if c.get("coarse_source") else "]")
             )
         elif report.get("no_burst"):
             lines.append(f"{c['channel']:<32} no held-out measure")
@@ -341,4 +368,8 @@ def render_sync_report(report: dict[str, Any], title: str = "") -> str:
                 f"spread(95%) {c['spread_p95_ms']:.3f}   n={int(c['n'])}"
             )
             lines.append(f"    {c['method']}; Blackrock {c['blackrock']}")
+            if report.get("no_burst") and report.get("cycle_vote") and (
+                    c["channel"] == report["cycle_vote"]["source"]):
+                lines.append("    chose the coarse shift: confirms the 1 Hz drift, "
+                             "not the whole-second shift")
     return "\n".join(lines) + "\n"

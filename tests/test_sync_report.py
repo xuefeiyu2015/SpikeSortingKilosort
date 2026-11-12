@@ -98,3 +98,32 @@ def test_a_channel_that_disagrees_keeps_it_not_validated(check):
     report = build_sync_report(NO_BURST, None, [], checks=[_check("eye_y"), check]
                                if check["status"] == "DRIFT" else [check])
     assert report["verdict"] == "NOT VALIDATED"
+
+
+def test_without_a_burst_the_report_names_the_coarse_match_channel_everywhere():
+    tried = [{"channel": "photodiode", "result": "2460 OneBox / 2460 Blackrock edges, "
+                                                  "no clear winner"},
+             {"channel": "eye_x", "result": "picked"}]
+    report = build_sync_report(dict(NO_BURST, coarse_match_tried=tried), None,
+                               ["eye_x", "photodiode"],
+                               checks=[_check("eye_x"), _check("photodiode")])
+    text = render_sync_report(report)
+    assert "Coarse match:        eye_x, shift +4.000 s (in place of the 14 s burst)" in text
+    assert "tried photodiode" in text and "tried eye_x        picked" in text
+    assert "whole seconds: eye_x coarse match (+4.000 s); fine: 1 Hz probe->Blackrock" in text
+    assert "[consistent; chose the coarse shift]" in text
+    assert "confirms the 1 Hz drift, not the whole-second shift" in text
+    photodiode = next(c for c in report["channels"] if c["channel"] == "photodiode")
+    assert photodiode["error_from"] == "independent check of this channel (below)"
+
+
+def test_without_any_coarse_match_the_header_says_none_was_picked():
+    no_vote = dict(NO_BURST, cycles_from="1hz_only", cycle_vote=None)
+    text = render_sync_report(build_sync_report(no_vote, None, ["eye_x"]))
+    assert "Coarse match:        none" in text
+    assert "whole seconds: none picked" in text
+
+
+def test_with_a_burst_there_is_no_coarse_match_line():
+    text = render_sync_report(build_sync_report(TIME_MAP, PASSED, ["eye_x"]))
+    assert "Coarse match" not in text and "whole seconds" not in text

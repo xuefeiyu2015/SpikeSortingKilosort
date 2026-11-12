@@ -1832,6 +1832,7 @@ def time_remapping(
     #    pick the wrong cycle -- and a line, so it holds at both ends of hours.
     match = None
     vote = None
+    tried = None
     if br_burst is not None and npx_burst is not None and br_burst.size and npx_burst.size:
         match = burst.match_bursts(br_burst, npx_burst, min_gap_s=config.burst_interval_s / 2)
         offset = match.offset_s
@@ -1853,7 +1854,7 @@ def time_remapping(
         # The provisional line has the drift right and the cycle possibly wrong;
         # the correction is a whole number of periods added to it.
         provisional = _fit_1hz(config, br_1hz, npx_1hz, offset)[2]
-        vote, cycles_from = _cycle_from_behaviour(config, provisional, obx_map)
+        vote, cycles_from, tried = _cycle_from_behaviour(config, provisional, obx_map)
         shift = 0.0
         if vote is not None:
             shift = vote.shift_s
@@ -1887,7 +1888,7 @@ def time_remapping(
     if not spike_times_path.exists():
         log.info("no sorting at %s; wrote the time map only", results_dir)
         _save_map(aligned_dir, mapping, offset, config, obx_map, method="map_only",
-                  cycles_from=cycles_from, cycle_vote=vote)
+                  cycles_from=cycles_from, cycle_vote=vote, coarse_tried=tried)
         _stamp_exports(config, mapping, obx_map)
         return TimeMap(mapping, offset, "map_only", burst_match=match)
 
@@ -1932,7 +1933,8 @@ def time_remapping(
             )
 
     _save_map(aligned_dir, mapping, offset, config, obx_map, method=method,
-              cycles_from=cycles_from, tprime_error=tprime_error, cycle_vote=vote)
+              cycles_from=cycles_from, tprime_error=tprime_error, cycle_vote=vote,
+              coarse_tried=tried)
     _stamp_exports(config, mapping, obx_map)
     return TimeMap(mapping, offset, method, aligned_path=out_path, burst_match=match)
 
@@ -2017,9 +2019,10 @@ def _cycle_from_behaviour(
     config: SessionConfig,
     provisional: align.LinearMap,
     obx_map: align.LinearMap | None,
-) -> tuple[Any, str]:
-    """``(CycleVote or None, source)``: the whole-cycle correction, from the
-    photodiode, else the eye. On ``None`` the source says why not.
+) -> tuple[Any, str, list[dict[str, str]]]:
+    """``(CycleVote or None, source, tried)``: the whole-cycle correction, from
+    the photodiode, else the eye. On ``None`` the source says why not.
+    ``tried`` lists each channel asked, in order, and what it answered.
 
     Both signals are on the OneBox and on Blackrock's ``.ns2``. The OneBox copy
     reaches Blackrock time through ``onebox_to_probe`` and the provisional 1 Hz
@@ -2033,11 +2036,11 @@ def _cycle_from_behaviour(
 
     brk, npx = config.blackrock, config.neuropixels
     if obx_map is None:
-        return None, "no OneBox 1 Hz edges, so the OneBox copies cannot be mapped"
+        return None, "no OneBox 1 Hz edges, so the OneBox copies cannot be mapped", []
     shared = [n for n in brk.analog_channels if n in npx.analog_channels]
     if brk.analog_file is None or not shared:
         return None, ("no channel named in both blackrock.analog_channels and "
-                      "neuropixels.analog_channels to pick the cycle with")
+                      "neuropixels.analog_channels to pick the cycle with"), []
     try:
         onebox = analog.load_onebox_analog(
             analog.find_onebox_analog(config.paths.export_for("neuropixels")),
@@ -2049,12 +2052,12 @@ def _cycle_from_behaviour(
             tolerance_s=config.alignment_tolerance_s, by="position",
         )
     except (OSError, ValueError, IndexError) as error:
-        return None, f"no photodiode or eye to pick the cycle with ({error})"
+        return None, f"no photodiode or eye to pick the cycle with ({error})", []
     composed = align.compose_linear_maps(provisional, obx_map)
     onebox = _replace(onebox, slope=composed.slope, intercept=composed.intercept)
     period = config.sync_period_s
 
-    reasons = []
+    tried: list[dict[str, str]] = []
     if "photodiode" in shared:
         try:
             obx_t, _ = analog.detect_onebox_events(onebox, "photodiode")
@@ -2067,8 +2070,9 @@ def _cycle_from_behaviour(
         else:
             note = f"{obx_t.size} OneBox / {br_t.size} Blackrock edges, no clear winner"
         if vote is not None:
-            return vote, "photodiode"
-        reasons.append(f"photodiode: {note}")
+            tried.append({"channel": "photodiode", "result": "picked"})
+            return vote, "photodiode", tried
+        tried.append({"channel": "photodiode", "result": note})
         log.info("the photodiode did not pick the cycle: %s", note)
 
     for name in [n for n in shared if n != "photodiode"]:
@@ -2078,16 +2082,19 @@ def _cycle_from_behaviour(
                 max_lag_s=CYCLE_SEARCH_S + period, min_corr=0.5, differentiate=True,
             )
         except (OSError, ValueError) as error:
-            reasons.append(f"{name}: {error}")
+            tried.append({"channel": name, "result": str(error)})
             log.info("the %s did not pick the cycle: %s", name, error)
             continue
         vote = cycles.cycle_shift_from_lags(lags, period_s=period)
         if vote is not None:
-            return vote, name
-        reasons.append(f"{name}: {lags.size} windows locked, no clear winner")
+            tried.append({"channel": name, "result": "picked"})
+            return vote, name, tried
+        tried.append({"channel": name,
+                      "result": f"{lags.size} windows locked, no clear winner"})
         log.info("the %s did not pick the cycle: %d windows locked, no clear winner",
                  name, lags.size)
-    return None, "could not pick the cycle: " + "; ".join(reasons)
+    return None, "could not pick the cycle: " + "; ".join(
+        f"{t['channel']}: {t['result']}" for t in tried), tried
 
 
 def _save_map(
@@ -2100,6 +2107,7 @@ def _save_map(
     cycles_from: str | None = None,
     tprime_error: str | None = None,
     cycle_vote: Any = None,
+    coarse_tried: list[dict[str, str]] | None = None,
 ) -> None:
     obx_to_br = None if obx_map is None else align.compose_linear_maps(mapping, obx_map)
     # Only a burst is held out of the fit; without one nothing validates the map
@@ -2124,6 +2132,9 @@ def _save_map(
             "n_total": cycle_vote.n_total,
             "counted": "flashes" if cycles_from == "photodiode" else "windows",
         },
+        # Without a burst: every channel asked for the whole-second offset, in
+        # order (photodiode, then the eye), and what each answered.
+        "coarse_match_tried": coarse_tried,
         "slope": mapping.slope,
         "intercept": mapping.intercept,
         "drift_ppm": mapping.drift_ppm,
