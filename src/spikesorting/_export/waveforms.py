@@ -173,7 +173,7 @@ def plan_snippets(
 
 
 def snippet_regions(
-    plan: SnippetPlan, pad: int, max_samples: int | None = None
+    plan: SnippetPlan, pad: int, max_samples: int | None = None, max_gap: int = 0
 ) -> list[tuple[int, int]]:
     """Merged ``(start, stop)`` sample ranges covering every snippet, plus ``pad``.
 
@@ -192,6 +192,14 @@ def snippet_regions(
     one piece after its pad is trimmed. Without it, measuring every spike merges
     the whole recording into one range -- one block the size of the file.
     :func:`accumulate` cuts a spike once, so the overlap counts nothing twice.
+
+    ``max_gap`` also joins ranges separated by up to that many samples, as long
+    as the joined range stays within ``max_samples``. Each read through
+    Kilosort's reader has a fixed cost -- a transfer, an FFT plan for a new
+    length, a whitening product -- so 95,000 snippets read one by one spent
+    far longer on that than on the samples. Spikes sampled evenly through a
+    session sit ~80 ms apart, so reading the gap between them is cheaper than
+    a separate read; gaps longer than ``max_gap`` are still skipped.
     """
     if plan.n_spikes == 0:
         return []
@@ -199,8 +207,13 @@ def snippet_regions(
     stops = plan.sample + plan.after + pad
     merged: list[tuple[int, int]] = []
     for start, stop in zip(starts.tolist(), stops.tolist()):
-        if merged and start <= merged[-1][1]:
+        if merged and start <= merged[-1][1]:                 # overlapping
             merged[-1] = (merged[-1][0], max(merged[-1][1], stop))
+        elif (
+            merged and max_gap > 0 and start - merged[-1][1] <= max_gap
+            and (max_samples is None or stop - merged[-1][0] <= max_samples)
+        ):                                                    # near enough to read through
+            merged[-1] = (merged[-1][0], stop)
         else:
             merged.append((start, stop))
     if max_samples is None:

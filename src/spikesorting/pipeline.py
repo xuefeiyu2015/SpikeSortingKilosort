@@ -2446,6 +2446,11 @@ def _kilosort_preprocessing(results_dir: Path) -> dict[str, Any]:
 #: merged range of dense spikes is split into pieces this long, so memory stays
 #: bounded however many spikes are measured.
 _KILOSORT_BLOCK_SAMPLES = 60_000
+#: Snippet ranges closer than this are read as one block (up to a batch): a
+#: read's fixed cost outweighs a quarter second of samples.
+_READ_THROUGH_GAP_S = 0.25
+#: How often the waveform export reports progress, as a fraction of its reads.
+_PROGRESS_STEP = 0.1
 
 
 def _kilosort_blocks(
@@ -2496,7 +2501,7 @@ def _kilosort_blocks(
     )
     rows = np.asarray(ops["probe"]["chanMap"], dtype=np.int64)
     imin = int(bfile.imin)
-    for start, stop in regions:
+    for start, stop in _with_progress(regions, "waveforms"):
         local = bfile[start - imin : stop - imin].cpu().numpy()   # (n_probe, n)
         if not local.any():
             log.warning(
@@ -2507,6 +2512,30 @@ def _kilosort_blocks(
         block = np.full((local.shape[1], n_chan), np.nan, dtype=np.float32)
         block[:, rows] = (unwhiten @ local).T
         yield start, block
+
+
+def _with_progress(items: list, label: str, step: float = _PROGRESS_STEP):
+    """Yield ``items``, logging every ``step`` of the way with a time estimate.
+
+    A stage that reads for half an hour without a line looks exactly like one
+    that hangs.
+    """
+    import time
+
+    n = len(items)
+    every = max(1, int(np.ceil(n * step)))
+    started = time.perf_counter()
+    for i, item in enumerate(items, 1):
+        yield item
+        if i % every == 0 and i < n:
+            elapsed = time.perf_counter() - started
+            left = elapsed / i * (n - i)
+            log.info("%s: %d%% of %d reads, %s elapsed, ~%s left", label,
+                     round(100 * i / n), n, _minutes(elapsed), _minutes(left))
+
+
+def _minutes(seconds: float) -> str:
+    return f"{seconds:.0f} s" if seconds < 90 else f"{seconds / 60:.1f} min"
 
 
 def _uv_per_digit(
@@ -2663,7 +2692,8 @@ def export_waveforms(
         max_per_unit=wf.max_spikes,
         margin=pad,
     )
-    regions = snippet_regions(plan, pad, max_samples=_KILOSORT_BLOCK_SAMPLES + 2 * pad)
+    regions = snippet_regions(plan, pad, max_samples=_KILOSORT_BLOCK_SAMPLES + 2 * pad,
+                              max_gap=int(_READ_THROUGH_GAP_S * fs))
     scale, scale_note = _uv_per_digit(config, system, n_chan, binary)
     # An unknown gain must not destroy the mean: the shape and the relative
     # amplitude are still worth having. uv_per_digit stays NaN so nobody

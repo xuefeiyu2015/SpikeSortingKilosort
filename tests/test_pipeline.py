@@ -2093,3 +2093,15 @@ def test_run_info_records_the_source_and_how_long_the_sort_took(tmp_path):
     info = json.loads((tmp_path / "run_info.json").read_text())
     assert info["timing"]["kilosort_s"] == 12.5
     assert info["source_recording"].endswith("x.bin")
+
+
+def test_a_long_read_reports_its_progress(caplog):
+    import logging
+
+    from spikesorting import pipeline
+
+    with caplog.at_level(logging.INFO, logger=pipeline.log.name):
+        assert list(pipeline._with_progress(list(range(100)), "waveforms")) == list(range(100))
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("waveforms:")]
+    assert len(lines) == 9                       # 10% .. 90%; the stage's own line ends it
+    assert "50% of 100 reads" in lines[4] and "left" in lines[4]
