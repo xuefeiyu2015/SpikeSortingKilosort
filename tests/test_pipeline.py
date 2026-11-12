@@ -1535,6 +1535,7 @@ def test_the_burst_is_mapped_off_the_onebox_clock_before_validation(tmp_path):
     assert report.max_residual_s < 1e-5
     time_map = json.loads((session.paths.aligned / "time_map.json").read_text())
     assert time_map["burst_clock"] == "probe"
+    assert time_map["onebox_to_blackrock"]["validated_by"] == "validation.json"
     assert time_map["onebox_to_probe"]["drift_ppm"] == pytest.approx(30.0, abs=0.01)
     validation = json.loads((session.paths.aligned / "validation.json").read_text())
     assert validation["burst_clock"] == "probe"
@@ -2037,6 +2038,23 @@ def test_the_sync_report_says_not_validated_without_bursts(tmp_path):
         (session.paths.export_for("neuropixels") / "sync_report.json").read_text()
     )
     assert sync["verdict"] == "NOT VALIDATED"
+
+
+def test_without_a_burst_the_time_map_claims_no_burst_and_no_validation(tmp_path):
+    session = _session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    for name in ("npx_burst.txt", "blackrock_burst.txt"):
+        for system in ("neuropixels", "blackrock"):
+            path = session.paths.sync_for(system) / name
+            if path.exists():
+                path.write_text("")
+    ss.time_remapping(session, "neuropixels")
+
+    time_map = json.loads((session.paths.aligned / "time_map.json").read_text())
+    assert time_map["cycles_from"] != "burst"
+    assert time_map["burst_clock"] is None
+    assert time_map["onebox_to_blackrock"]["validated_by"] is None
+    assert time_map["onebox_to_probe"]["formula"].startswith("spikeglx_time =")
 
 
 def test_a_clock_map_from_another_file_is_never_applied_to_spikes(tmp_path):

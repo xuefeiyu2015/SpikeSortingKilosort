@@ -2042,7 +2042,10 @@ def _save_map(
     cycles_from: str | None = None,
     tprime_error: str | None = None,
 ) -> None:
-    obx_to_br =None if obx_map is None else align.compose_linear_maps(mapping, obx_map)
+    obx_to_br = None if obx_map is None else align.compose_linear_maps(mapping, obx_map)
+    # Only a burst is held out of the fit; without one nothing validates the map
+    # and there was no burst whose clock to report.
+    had_burst = cycles_from == "burst"
     payload = {
         "session": config.session,
         "reference_timebase": "blackrock",
@@ -2061,8 +2064,9 @@ def _save_map(
         # Why TPrime was set aside for the least-squares map, when it was.
         "tprime_error": tprime_error,
         "formula": "blackrock_time = slope * spikeglx_time + intercept",
-        # Which clock the burst was on when it picked the coarse offset.
-        "burst_clock": "probe" if obx_map is not None else "onebox",
+        # Which clock the burst was on when it picked the coarse offset; null
+        # without a burst.
+        "burst_clock": None if not had_burst else ("probe" if obx_map is not None else "onebox"),
         "onebox_to_probe": None if obx_map is None else {
             "slope": obx_map.slope,
             "intercept": obx_map.intercept,
@@ -2070,7 +2074,8 @@ def _save_map(
             "n_points": obx_map.n_points,
             "fit_max_residual_s": float(np.abs(obx_map.residuals_s).max()),
             "fit_rms_residual_s": float(np.sqrt(np.mean(obx_map.residuals_s ** 2))),
-            "formula": "probe_time = slope * onebox_time + intercept",
+            # spikeglx_time is the probe's clock: one name for it throughout.
+            "formula": "spikeglx_time = slope * onebox_time + intercept",
         },
         # The two fits above composed: what a OneBox analog channel (eye, pupil,
         # photodiode) needs to land on Blackrock time. It is the exact chain the
@@ -2081,7 +2086,8 @@ def _save_map(
             "intercept": obx_to_br.intercept,
             "drift_ppm": obx_to_br.drift_ppm,
             "formula": "blackrock_time = slope * onebox_time + intercept",
-            "validated_by": "validation.json",
+            # The held-out burst checks this chain; without one, nothing does.
+            "validated_by": "validation.json" if had_burst else None,
         },
         "clocks": _clock_definitions(config),
     }
