@@ -1930,7 +1930,7 @@ def time_remapping(
     method, tprime_error = "linear_fit", None
     if config.machine.has_tprime:
         try:
-            _run_tprime_shifted(config, br_trim, npx_trim, npx_trim_path,
+            _run_tprime_shifted(config, br_trim, npx_trim, mapping,
                                 seconds_path, out_path, spike_seconds.size)
         except RuntimeError as error:          # TPrimeTimeout included
             # The least-squares map is the same 1 Hz pairing fitted as a line;
@@ -1961,39 +1961,64 @@ def _run_tprime_shifted(
     config: SessionConfig,
     br_trim: np.ndarray,
     npx_trim: np.ndarray,
-    npx_trim_path: Path,
+    mapping: align.LinearMap,
     seconds_path: Path,
     out_path: Path,
     n_events: int,
 ) -> None:
-    """TPrime on a Blackrock reference moved next to the SpikeGLX one, then moved back.
+    """TPrime with the probe clock put onto Blackrock's by the fitted line first.
 
-    Blackrock edges are on the NSP's PTP clock (~1.8e9 s) and SpikeGLX's count
-    from the run start; TPrime expects streams that start together and spent
-    hours on that gap. The trimmed trains are already paired edge for edge, so
-    subtracting their first difference leaves TPrime its usual case -- streams
-    within the drift of each other -- and adding it back to its output is exact.
-    The constant carries no information TPrime could use: the coarse step
-    already chose the pairing.
+    **What TPrime does**, measured on a real session (fits its output to 0.1 us):
+    for an event at ``t`` it takes the last *reference* edge ``to_k <= t`` and
+    returns ``t + (to_k - from_k)`` -- one constant offset per sync interval,
+    chosen by comparing a from-stream time against to-stream edges. That is only
+    right when the two edge lists sit on top of each other.
+
+    So both are brought together before TPrime sees them, by the 1 Hz line
+    ``L(t) = slope*t + intercept`` already fitted from these same pairs:
+
+    - **from**: ``slope*npx`` and ``slope*t`` -- the probe clock, drift removed;
+    - **to**:   ``br - intercept`` -- Blackrock, its 1.8e9 s PTP origin removed.
+
+    The two lists then differ only by the line's residual (< 1 ms), so TPrime's
+    interval switches at the probe's own edge rather than up to drift x duration
+    before it (7.6 ms by the end of a 2 h session at 1 ppm, when only the first
+    difference was subtracted). Its output plus ``intercept`` is
+    ``L(t) + (br_k - L(npx_k))``: the line, plus that interval's measured
+    departure from it -- the slow wander TPrime exists to follow. Values stay
+    near the run's own seconds, so nothing loses float precision.
+
+    The offset still steps by whole samples at each edge (edge quantisation),
+    so two spikes straddling an edge closer than the step can swap order. That
+    is TPrime's model, not this shift.
     """
     from ._sync import catgt, tprime as tprime_mod
 
-    origin = float(br_trim[0] - npx_trim[0])
+    slope, intercept = float(mapping.slope), float(mapping.intercept)
+    work = out_path.parent
     to_path = catgt.write_edge_file(
-        out_path.parent / "blackrock_1hz_trimmed_tprime.txt", br_trim - origin
-    )
+        work / "blackrock_1hz_trimmed_tprime.txt", br_trim - intercept)
+    from_path = catgt.write_edge_file(
+        work / "npx_1hz_trimmed_tprime.txt", slope * npx_trim)
+    events_path = work / f"{seconds_path.stem}_tprime.npy"
+    np.save(events_path, slope * np.load(seconds_path).astype(np.float64))
+    log.info("TPrime edges brought together by the 1 Hz line: max gap %.3f ms",
+             1e3 * float(np.abs((br_trim - intercept) - slope * npx_trim).max()))
     args = tprime_mod.build_tprime_args(
         to_stream=to_path,
-        from_streams={1: npx_trim_path},
-        events=[tprime_mod.TPrimeEvent(1, seconds_path, out_path)],
+        from_streams={1: from_path},
+        events=[tprime_mod.TPrimeEvent(1, events_path, out_path)],
         sync_period_s=config.sync_period_s,
     )
-    log.info("TPrime command (Blackrock reference shifted by %.6f s): %s",
-             origin, " ".join(args))
-    tprime_mod.run_tprime(config.machine.tprime_dir, args,
-                          timeout_s=tprime_mod.tprime_timeout_s(n_events))
+    log.info("TPrime command (probe x %.9f, Blackrock - %.6f s): %s",
+             slope, intercept, " ".join(args))
+    try:
+        tprime_mod.run_tprime(config.machine.tprime_dir, args,
+                              timeout_s=tprime_mod.tprime_timeout_s(n_events))
+    finally:
+        events_path.unlink(missing_ok=True)       # a scaled copy of every spike
     mapped = np.load(out_path).astype(np.float64)
-    np.save(out_path, mapped + origin)
+    np.save(out_path, mapped + intercept)
 
 
 def _fit_1hz(

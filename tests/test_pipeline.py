@@ -1477,6 +1477,54 @@ def test_tprime_sees_the_blackrock_reference_beside_the_spikeglx_one(tmp_path, m
                        rtol=0, atol=1e-6)
 
 
+def _tprime_rule(to, frm, t):
+    """TPrime as measured on a real session: the interval is chosen by the
+    *reference* edges, and each interval is one constant offset."""
+    k = np.clip(np.searchsorted(to, t, side="right") - 1, 0, to.size - 1)
+    return t + (to[k] - frm[k])
+
+
+def test_tprime_switches_interval_at_the_probe_edge_despite_drift(tmp_path, monkeypatch):
+    # 50 ppm over 10 min is 30 ms of drift, and every Blackrock edge carries a
+    # whole-sample jitter. With only the first difference subtracted, TPrime
+    # would pick the next interval for spikes up to 30 ms before a probe edge.
+    from spikesorting._sync import catgt, tprime
+
+    session, origin = _ptp_session_with_a_sorting(tmp_path)
+    npx = np.arange(0.0, 600.0, 1.0) + 5.0
+    jitter = np.random.default_rng(1).integers(-3, 4, npx.size) / 30000.0
+    br = origin + npx * (1 + 50e-6) + jitter
+    catgt.write_edge_file(session.paths.sync_for("blackrock") / "blackrock_1hz.txt", br)
+    # spikes 1 ms before each probe edge: inside the window the old shift got wrong
+    spikes_s = npx[10:500] - 1e-3
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    np.save(sorted_dir / "spike_times.npy", np.round(spikes_s * 30000).astype(np.int64))
+    seen = {}
+
+    def fake_tprime(tprime_dir, args, timeout_s=None):
+        flags = dict(a.lstrip("-").split("=", 1) for a in args)
+        to = catgt.read_edge_file(flags["tostream"])
+        frm = catgt.read_edge_file(flags["fromstream"].split(",", 1)[1])
+        _, src, dst = flags["events"].split(",")
+        seen["gap"] = float(np.abs(to - frm).max())
+        seen["events"] = Path(src)
+        np.save(dst, _tprime_rule(to, frm, np.load(src)))
+
+    monkeypatch.setattr(tprime, "run_tprime", fake_tprime)
+    result = ss.time_remapping(session, "neuropixels")
+
+    assert result.method == "tprime"
+    assert seen["gap"] < 2e-4                         # residual only, no drift
+    assert not seen["events"].exists()                # the scaled copy is removed
+    t = np.round(spikes_s * 30000) / 30000.0
+    m = result.mapping
+    k = np.searchsorted(npx, t, side="right") - 1     # the probe's own interval
+    expected = m.slope * t + m.intercept + (br[k] - (m.slope * npx[k] + m.intercept))
+    # 2 us: edge files carry 6 decimals and float64 at 1.8e9 s; the wrong
+    # interval would be off by the jitter step, 33-200 us.
+    assert np.allclose(np.load(result.aligned_path), expected, rtol=0, atol=2e-6)
+
+
 def test_a_stuck_tprime_falls_back_to_the_fitted_line(tmp_path, monkeypatch):
     from spikesorting._sync import tprime
 
