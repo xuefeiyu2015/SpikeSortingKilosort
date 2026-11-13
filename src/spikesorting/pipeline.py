@@ -83,6 +83,7 @@ __all__ = [
     "export_results",
     "export_waveforms",
     "record_timing",
+    "timing_table",
     "stamp_lfp_timebase",
     "stamp_analog_timebase",
     "Binary",
@@ -3233,6 +3234,28 @@ def record_timing(
         "total": tm.format_seconds(run_info["timing"]["total_s"]),
         "_text": text,                     # the table, for the driver to print
     }
+
+
+def timing_table(config: SessionConfig, system: str) -> str | None:
+    """The timing table of this stream's ``run_info.json``, as text; None without one.
+
+    The same rendering :func:`record_timing` writes to ``timing.txt``, read back
+    from whatever phases have run so far -- after sorting alone, four of five.
+    """
+    _check(system)
+    from ._export import timing as tm
+
+    info_path = config.paths.sorted_for(system) / "run_info.json"
+    if not info_path.exists():
+        return None
+    with open(info_path, "r", encoding="utf-8") as handle:
+        timing = json.load(handle).get("timing")
+    if not timing:
+        return None
+    title = f"{config.session} | {stream_label(system)}"
+    if system == "neuropixels" and config.probe_tag is not None:
+        title += f" {config.probe_tag}"
+    return tm.render_timing(timing, title)
 
 
 def _write_overview(phy, unit_ids: np.ndarray, path: Path) -> Path | None:

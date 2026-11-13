@@ -34,6 +34,10 @@ The export reads the labels Phy writes: ``cluster_group.tsv`` overrides
 Kilosort's own ``cluster_KSLabel.tsv``, and every cluster not labelled noise is
 exported.
 
+Everything it prints -- each stage's outcome and time, the pipeline's messages,
+the timing tables -- is also saved to
+``<system>_dir/kilosort4/logs/exporting_<start>_<machine>.log``, one per run.
+
 Two flags, each overriding a session key for this run only:
 
     --export-lfp         export_lfp: true
@@ -55,7 +59,7 @@ from pathlib import Path
 # The shared CLI helpers live in tools/; _cli adds src/ itself.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 
-from _cli import Runner, build_parser, load  # noqa: E402
+from _cli import RunLog, Runner, build_parser, load, log_directories  # noqa: E402
 
 import spikesorting as ss  # noqa: E402
 
@@ -94,7 +98,21 @@ def main() -> int:
     args = parser.parse_args()
     _log_pipeline_messages()
 
-    config = load(args, require_inputs=False)
+    # Everything printed from here on is also kept, and saved as
+    # <system>_dir/kilosort4/logs/exporting_<start>_<machine>.log.
+    run_log = RunLog("exporting")
+    config = None
+    try:
+        config = load(args, require_inputs=False)
+        return _export(config)
+    finally:
+        run_log.close()
+        if config is not None:
+            for path in run_log.save(log_directories(config), config.machine.name):
+                print(f"log: {path}")
+
+
+def _export(config) -> int:
     run = Runner(config)
     print()
 

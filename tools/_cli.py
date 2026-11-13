@@ -8,10 +8,13 @@ shared conda env is not always possible.
 from __future__ import annotations
 
 import argparse
+import io
+import logging
 import os
 import sys
 import time
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -241,13 +244,112 @@ class Runner:
         """The stages that ran for one stream (``label`` as printed), in order."""
         return [s for s in self.stages if s["label"] == label]
 
+    def stage_table(self) -> str:
+        """Every stage of this run, one line each: stream, stage, outcome, time."""
+        if not self.stages:
+            return ""
+        width = max(len(s["label"] or "") for s in self.stages) + 2
+        lines = ["stage times"]
+        for s in self.stages:
+            lines.append(
+                f"  {s['label'] or '':<{width}}{s['stage']:<22}{s['status']:<15}"
+                f"{_elapsed(s['seconds']):>10}"
+            )
+        total = sum(s["seconds"] for s in self.stages)
+        lines.append(f"  {'':<{width}}{'total':<37}{_elapsed(total):>10}")
+        return "\n".join(lines)
+
     def finish(self, name: str) -> int:
+        table = self.stage_table()
+        if table:
+            print()
+            print(table)
         print()
         if self.failures:
             print(f"{name} finished with {self.failures} failure(s)")
             return 1
         print(f"{name} finished")
         return 0
+
+
+class _Tee(io.TextIOBase):
+    """A stream that writes to the terminal and to the run log."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text: str) -> int:
+        for stream in self.streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
+class RunLog:
+    """Everything a driver prints, kept so it can be saved beside the outputs.
+
+    The terminal shows the run as it happens and is gone afterwards; this keeps
+    the same text -- the ``[ok]/[--]/[!!]`` lines, the pipeline's log messages,
+    the stage times and timing tables -- and :meth:`save` writes it, named by
+    script, start time and machine, so runs accumulate rather than overwrite
+    and a run from the share can be read beside one from a local disk.
+
+    Kilosort's own log is not in it (Kilosort writes ``kilosort4.log`` beside
+    the sorting), nor are progress bars, which go to stderr.
+    """
+
+    def __init__(self, script: str):
+        self.script = script
+        self.started = datetime.now().astimezone()
+        self.buffer = io.StringIO()
+        self._stdout = sys.stdout
+        sys.stdout = _Tee(self._stdout, self.buffer)
+        self._handler = logging.StreamHandler(self.buffer)
+        self._handler.setFormatter(logging.Formatter("       %(message)s"))
+        logging.getLogger("spikesorting").addHandler(self._handler)
+        print(f"{script} started {self.started.isoformat(timespec='seconds')}, "
+              f"command: {' '.join(sys.argv)}")
+
+    def close(self) -> None:
+        """Stop capturing. Safe to call twice."""
+        sys.stdout = self._stdout
+        logging.getLogger("spikesorting").removeHandler(self._handler)
+
+    def filename(self, machine: str) -> str:
+        return f"{self.script}_{self.started:%Y%m%d-%H%M%S}_{machine}.log"
+
+    def save(self, directories, machine: str) -> list[Path]:
+        """Write the log into ``<dir>/logs/`` for each directory. Returns the paths."""
+        text = self.buffer.getvalue()
+        saved = []
+        for directory in dict.fromkeys(Path(d) for d in directories):
+            target = directory / "logs" / self.filename(machine)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+            except OSError as error:  # a log must never turn a finished run into a failure
+                print(f"could not write {target}: {error}")
+                continue
+            saved.append(target)
+        return saved
+
+
+def log_directories(config: SessionConfig) -> list[Path]:
+    """Where a run's log goes: each stream's sorting folder the session declares.
+
+    Beside ``run_info.json`` and the sorting it describes; one copy per stream,
+    so each folder holds the record of every run that touched it.
+    """
+    dirs = []
+    for _, probe_config in config.per_probe():
+        if probe_config.has_data("neuropixels"):
+            dirs.append(probe_config.paths.sorted_for("neuropixels"))
+    if config.has_data("blackrock"):
+        dirs.append(config.paths.sorted_for("blackrock"))
+    return dirs
 
 
 def _elapsed(seconds: float) -> str:

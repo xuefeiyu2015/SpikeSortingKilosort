@@ -133,3 +133,47 @@ def test_the_runner_keeps_each_stages_time_and_breakdown(monkeypatch):
     assert stage["stage"] == "export_results" and stage["status"] == "ok"
     assert stage["steps"] == {"figures": 1.0}
     assert run.stages_for("blackrock")[0]["status"] == "nothing to do"
+
+
+def test_the_run_log_keeps_what_was_printed_and_logged_and_saves_it_per_stream(tmp_path):
+    import logging
+    import sys
+
+    from _cli import RunLog
+
+    terminal = sys.stdout
+    run_log = RunLog("exporting")
+    try:
+        print("[ok] extract_sync(neuropixels)")
+        logging.getLogger("spikesorting").warning("a pipeline message")
+    finally:
+        run_log.close()
+    assert sys.stdout is terminal                    # capture is undone
+
+    saved = run_log.save([tmp_path / "np", tmp_path / "br", tmp_path / "np"], "rig")
+
+    assert [p.parent for p in saved] == [tmp_path / "np" / "logs", tmp_path / "br" / "logs"]
+    name = saved[0].name
+    assert name.startswith("exporting_") and name.endswith("_rig.log")
+    text = saved[0].read_text()
+    assert "[ok] extract_sync(neuropixels)" in text and "a pipeline message" in text
+    assert "command:" in text.splitlines()[0]
+
+
+def test_the_stage_table_lists_every_stage_and_the_total(monkeypatch):
+    from types import SimpleNamespace
+
+    import _cli
+    from _cli import Runner
+
+    monkeypatch.setattr(_cli, "skip_reason", lambda *a, **k: None)
+    run = Runner(SimpleNamespace())
+    run.stages = [
+        {"label": "neuropixels", "stage": "preprocess", "status": "ok", "seconds": 90.0},
+        {"label": "blackrock", "stage": "sort_with_kilosort", "status": "ok", "seconds": 30.0},
+    ]
+    lines = run.stage_table().splitlines()
+
+    assert lines[0] == "stage times"
+    assert "preprocess" in lines[1] and "1.5 min" in lines[1]
+    assert lines[-1].split()[-3:] == ["total", "2.0", "min"]
