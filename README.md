@@ -18,16 +18,21 @@ run_sorting_pipeline.py             →           phy template-gui  →  run_exp
 | missing a channel map (`probe_file`) | **[Extra 1](#Extra-1--probe-files-channel-maps)** |
 | staring at a `[--]` skipped or `[!!]` failed line | **[Extra 2](#Extra-2--when-a-stage-skips-or-fails)** |
 
-Three notebooks sit alongside the steps below, in `notebooks/`:
+Five notebooks sit alongside the steps below, in `notebooks/`:
 
-- **`run_pipeline_stepbystep.ipynb`** — if you want to understand what each step
-  of the pipeline actually does, follow this one. Every cell calls a single verb,
-  in the same order the two runner scripts call them, and shows what it returns.
-  It is for reading and learning; for a real session use the scripts.
+- **`step1_run_sorting_stepbystep.ipynb`** and **`step2_run_export_stepbystep.ipynb`**
+  — if you want to understand what each step of the pipeline actually does,
+  follow these, one per runner script. Every cell calls a single verb, in the
+  same order the script calls them, and shows what it returns; step 2 also takes
+  synchronization apart one step at a time and recomputes a unit's quality
+  metrics by hand. They are for reading and learning; for a real session use the
+  scripts.
 - **`setup_demo_data.ipynb`** — downloads the official Kilosort4 demo recording
   and its channel map, so you can run the whole pipeline start to finish without
   any rig data. Used in [Step 4f](#4f-prove-it-works).
 - **`build_probe_config.ipynb`** — builds or inspects a channel map by hand.
+- **`compare_sync_analog.ipynb`** — overlays the OneBox and Blackrock copies of
+  the sync and behaviour signals, before and after synchronization.
   **Not needed in most cases**: a Neuropixels map comes from the run's own
   `.meta`, and a Utah array's comes from its `.cmp`. See
   [Step 5](#step-5--probe-files-channel-maps).
@@ -102,7 +107,8 @@ settings Kilosort would get — without sorting. It is the way to check a sessio
 file before booking rig time.
 
 To watch the same thing happen one verb at a time, open
-`notebooks/run_pipeline_stepbystep.ipynb`.
+`notebooks/step1_run_sorting_stepbystep.ipynb`, then
+`notebooks/step2_run_export_stepbystep.ipynb` after curation.
 
 
 
