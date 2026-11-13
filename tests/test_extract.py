@@ -294,3 +294,82 @@ def test_ignoring_clock_drift_fails_validation(tmp_path):
     )
     assert not report.passed
     assert report.max_residual_s > 1e-3
+
+
+def _fake_blackrock(monkeypatch, pulses):
+    """Stand in for neo: one reader, an identity NSP map, fixed pulse times."""
+    from types import SimpleNamespace
+
+    from spikesorting._io import blackrock
+
+    opened = []
+    identity = SimpleNamespace(
+        apply=lambda samples: np.asarray(samples, dtype=float) / FS,
+        summary=lambda: "identity",
+        to_dict=lambda: {"segments": []},
+    )
+    monkeypatch.setattr(blackrock, "open_reader", lambda path, **_: opened.append(path) or object())
+    monkeypatch.setattr(blackrock, "nsp_time_map", lambda *a, **k: identity)
+    monkeypatch.setattr(blackrock, "nsx_number", lambda path: 5)
+    monkeypatch.setattr(
+        blackrock, "stream_for_channel",
+        lambda reader, channel: SimpleNamespace(n_segments=1, fs=FS, channel_id=channel),
+    )
+    monkeypatch.setattr(blackrock, "iter_channel", lambda *a, **k: iter(()))
+    monkeypatch.setattr(extract.edges, "stream_pulse_times", lambda *a, **k: pulses)
+    return opened
+
+
+def _sync_only_session(tmp_path, neuropixels_block):
+    br = tmp_path / "share" / "2026-11-10"
+    br.mkdir(parents=True)
+    path = tmp_path / "s.yaml"
+    path.write_text(
+        f"blackrock_dir: '{br}'\nblackrock:\n  sync_file: '{br}/NSP-x.ns5'\n"
+        + neuropixels_block,
+        encoding="utf-8",
+    )
+    session = cfg.load_session_config(path, "mac", None)
+    for _, probe_config in session.per_probe():
+        probe_config.paths.dir_for("neuropixels").mkdir(parents=True, exist_ok=True)
+        probe_config.paths.mkdirs()
+    return session, br
+
+
+def test_blackrock_pulses_land_in_the_neuropixels_folder_not_on_the_share(tmp_path, monkeypatch):
+    # The Blackrock share is read for its pulses and never written to: they
+    # exist only to align Neuropixels, so they go beside its time map.
+    _fake_blackrock(monkeypatch, np.arange(5.0))
+    session, br = _sync_only_session(
+        tmp_path,
+        f"neuropixels_dir: '{tmp_path / 'local' / 'run_g0_imec0'}'\n"
+        f"neuropixels:\n  bin_file: '{tmp_path}/local/run_g0_imec0/run_g0_t0.imec0.ap.bin'\n",
+    )
+
+    extract_sync(session, "blackrock")
+
+    folder = session.paths.sorted_for("neuropixels")
+    for name in ("blackrock_1hz.txt", "blackrock_burst.txt", extract.SYNC_NSP_MAP):
+        assert (folder / name).exists(), name
+    assert list(br.iterdir()) == []                 # not even a kilosort4/
+
+
+def test_two_probes_each_get_the_blackrock_pulses_from_one_read(tmp_path, monkeypatch):
+    opened = _fake_blackrock(monkeypatch, np.arange(5.0))
+    run = tmp_path / "local" / "run_g0"
+    session, br = _sync_only_session(
+        tmp_path,
+        f"neuropixels_dir: '{run}'\nneuropixels:\n  bin_files:\n"
+        f"    - '{run}/run_g0_imec0/run_g0_t0.imec0.ap.bin'\n"
+        f"    - '{run}/run_g0_imec1/run_g0_t0.imec1.ap.bin'\n",
+    )
+
+    extract_sync(session, "blackrock")
+
+    assert len(opened) == 1
+    for _, probe_config in session.per_probe():
+        folder = probe_config.paths.sorted_for("neuropixels")
+        assert np.allclose(np.loadtxt(folder / "blackrock_1hz.txt"), np.arange(5.0))
+        assert (folder / extract.SYNC_NSP_MAP).exists()
+    assert not (run / cfg.SORTER_NAME).exists()     # nothing above the probe folders
+    assert list(br.iterdir()) == []

@@ -583,12 +583,16 @@ class OutputPaths:
     """Where one session's outputs go: one folder per system, beside its data.
 
     Everything derived from a system lands in ``<system>_dir/<sorter>/`` -- the
-    sorting, that system's sync edges, and the export bundle inside it. Handing
-    an analysis a recording means handing it one directory, and there is no
-    system or probe level above it: the directory the session names already says
-    which recording it is. Cross-system results (the time map) go under the
-    Blackrock one, because Blackrock is the reference timebase everything is
-    mapped onto.
+    sorting and the export bundle inside it. Handing an analysis a recording
+    means handing it one directory, and there is no system or probe level above
+    it: the directory the session names already says which recording it is.
+
+    Synchronization belongs to the Neuropixels recording: the time map, and the
+    Blackrock pulse files it was fitted from, go in the Neuropixels folder,
+    since they exist only to put Neuropixels on Blackrock time. So
+    ``<blackrock_dir>/<sorter>/`` exists only when the Utah array is sorted
+    (``sorts_blackrock``); a session whose Blackrock only carries the pulses
+    writes nothing beside the ``.ns5``.
 
     ``sorted_np`` and ``sorted_br`` both name a directory holding the sorter's
     own results -- ``spike_times.npy``, ``params.py``, ``cluster_KSLabel.tsv``.
@@ -605,6 +609,9 @@ class OutputPaths:
     #: label only: each probe's outputs are already apart, in its own
     #: ``neuropixels_dir``.
     probe_tag: str | None = None
+    #: Whether the Utah array is sorted. Without that, nothing is written
+    #: under ``blackrock_dir`` -- its folder is never even created.
+    sorts_blackrock: bool = True
 
     def dir_for(self, system: str) -> Path | None:
         """That system's directory, or None when it never recorded."""
@@ -641,11 +648,19 @@ class OutputPaths:
         return self._require(system) / "preprocessed"
 
     def sync_for(self, system: str) -> Path:
-        """Edge files, in the same folder as the sorting they are aligned with.
+        """Edge files: both systems' go in the Neuropixels sorting's folder.
+
+        Blackrock's pulses exist only to align Neuropixels, so they sit beside
+        the time map fitted from them, not beside the ``.ns5`` -- a local
+        Neuropixels sorting then never writes to the share Blackrock is on. Only
+        a session with no Neuropixels (nothing to align) falls back to
+        Blackrock's own folder, so the path is still defined.
 
         Computable before anything is sorted, which is what lets ``extract_sync``
         run on the rig straight after the session.
         """
+        if self.neuropixels_dir is not None:
+            return self.sorted_for("neuropixels")
         return self.sorted_for(system)
 
     @property
@@ -664,8 +679,8 @@ class OutputPaths:
         Neuropixels recording -- Blackrock's own spikes are already on its clock
         and never read it. It sits beside that sorting, with the trimmed edges,
         ``validation.json`` and the mapped spike times, wherever that folder is:
-        a local sorting stays local and only Blackrock's few-KB edge files are
-        read off the share. Each probe already has its own ``neuropixels_dir``,
+        a local sorting stays local, and the Blackrock edges it was fitted from
+        sit beside it too (``sync_for``). Each probe already has its own ``neuropixels_dir``,
         so two probes' maps cannot collide.
 
         A session with no Neuropixels has nothing to map; the Blackrock folder
@@ -689,11 +704,21 @@ class OutputPaths:
         """Per-unit and overview plots, inside that system's bundle."""
         return self.export_for(system) / "figures"
 
+    def writes_to(self, system: str) -> bool:
+        """Whether anything is written under that system's directory.
+
+        Neuropixels whenever it recorded; Blackrock only when its array is
+        sorted -- a sync-only Blackrock's outputs live with Neuropixels.
+        """
+        if self.dir_for(system) is None:
+            return False
+        return system == "neuropixels" or self.sorts_blackrock
+
     def all(self) -> tuple[Path, ...]:
         """Every directory this session can actually write to."""
         paths: list[Path] = []
         for system in ("neuropixels", "blackrock"):
-            if self.dir_for(system) is not None:
+            if self.writes_to(system):
                 paths += [self.sorted_for(system), self.export_for(system)]
         return tuple(dict.fromkeys(paths))
 
@@ -717,9 +742,13 @@ class OutputPaths:
         return directory
 
     def mkdirs(self) -> None:
-        """Create each system's output folders, inside its existing directory."""
+        """Create each system's output folders, inside its existing directory.
+
+        Only for a system that is written to (``writes_to``): a Blackrock that
+        is not sorted gets no ``kilosort4/`` beside its recording.
+        """
         for system in ("neuropixels", "blackrock"):
-            if self.dir_for(system) is None:
+            if not self.writes_to(system):
                 continue
             self.require_dir(system)
             for path in (self.sorted_for(system), self.export_for(system)):
@@ -790,6 +819,7 @@ class SessionConfig:
             self.neuropixels_dir,
             self.sorter,
             probe_tag=self.probe_tag,
+            sorts_blackrock=self.sorts_blackrock,
         )
 
     @property

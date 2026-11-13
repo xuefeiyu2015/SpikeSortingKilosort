@@ -340,6 +340,9 @@ class RunLog:
 def log_directories(config: SessionConfig) -> list[Path]:
     """Where a run's log goes: each stream's sorting folder the session declares.
 
+    Blackrock only when its array is sorted: a sync-only Blackrock's outputs
+    are in the Neuropixels folder, and so is the log.
+
     Beside ``run_info.json`` and the sorting it describes; one copy per stream,
     so each folder holds the record of every run that touched it.
     """
@@ -347,7 +350,7 @@ def log_directories(config: SessionConfig) -> list[Path]:
     for _, probe_config in config.per_probe():
         if probe_config.has_data("neuropixels"):
             dirs.append(probe_config.paths.sorted_for("neuropixels"))
-    if config.has_data("blackrock"):
+    if config.paths.writes_to("blackrock"):     # only a sorted Utah array
         dirs.append(config.paths.sorted_for("blackrock"))
     return dirs
 

@@ -511,11 +511,41 @@ def test_by_probe_takes_kilosort_and_nothing_else(tmp_path):
 
 def test_output_paths_are_derived_from_each_systems_directory(tmp_path):
     paths = cfg.OutputPaths(tmp_path / "br", tmp_path / "np")
-    assert paths.sync_for("blackrock").parent == tmp_path / "br"
+    # Blackrock's pulses only align Neuropixels, so they sit with its sorting.
+    assert paths.sync_for("blackrock").parent == tmp_path / "np"
     assert paths.aligned.parent == tmp_path / "np"
     (tmp_path / "br").mkdir(), (tmp_path / "np").mkdir()   # the recordings' folders
     paths.mkdirs()
     assert all(p.exists() for p in paths.all())
+
+
+def test_an_unsorted_blackrock_gets_no_output_folder(tmp_path):
+    # Blackrock that only carries the pulses: everything it contributes lives in
+    # the Neuropixels folder, so nothing is created beside the .ns5.
+    paths = cfg.OutputPaths(tmp_path / "br", tmp_path / "np", sorts_blackrock=False)
+    (tmp_path / "br").mkdir(), (tmp_path / "np").mkdir()
+    paths.mkdirs()
+
+    assert list((tmp_path / "br").iterdir()) == []
+    assert paths.sorted_for("neuropixels").is_dir()
+    assert paths.sync_for("blackrock") == paths.sorted_for("neuropixels")
+    assert not any(tmp_path / "br" in p.parents for p in paths.all())
+
+
+def test_a_session_without_a_spike_file_does_not_sort_blackrock(tmp_path):
+    session = cfg.load_session_config(_write_session(tmp_path, _TWO_SYSTEMS), "windows_rig", CONFIG_DIR)
+    assert session.sorts_blackrock is False
+    assert session.paths.sorts_blackrock is False
+    assert session.paths.all() == (session.paths.sorted_np, session.paths.export_for("neuropixels"))
+
+
+def test_two_probes_each_read_the_blackrock_pulses_from_their_own_folder(tmp_path):
+    session = _two_probe_session(
+        tmp_path, f'blackrock_dir: "{tmp_path / "br"}"\nblackrock:\n  sync_file: "/b/y.ns5"\n'
+    )
+    folders = [c.paths.sync_for("blackrock") for _, c in session.per_probe()]
+    assert folders == [c.paths.sorted_for("neuropixels") for _, c in session.per_probe()]
+    assert len(set(folders)) == 2
 
 
 def test_only_the_reachable_directories_are_created(tmp_path):
@@ -769,8 +799,9 @@ def test_sync_edges_follow_the_system_they_came_from(tmp_path):
     session = cfg.load_session_config(_write_session(tmp_path, _TWO_SYSTEMS), "windows_rig", CONFIG_DIR)
     paths = session.paths
 
-    # Each system's edges sit in that system's own folder, beside its sorting.
-    assert str(paths.sync_for("blackrock")) == "Z:/server/Monkey Athos/2026-08-13/kilosort4"
+    # Both systems' edges sit with the Neuropixels sorting they align: the
+    # Blackrock share is read, never written to, for synchronization.
+    assert str(paths.sync_for("blackrock")) == "Y:/npx/Monkey Athos/2026-08-13/kilosort4"
     assert str(paths.sync_for("neuropixels")) == "Y:/npx/Monkey Athos/2026-08-13/kilosort4"
     # The LF band is a Neuropixels product and goes in its export bundle;
     # Blackrock LFPs are saved separately by Central.

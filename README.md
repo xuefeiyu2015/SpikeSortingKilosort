@@ -295,9 +295,11 @@ python run_exporting_pipeline.py --config session_Porthos_1probe
 ### What you get
 
 ```
-<system>_dir/kilosort4/                 the sorting (Kilosort's own layout)
-                                        edge files, nsp_time_map.json
-                                        time_map.json (Neuropixels: its map onto Blackrock time)
+<neuropixels_dir>/kilosort4/            the sorting (Kilosort's own layout)
+                                        every sync edge file, Blackrock's included
+                                        time_map.json (its map onto Blackrock time)
+<blackrock_dir>/kilosort4/              only when the Utah array is sorted
+                                        (nothing is written beside a sync-only .ns5)
                        export/
                            figures/                     units.pdf (a row per unit), overview.png
                            sorting_summary_info.json    what ran, on what, from where

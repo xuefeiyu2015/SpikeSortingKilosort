@@ -1533,8 +1533,9 @@ def extract_sync(config: SessionConfig, system: str) -> Any | None:
     machine without CatGT. CatGT's arguments come from the AP binary's own
     SpikeGLX filename, so the session names only ``bin_file``.
 
-    Edges land beside the sorting, in ``<system>_dir/kilosort4/``, which is
-    computable before anything is sorted.
+    Edges land in the Neuropixels sorting's folder, ``<neuropixels_dir>/kilosort4/``
+    -- Blackrock's too, since they exist only to align it -- which is computable
+    before anything is sorted. Nothing is written under ``blackrock_dir``.
     """
     _check(system)
     if not config.has_data(system):

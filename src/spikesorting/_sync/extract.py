@@ -1,8 +1,8 @@
 """Drive sync-edge extraction for a session (pipeline steps 2 and 4).
 
-Produces five canonical edge files, each in the folder beside the recording it
-came from -- the SpikeGLX pair under ``neuropixels_dir/kilosort4/``, the NSP pair
-under ``blackrock_dir/kilosort4/``:
+Produces five canonical edge files, all in ``neuropixels_dir/kilosort4/`` --
+the NSP pair too, since it exists only to align Neuropixels; the Blackrock share
+is read and never written to (``OutputPaths.sync_for``):
 
 ===================== ==============================================
 ``npx_1hz.txt``       SpikeGLX SY-word bit 6, the 1 Hz square wave
@@ -452,6 +452,12 @@ def extract_blackrock_edges(
     CatGT cannot read Blackrock files, so this path is always the NumPy detector.
     It writes the same edge-file format, which is what lets TPrime align the two
     systems later.
+
+    The pulses exist only to align Neuropixels, so they are written into each
+    probe's sorting folder (``sync_for``), beside the time map fitted from them
+    -- never under ``blackrock_dir``. The ``.ns5`` is read once; a two-probe
+    session gets one small copy per probe, so each probe's folder holds
+    everything its map was built from.
     """
     from .._io import blackrock  # lazy: neo is not installed everywhere
 
@@ -460,11 +466,21 @@ def extract_blackrock_edges(
     if spec.sync_file is None:
         report.note("Blackrock extraction skipped: no blackrock.sync_file configured.")
         return report
+    if not config.has_data("neuropixels"):
+        report.note(
+            "Blackrock extraction skipped: its pulses only align Neuropixels, "
+            "and this session has none."
+        )
+        return report
 
     config.paths.require_dir("blackrock")         # never create the recording's folder
+    sync_dirs = list(dict.fromkeys(
+        probe_config.paths.sync_for("blackrock") for _, probe_config in config.per_probe()
+    ))
+    sync_dir, copies = sync_dirs[0], sync_dirs[1:]
     reader = blackrock.open_reader(spec.sync_file, gap_tolerance_ms=spec.gap_tolerance_ms)
-    sync_dir = config.paths.sync_for("blackrock")
-    sync_dir.mkdir(parents=True, exist_ok=True)
+    for directory in sync_dirs:
+        directory.mkdir(parents=True, exist_ok=True)
 
     # Edge times go out on the NSP clock, the same axis the .nev markers and the
     # eye traces use -- so the fitted Neuropixels map lands there too, with
@@ -474,7 +490,8 @@ def extract_blackrock_edges(
         reader, blackrock.nsx_number(spec.sync_file),
         tolerance_s=config.alignment_tolerance_s,
     )
-    _write_nsp_map(sync_dir, time_map, spec.sync_file)
+    for directory in sync_dirs:
+        _write_nsp_map(directory, time_map, spec.sync_file)
     report.note(f"Blackrock edge times are on the NSP clock: {time_map.summary()}")
 
     jobs = [
@@ -512,6 +529,8 @@ def extract_blackrock_edges(
                 f"{threshold}. Check blackrock.{'sync' if name == BR_1HZ else 'burst'}_threshold "
                 "against the file's units."
             )
+        for directory in copies:              # the other probes: same file, no re-read
+            catgt.write_edge_file(directory / f"{name}.txt", times)
 
     return report
 

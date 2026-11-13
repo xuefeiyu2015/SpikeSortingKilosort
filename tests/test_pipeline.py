@@ -1418,15 +1418,17 @@ def test_the_neuropixels_side_writes_nothing_into_the_blackrock_folder(tmp_path)
     np.save(sorted_dir / "spike_times.npy", np.array([30_000, 60_000, 90_000]))
     (sorted_dir / "params.py").write_text("sample_rate = 30000.0\n", encoding="utf-8")
 
-    br_dir = session.paths.sorted_for("blackrock")
-    before = {p.name for p in br_dir.iterdir()}
+    br_root = session.paths.dir_for("blackrock")
+    before = sorted(br_root.rglob("*")) if br_root.exists() else []
     result = ss.time_remapping(session, "neuropixels")
 
     assert result.aligned_path.parent == sorted_dir
     assert np.allclose(np.load(result.aligned_path), [13.0, 14.0, 15.0])
     assert (sorted_dir / "time_map.json").exists()
     assert (sorted_dir / "npx_1hz_trimmed.txt").exists()
-    assert {p.name for p in br_dir.iterdir()} == before
+    assert (sorted_dir / "blackrock_1hz.txt").exists()     # read from here
+    after = sorted(br_root.rglob("*")) if br_root.exists() else []
+    assert after == before
 
 def _ptp_session_with_a_sorting(tmp_path):
     """Blackrock 1 Hz on a PTP clock (~1.8e9 s), SpikeGLX from zero, TPrime "installed"."""
