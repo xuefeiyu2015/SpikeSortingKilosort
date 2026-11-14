@@ -2743,27 +2743,18 @@ def _kilosort_blocks(
 
 
 def _with_progress(items: list, label: str, step: float = _PROGRESS_STEP):
-    """Yield ``items``, logging every ``step`` of the way with a time estimate.
+    """Yield ``items``, reporting progress through them (``_progress``).
 
     A stage that reads for half an hour without a line looks exactly like one
-    that hangs.
+    that hangs. The drivers draw it as a bar; the log gets a line every ``step``.
     """
-    import time
+    from ._progress import Progress
 
-    n = len(items)
-    every = max(1, int(np.ceil(n * step)))
-    started = time.perf_counter()
+    progress = Progress(log, label, len(items), unit="reads", step=step)
     for i, item in enumerate(items, 1):
         yield item
-        if i % every == 0 and i < n:
-            elapsed = time.perf_counter() - started
-            left = elapsed / i * (n - i)
-            log.info("%s: %d%% of %d reads, %s elapsed, ~%s left", label,
-                     round(100 * i / n), n, _minutes(elapsed), _minutes(left))
-
-
-def _minutes(seconds: float) -> str:
-    return f"{seconds:.0f} s" if seconds < 90 else f"{seconds / 60:.1f} min"
+        progress.update(i)
+    progress.finish()
 
 
 def _uv_per_digit(

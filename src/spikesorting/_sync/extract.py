@@ -136,15 +136,19 @@ def _sy_bit_chunks(
 ) -> Iterator[tuple[int, np.ndarray]]:
     """Yield ``(start, bit_values)`` for the SY word, chunk by chunk.
 
-    Logs progress as it goes: the caller is reading the whole binary to get one
-    channel, which on a share is minutes, and a silent loop is indistinguishable
-    from a hang.
+    Reports progress in bytes of the file as it goes (``_progress``): the caller
+    is reading the whole binary to get one channel, which on a share is minutes,
+    and a silent loop is indistinguishable from a hang. The drivers draw it as a
+    bar; the log gets a line every 10%.
     """
-    total = info.n_samples
+    from .._progress import Progress
+
+    row_bytes = info.n_chan * 2
+    progress = Progress(log, f"read {info.path.name}", info.n_samples * row_bytes)
     for start, block in spikeglx.iter_channel(info, info.sy_index, chunk_bytes):
-        if total:
-            log.info("  read %5.1f%% of %s", 100.0 * (start + block.size) / total, info.path.name)
+        progress.update((start + block.size) * row_bytes)
         yield start, edges.digital_bit_signal(block.view(np.uint16), bit)
+    progress.finish()
 
 
 def _announce_read(info: spikeglx.StreamInfo, report: ExtractionReport) -> None:

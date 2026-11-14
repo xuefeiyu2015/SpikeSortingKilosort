@@ -38,33 +38,23 @@ skipped are reported and do not fail the run.
 
 from __future__ import annotations
 
-import logging
 import sys
 from pathlib import Path
 
 # The shared CLI helpers live in tools/; _cli adds src/ itself.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 
-from _cli import RunLog, Runner, build_parser, load, log_directories, shell_arg  # noqa: E402
+from _cli import (  # noqa: E402
+    RunLog,
+    Runner,
+    build_parser,
+    load,
+    log_directories,
+    log_pipeline_messages,
+    shell_arg,
+)
 
 import spikesorting as ss  # noqa: E402
-
-
-def _log_pipeline_messages() -> None:
-    """Show this pipeline's own log lines, and only its own.
-
-    ``logging.basicConfig`` would configure the *root* logger, which turns on
-    INFO for every installed package too -- faiss announcing which build it
-    loaded, matplotlib announcing a backend -- all wearing this project's indent.
-    Everything here logs to one named logger (``pipeline.py``, ``_sync/``), so
-    that is the one to attach a handler to.
-    """
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("       %(message)s"))
-    log = logging.getLogger("spikesorting")
-    log.handlers[:] = [handler]
-    log.setLevel(logging.INFO)
-    log.propagate = False
 
 
 def main() -> int:
@@ -92,7 +82,7 @@ def main() -> int:
         "each stream; write and sort nothing",
     )
     args = parser.parse_args()
-    _log_pipeline_messages()
+    log_pipeline_messages()
 
     # Everything printed from here on is also kept, and saved as
     # <system>_dir/kilosort4/logs/sorting_<start>_<machine>.log. A dry run

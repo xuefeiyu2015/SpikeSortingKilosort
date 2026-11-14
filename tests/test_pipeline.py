@@ -2232,8 +2232,9 @@ def test_a_long_read_reports_its_progress(caplog):
     with caplog.at_level(logging.INFO, logger=pipeline.log.name):
         assert list(pipeline._with_progress(list(range(100)), "waveforms")) == list(range(100))
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("waveforms:")]
-    assert len(lines) == 9                       # 10% .. 90%; the stage's own line ends it
-    assert "50% of 100 reads" in lines[4] and "left" in lines[4]
+    assert len(lines) == 10                      # 10% .. 90%, then done
+    assert "50% (50/100 reads" in lines[4] and "left" in lines[4]
+    assert lines[-1].startswith("waveforms: done, 100 reads in")
 
 
 def test_an_old_run_info_spike_count_is_corrected_from_the_sorting(tmp_path):

@@ -11,6 +11,7 @@ import argparse
 import io
 import logging
 import os
+import shutil
 import sys
 import time
 from dataclasses import replace
@@ -272,6 +273,117 @@ class Runner:
         return 0
 
 
+def render_bar(state, columns: int = 100, fill: str = "█", empty: str = "░") -> str:
+    """One line for a ``_progress.ProgressState``: label, bar, percent, amount, rate, time left.
+
+    Pure: the same state and width give the same line. The bar takes what the
+    text leaves of ``columns``; a label too long for it is shortened from the
+    left, keeping the file name's distinctive end.
+    """
+    from spikesorting._progress import format_amount, format_done, format_duration
+
+    unit = state.unit
+    amount = format_done(state.done, state.total, unit)
+    rate = f"{format_amount(state.rate, unit)}/s" if state.rate else ""
+    if state.final:
+        tail = f"done in {format_duration(state.elapsed_s)}"
+    else:
+        tail = f"~{format_duration(state.left_s)} left" if state.left_s is not None else ""
+    info = "  ".join(x for x in (f"{100 * state.fraction:5.1f}%", amount, rate, tail) if x)
+
+    indent = "       "
+    label = state.label
+    room = columns - len(indent) - len(info) - 6           # brackets and spaces
+    bar_width = max(20, min(30, room - len(label)))
+    if len(label) > room - bar_width:
+        keep = max(8, room - bar_width - 1)
+        label = "…" + label[-keep:] if len(label) > keep else label
+    filled = int(round(bar_width * state.fraction))
+    bar = fill * filled + empty * (bar_width - filled)
+    return f"{indent}{label} [{bar}] {info}"
+
+
+class TerminalLog(logging.Handler):
+    """The drivers' terminal output for the ``spikesorting`` logger.
+
+    Ordinary records (INFO and up) print as lines. Progress records
+    (``_progress.Progress``) redraw one bar in place on a terminal -- at most
+    every ``interval_s``, plus the final state -- and print only their INFO
+    milestones when the output is a file or a pipe (a batch job), where ``\r``
+    would leave thousands of lines. Writes to stderr, so the bar never enters
+    the run log, which tees stdout.
+    """
+
+    def __init__(self, stream=None, interval_s: float = 0.2, live: bool | None = None):
+        super().__init__(logging.DEBUG)
+        self.stream = stream if stream is not None else sys.stderr
+        isatty = getattr(self.stream, "isatty", lambda: False)
+        self.live = isatty() if live is None else live
+        self.interval_s = interval_s
+        self._drawn = 0          # length of the bar line on screen; 0 = none
+        self._last = 0.0
+        encoding = getattr(self.stream, "encoding", None) or "ascii"
+        try:
+            "█░…".encode(encoding)
+            self._glyphs = ("█", "░")
+        except (UnicodeEncodeError, LookupError):
+            self._glyphs = ("#", "-")
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            state = getattr(record, "progress", None)
+            if state is not None and self.live:
+                self._draw(state)
+            elif record.levelno >= logging.INFO:
+                self._end_bar()
+                self.stream.write(self.format(record) + "\n")
+                self.stream.flush()
+        except Exception:  # noqa: BLE001 -- logging must never stop the run
+            self.handleError(record)
+
+    def _draw(self, state) -> None:
+        now = time.monotonic()
+        if not state.final and self._drawn and now - self._last < self.interval_s:
+            return
+        self._last = now
+        columns = shutil.get_terminal_size((100, 20)).columns - 1
+        line = render_bar(state, columns, *self._glyphs)
+        if self._glyphs[0] == "#":
+            line = line.replace("…", "...")
+        # Pad over the previous line instead of an ANSI erase, which an old
+        # Windows console prints literally.
+        self.stream.write("\r" + line + " " * max(0, self._drawn - len(line)))
+        self._drawn = len(line)
+        if state.final:
+            self._end_bar()
+        self.stream.flush()
+
+    def _end_bar(self) -> None:
+        if self._drawn:
+            self.stream.write("\n")
+            self._drawn = 0
+
+
+def log_pipeline_messages() -> TerminalLog:
+    """Show this pipeline's own log lines on the terminal, and only its own.
+
+    ``logging.basicConfig`` would configure the *root* logger, which turns on
+    INFO for every installed package too -- faiss announcing which build it
+    loaded, matplotlib announcing a backend -- all wearing this project's indent.
+    Everything here logs to one named logger (``pipeline.py``, ``_sync/``), so
+    that is the one to attach a handler to. DEBUG is let through the logger for
+    the progress updates; ``TerminalLog`` and ``RunLog`` each keep only what
+    they show.
+    """
+    handler = TerminalLog()
+    handler.setFormatter(logging.Formatter("       %(message)s"))
+    log = logging.getLogger("spikesorting")
+    log.handlers[:] = [handler]
+    log.setLevel(logging.DEBUG)
+    log.propagate = False
+    return handler
+
+
 class _Tee(io.TextIOBase):
     """A stream that writes to the terminal and to the run log."""
 
@@ -309,6 +421,9 @@ class RunLog:
         sys.stdout = _Tee(self._stdout, self.buffer)
         self._handler = logging.StreamHandler(self.buffer)
         self._handler.setFormatter(logging.Formatter("       %(message)s"))
+        # INFO and up: a long read's progress arrives as a line every 10%,
+        # not as the per-block updates that move the terminal's bar.
+        self._handler.setLevel(logging.INFO)
         logging.getLogger("spikesorting").addHandler(self._handler)
         print(f"{script} started {self.started.isoformat(timespec='seconds')}, "
               f"command: {' '.join(sys.argv)}")
