@@ -2169,9 +2169,9 @@ def _cycle_from_behaviour(
     brk, npx = config.blackrock, config.neuropixels
     if obx_map is None:
         return None, "no OneBox 1 Hz edges, so the OneBox copies cannot be mapped", []
-    shared = [n for n in brk.analog_channels if n in npx.analog_channels]
+    shared = [n for n in brk.analog_inputs if n in npx.analog_channels]
     if brk.analog_file is None or not shared:
-        return None, ("no channel named in both blackrock.analog_channels and "
+        return None, ("no channel named in both blackrock.analog_inputs and "
                       "neuropixels.analog_channels to pick the cycle with"), []
     try:
         onebox = analog.load_onebox_analog(
@@ -2179,11 +2179,11 @@ def _cycle_from_behaviour(
             require_blackrock=False,
         )
         br = analog.open_blackrock_analog(
-            brk.analog_file, {n: brk.analog_channels[n] for n in shared},
-            gap_tolerance_ms=brk.gap_tolerance_ms,
-            tolerance_s=config.alignment_tolerance_s, by="position",
+            brk.analog_file, {n: brk.analog_inputs[n] for n in shared},
+            brk.nsp_frontend_channels, gap_tolerance_ms=brk.gap_tolerance_ms,
+            tolerance_s=config.alignment_tolerance_s,
         )
-    except (OSError, ValueError, IndexError) as error:
+    except (OSError, ValueError, KeyError) as error:
         return None, f"no photodiode or eye to pick the cycle with ({error})", []
     composed = align.compose_linear_maps(provisional, obx_map)
     onebox = _replace(onebox, slope=composed.slope, intercept=composed.intercept)
@@ -2510,7 +2510,7 @@ def _independent_checks(config: SessionConfig) -> list[dict[str, Any]]:
     """Each behavioural channel recorded twice, compared after synchronization.
 
     Needs the OneBox analog export on Blackrock time and ``blackrock.analog_file``
-    with its ``analog_channels``. These channels play no part in alignment --
+    with its ``analog_inputs``. These channels play no part in alignment --
     not even in picking cycles, as the burst does -- so their agreement is the
     most independent evidence there is. The photodiode is compared edge by edge;
     every other channel by cross-correlation in windows across the session.
@@ -2523,12 +2523,12 @@ def _independent_checks(config: SessionConfig) -> list[dict[str, Any]]:
     from ._sync import compare
 
     brk = config.blackrock
-    if brk.analog_file is None or not brk.analog_channels:
+    if brk.analog_file is None or not brk.analog_inputs:
         return []
 
     def unmeasured(note: str) -> list[dict[str, Any]]:
         return [{"channel": n, "status": "not measured", "note": note}
-                for n in brk.analog_channels]
+                for n in brk.analog_inputs]
 
     try:
         onebox = analog.load_onebox_analog(
@@ -2538,20 +2538,20 @@ def _independent_checks(config: SessionConfig) -> list[dict[str, Any]]:
         return unmeasured(f"no OneBox analog export on Blackrock time: {error}")
     try:
         br = analog.open_blackrock_analog(
-            brk.analog_file, brk.analog_channels, gap_tolerance_ms=brk.gap_tolerance_ms,
-            tolerance_s=config.alignment_tolerance_s, by="position",
+            brk.analog_file, brk.analog_inputs, brk.nsp_frontend_channels,
+            gap_tolerance_ms=brk.gap_tolerance_ms, tolerance_s=config.alignment_tolerance_s,
         )
-    except (OSError, ValueError, IndexError) as error:
+    except (OSError, ValueError, KeyError) as error:
         return unmeasured(f"could not read {brk.analog_file}: {error}")
 
     tolerance_ms = config.alignment_tolerance_s * 1e3
     checks = []
-    for name, position in brk.analog_channels.items():
+    for name, number in brk.analog_inputs.items():
         stream = br.streams[name]
         entry: dict[str, Any] = {
             "channel": name,
-            "blackrock": f"{brk.analog_file.name} position {position} "
-                         f"(id {stream.channel_id}, {stream.channel_name}, {stream.fs:g} Hz)",
+            "blackrock": f"{brk.analog_file.name} ainp{number} "
+                         f"(id {stream.channel_id}, {stream.fs:g} Hz)",
         }
         try:
             if name == "photodiode":

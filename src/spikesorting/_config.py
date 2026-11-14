@@ -391,13 +391,26 @@ class BlackrockSpec:
     #: OneBox records on XA1-XA4. Read only to *check* synchronization; nothing
     #: is aligned by it.
     analog_file: Path | None = None
-    #: ``{OneBox label: position in analog_file}``, 0-based -- the channel's
-    #: place in the file, never its id: an id lookup could land on a different
-    #: channel whose id happens to equal the number. Labels match the OneBox's
-    #: ``neuropixels.analog_channels``, which is what pairs the two copies.
-    analog_channels: dict[str, int] = field(default_factory=dict)
-    sync_1hz_channel: int = 1
-    burst_channel: int = 2
+    #: ``{OneBox label: analog input}`` -- the n of ``ainp<n>`` each copy is
+    #: wired into, as labelled on the NSP, the same numbering as
+    #: ``sync_1hz_input``/``burst_input`` (and as ``neuropixels.analog_channels``
+    #: gives XA numbers). Found by ID ``nsp_frontend_channels + n`` and checked
+    #: against the ``ainp<n>`` name, never by place in the file, so an input
+    #: switched off in Central cannot shift the others. Labels match the
+    #: OneBox's, which is what pairs the two copies.
+    analog_inputs: dict[str, int] = field(default_factory=dict)
+    #: How many front-end (electrode) channels the NSP writing ``sync_file`` has.
+    #: It numbers its analog inputs after them -- ``ainp<n>`` is channel ID
+    #: ``nsp_frontend_channels + n`` -- so 32 puts ainp7 at ID 39, and a
+    #: 128-channel NSP puts it at 135. A property of the rig, not the session.
+    nsp_frontend_channels: int = 32
+    #: Which analog input (the n of ``ainp<n>``, as labelled on the NSP) carries
+    #: the 1 Hz wave, and which the 14 s burst. :meth:`channel_id` turns one into
+    #: the ID the ``.ns5`` header lists, and the reader checks that channel is
+    #: named ``ainp<n>``, so a wrong front-end count stops rather than reading
+    #: another channel.
+    sync_1hz_input: int = 7
+    burst_input: int = 8
     #: Rising-edge thresholds, in the units returned by the reader (see io.blackrock).
     sync_threshold: float = 2.5
     burst_threshold: float = 2.5
@@ -424,18 +437,29 @@ class BlackrockSpec:
     #: What is done to the signal before Kilosort reads it.
     preprocess: PreprocessSpec = field(default_factory=lambda: BLACKROCK_PREPROCESS)
 
+    def channel_id(self, analog_input: int) -> int:
+        """The NSP channel ID of analog input ``ainp<analog_input>``."""
+        return self.nsp_frontend_channels + int(analog_input)
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "BlackrockSpec":
+        for key in ("sync_1hz_input", "burst_input"):
+            if key in data and int(data[key]) < 1:
+                raise ValueError(
+                    f"blackrock.{key} is the analog input number, ainp<n> with n >= 1 "
+                    f"(got {data[key]})"
+                )
         return cls(
             sync_file=_as_path(data.get("sync_file")),
             spike_file=_as_path(data.get("spike_file")),
             analog_file=_as_path(data.get("analog_file")),
-            analog_channels={
-                str(name): int(position)
-                for name, position in (data.get("analog_channels") or {}).items()
+            analog_inputs={
+                str(name): int(number)
+                for name, number in (data.get("analog_inputs") or {}).items()
             },
-            sync_1hz_channel=int(data.get("sync_1hz_channel", 1)),
-            burst_channel=int(data.get("burst_channel", 2)),
+            nsp_frontend_channels=int(data.get("nsp_frontend_channels", 32)),
+            sync_1hz_input=int(data.get("sync_1hz_input", 7)),
+            burst_input=int(data.get("burst_input", 8)),
             sync_threshold=float(data.get("sync_threshold", 2.5)),
             burst_threshold=float(data.get("burst_threshold", 2.5)),
             stream_id=data.get("stream_id"),
@@ -1220,7 +1244,19 @@ _RENAMED = {"cmp_file": "probe_file"}
 
 #: Keys removed outright, with what replaced them. Same reason as ``_RENAMED``:
 #: ``export_groups`` is closest to ``export_figures``, an unrelated switch.
+_SYNC_BY_INPUT = (
+    "the .ns5 sync channels are now named by analog input -- sync_1hz_input / "
+    "burst_input (the n of ainp<n>, e.g. 7 and 8) plus nsp_frontend_channels "
+    "(e.g. 32); the channel ID is their sum -- replace the line"
+)
 _RETIRED = {
+    "sync_1hz_channel": _SYNC_BY_INPUT,
+    # Only ever reached in blackrock: (neuropixels.analog_channels is a setting).
+    "analog_channels": "blackrock.analog_channels held 0-based positions in the "
+    ".ns2; it is now analog_inputs, the n of ainp<n> each copy is wired into "
+    "(the sync inputs' numbering) -- a file saving ainp1..ainp4 in order turns "
+    "{eye_x: 0, ...} into {eye_x: 1, ...}; check the .ns2 header's names",
+    "burst_channel": _SYNC_BY_INPUT,
     "export_groups": "the export now keeps every cluster not labelled noise in "
     "Phy, so there is nothing to choose -- delete the line",
     "highpass_hz": "waveforms are now read through Kilosort's own preprocessing, which "
@@ -1518,33 +1554,35 @@ def _reject_bad_analog_channels(config: SessionConfig, path: Path) -> None:
 
 
 def _reject_bad_blackrock_analog(config: SessionConfig, path: Path) -> None:
-    """``analog_file`` and ``analog_channels`` come together, as positions.
+    """``analog_file`` and ``analog_inputs`` come together, as ainp numbers.
 
     One without the other is read by nobody. A label the OneBox does not also
     carry has nothing to be compared with, which is the only thing these are for
     -- so it is refused rather than left to be silently skipped.
     """
     brk = config.blackrock
-    if bool(brk.analog_file) != bool(brk.analog_channels):
+    if bool(brk.analog_file) != bool(brk.analog_inputs):
         named, missing = (
-            ("analog_file", "analog_channels") if brk.analog_file
-            else ("analog_channels", "analog_file")
+            ("analog_file", "analog_inputs") if brk.analog_file
+            else ("analog_inputs", "analog_file")
         )
         raise ValueError(
             f"{path}: blackrock.{named} is set but blackrock.{missing} is not; "
             "they describe one file and its channels, so state both or neither"
         )
-    positions = list(brk.analog_channels.values())
-    if any(p < 0 for p in positions):
-        raise ValueError(f"{path}: blackrock.analog_channels positions are 0-based, >= 0")
-    if len(set(positions)) != len(positions):
-        raise ValueError(f"{path}: blackrock.analog_channels names one position twice")
+    inputs = list(brk.analog_inputs.values())
+    if any(n < 1 for n in inputs):
+        raise ValueError(
+            f"{path}: blackrock.analog_inputs are ainp numbers, n >= 1 (ainp1 -> 1)"
+        )
+    if len(set(inputs)) != len(inputs):
+        raise ValueError(f"{path}: blackrock.analog_inputs names one input twice")
     onebox = set(config.neuropixels.analog_channels)
-    if brk.analog_channels and config.has_data("neuropixels"):
-        unmatched = sorted(set(brk.analog_channels) - onebox)
+    if brk.analog_inputs and config.has_data("neuropixels"):
+        unmatched = sorted(set(brk.analog_inputs) - onebox)
         if unmatched:
             raise ValueError(
-                f"{path}: blackrock.analog_channels {unmatched} have no OneBox copy "
+                f"{path}: blackrock.analog_inputs {unmatched} have no OneBox copy "
                 f"in neuropixels.analog_channels ({sorted(onebox) or 'none'}); the "
                 "labels are what pair the two recordings"
             )

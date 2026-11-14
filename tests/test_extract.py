@@ -312,8 +312,10 @@ def _fake_blackrock(monkeypatch, pulses):
     monkeypatch.setattr(blackrock, "nsp_time_map", lambda *a, **k: identity)
     monkeypatch.setattr(blackrock, "nsx_number", lambda path: 5)
     monkeypatch.setattr(
-        blackrock, "stream_for_channel",
-        lambda reader, channel: SimpleNamespace(n_segments=1, fs=FS, channel_id=channel),
+        blackrock, "stream_for_analog_input",
+        lambda reader, analog_input, frontend: SimpleNamespace(
+            n_segments=1, fs=FS, channel_id=str(frontend + analog_input)
+        ),
     )
     monkeypatch.setattr(blackrock, "iter_channel", lambda *a, **k: iter(()))
     monkeypatch.setattr(extract.edges, "stream_pulse_times", lambda *a, **k: pulses)

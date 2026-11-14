@@ -91,14 +91,42 @@ class _Reader:
         return raw.astype(dtype)
 
 
-def test_a_position_never_resolves_through_a_channel_id():
-    # ids 1..4 at positions 0..3: an id lookup for "1" would take position 0.
-    zeros = np.zeros(10)
-    reader = _Reader({i: zeros for i in "1234"}, ["1", "2", "3", "4"], BR_FS, 0.0)
-    assert blackrock.stream_for_position(reader, 1).channel_id == "2"
-    assert blackrock.stream_for_channel(reader, 1).channel_id == "1"
-    with pytest.raises(IndexError, match="outside"):
-        blackrock.stream_for_position(reader, 4)
+def _sync_ns5(ids, names):
+    reader = _Reader({i: np.zeros(10) for i in ids}, ids, BR_FS, 0.0)
+    reader.header["signal_channels"]["name"] = names
+    return reader
+
+
+def test_an_analog_input_is_found_by_the_id_the_front_end_count_gives_it():
+    # A 32-channel NSP saving only ainp7 and ainp8: IDs 39 and 40.
+    reader = _sync_ns5(["39", "40"], ["ainp7", "ainp8"])
+    assert blackrock.stream_for_analog_input(reader, 7, 32).channel_id == "39"
+    assert blackrock.stream_for_analog_input(reader, 8, 32).channel_name == "ainp8"
+
+
+def test_a_wrong_front_end_count_stops_and_names_the_right_one():
+    reader = _sync_ns5(["39", "40"], ["ainp7", "ainp8"])
+    # 128 would put ainp7 at 135, which this file does not have.
+    with pytest.raises(KeyError, match="nsp_frontend_channels is 32"):
+        blackrock.stream_for_analog_input(reader, 7, 128)
+    # 33 lands on an ID that exists (40) -- but it is ainp8, not ainp7.
+    with pytest.raises(KeyError, match="is ainp8, not ainp7.*nsp_frontend_channels is 32"):
+        blackrock.stream_for_analog_input(reader, 7, 33)
+
+
+def test_an_input_switched_off_does_not_shift_the_others():
+    # The .ns2 saves ainp1, ainp3, ainp4 (ainp2 off): photodiode on ainp4 is the
+    # third channel in the file, and a position would have read pupil instead.
+    reader = _sync_ns5(["33", "35", "36"], ["ainp1", "ainp3", "ainp4"])
+    stream = blackrock.stream_for_analog_input(reader, 4, 32)
+    assert (stream.channel_id, stream.channel_name) == ("36", "ainp4")
+
+
+def test_an_analog_input_never_falls_back_to_a_position():
+    # A bare 1 used to resolve to position 1 -- the second saved channel.
+    reader = _sync_ns5(["39", "40"], ["ainp7", "ainp8"])
+    with pytest.raises(KeyError, match="no channel is named ainp1"):
+        blackrock.stream_for_analog_input(reader, 1, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +162,7 @@ def _session(tmp_path, stamped_slope):
         f"blackrock_dir: '{tmp_path / 'br'}'\nneuropixels_dir: '{npx_dir}'\n"
         "blackrock:\n  sync_file: '{blackrock_dir}/NSP_001.ns5'\n"
         "  analog_file: '{blackrock_dir}/NSP_001.ns2'\n"
-        "  analog_channels: {eye_x: 0, photodiode: 3}\n"
+        "  analog_inputs: {eye_x: 1, photodiode: 4}\n  nsp_frontend_channels: 128\n"
         "neuropixels:\n  bin_file: '{neuropixels_dir}/run_g0_t0.imec0.ap.bin'\n"
         "  analog_channels: {eye_x: 1, photodiode: 4}\n",
         encoding="utf-8",
@@ -171,10 +199,9 @@ def _session(tmp_path, stamped_slope):
 
 
 def _open_with(reader):
-    def fake_open(path, channels, gap_tolerance_ms=None, tolerance_s=None, by="id"):
-        assert by == "position"                       # the session's keys are positions
-        streams = {name: blackrock.stream_for_position(reader, pos)
-                   for name, pos in channels.items()}
+    def fake_open(path, inputs, frontend_channels, gap_tolerance_ms=None, tolerance_s=None):
+        streams = {name: blackrock.stream_for_analog_input(reader, n, frontend_channels)
+                   for name, n in inputs.items()}
         time_map = blackrock.NspTimeMap(
             (blackrock.NspSegment(0, reader.n, BR_PERIOD, T0, 0.0),), BR_FS, "3.0", True
         )
@@ -198,7 +225,7 @@ def test_a_constant_filter_delay_reads_as_offset_and_passes(tmp_path, monkeypatc
     assert -3.1 < pd["median_offset_ms"] < -1.9
     assert eye["median_offset_ms"] == pytest.approx(-2.0, abs=0.3)
     assert abs(pd["drift_ms"]) < 0.3 and abs(eye["drift_ms"]) < 0.3
-    assert "position 3 (id 132" in pd["blackrock"]     # what the position resolved to
+    assert "ainp4 (id 132" in pd["blackrock"]         # what the input resolved to
 
 
 def test_a_rate_error_reads_as_drift(tmp_path, monkeypatch):
@@ -229,7 +256,7 @@ def test_without_the_ns2_keys_there_is_nothing_to_check(tmp_path):
     session, _ = _session(tmp_path, stamped_slope=M)
     from dataclasses import replace
     bare = replace(session, blackrock=replace(session.blackrock, analog_file=None,
-                                              analog_channels={}))
+                                              analog_inputs={}))
     assert pipeline._independent_checks(bare) == []
 
 
@@ -265,8 +292,8 @@ def _remap_with_a_planted_cycle_error(tmp_path, monkeypatch, drop=(), with_sessi
 
     session, reader = _session(tmp_path, stamped_slope=M)
     if drop:
-        kept = {k: v for k, v in session.blackrock.analog_channels.items() if k not in drop}
-        session = replace(session, blackrock=replace(session.blackrock, analog_channels=kept))
+        kept = {k: v for k, v in session.blackrock.analog_inputs.items() if k not in drop}
+        session = replace(session, blackrock=replace(session.blackrock, analog_inputs=kept))
     _plant_1hz_without_burst(session)
     monkeypatch.setattr(analog, "open_blackrock_analog", _open_with(reader))
     # The 1 Hz alone lands three cycles off -- what it does when one recording

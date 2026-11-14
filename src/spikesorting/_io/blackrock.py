@@ -31,8 +31,7 @@ __all__ = [
     "nsp_time_map",
     "nsx_number",
     "open_reader",
-    "stream_for_channel",
-    "stream_for_position",
+    "stream_for_analog_input",
     "read_channel",
     "iter_channel",
     "list_streams",
@@ -342,48 +341,45 @@ def _channel_table(reader: Any) -> np.ndarray:
     return reader.header["signal_channels"]
 
 
-def stream_for_channel(reader: Any, channel: int | str, seg_index: int = 0) -> BlackrockStream:
-    """Resolve a Blackrock channel number to its stream and shape.
+def stream_for_analog_input(
+    reader: Any, analog_input: int, frontend_channels: int, seg_index: int = 0
+) -> BlackrockStream:
+    """Analog input ``ainp<analog_input>``, found by the ID it must have.
 
-    Matches on the channel id first (Blackrock's electrode number, which is what
-    ``SynchronizePulse_setup.md`` means by "channel 1" / "channel 2"), then on the
-    channel name, then falls back to positional index.
+    The NSP numbers its analog inputs after its front-end channels, so the ID
+    is ``frontend_channels + analog_input``. That ID is looked up exactly -- no
+    name or position fallback -- and the channel found must be named
+    ``ainp<analog_input>`` when the file names its inputs that way. A wrong
+    front-end count therefore stops, naming the count the file implies, rather
+    than reading whichever channel happens to hold that ID.
     """
     channels = _channel_table(reader)
-    wanted = str(channel)
+    wanted_id = str(int(frontend_channels) + int(analog_input))
+    wanted_name = f"ainp{int(analog_input)}"
+    ids = [str(row["id"]) for row in channels]
+    names = [str(row["name"]).strip().lower() for row in channels]
+    listing = ", ".join(f"{i} ({n})" for i, n in zip(ids, names))
 
-    index = None
-    for i, row in enumerate(channels):
-        if str(row["id"]) == wanted:
-            index = i
-            break
-    if index is None:
-        for i, row in enumerate(channels):
-            if str(row["name"]) == wanted:
-                index = i
-                break
-    if index is None and isinstance(channel, int) and 0 <= channel < len(channels):
-        index = channel
-    if index is None:
-        available = ", ".join(str(row["id"]) for row in channels[:16])
-        raise KeyError(f"channel {channel!r} not found; available ids include: {available} ...")
-    return _stream_at(reader, index, seg_index)
+    def implied(index: int) -> str:
+        count = int(ids[index]) - int(analog_input)
+        return f"{wanted_name} is ID {ids[index]} in this file, so nsp_frontend_channels is {count}"
 
-
-def stream_for_position(reader: Any, position: int, seg_index: int = 0) -> BlackrockStream:
-    """The channel at ``position`` (0-based) in the file, and nothing else.
-
-    No id or name lookup: a session that says "position 1" must not land on the
-    channel whose *id* is 1. The chosen channel's id and name are in the result,
-    so a caller can log what the position resolved to.
-    """
-    channels = _channel_table(reader)
-    if not 0 <= int(position) < len(channels):
-        raise IndexError(
-            f"position {position} is outside this file's {len(channels)} channels "
-            f"(ids: {', '.join(str(row['id']) for row in channels[:16])})"
+    by_name = names.index(wanted_name) if wanted_name in names else None
+    if wanted_id not in ids:
+        hint = implied(by_name) if by_name is not None else f"no channel is named {wanted_name}"
+        raise KeyError(
+            f"{wanted_name} should be channel ID {wanted_id} "
+            f"(nsp_frontend_channels {frontend_channels} + input {analog_input}), "
+            f"but the file has: {listing}. {hint}."
         )
-    return _stream_at(reader, int(position), seg_index)
+    index = ids.index(wanted_id)
+    if names[index].startswith("ainp") and names[index] != wanted_name:
+        hint = implied(by_name) if by_name is not None else f"no channel is named {wanted_name}"
+        raise KeyError(
+            f"channel ID {wanted_id} is {names[index]}, not {wanted_name}: "
+            f"nsp_frontend_channels ({frontend_channels}) does not match this NSP. {hint}."
+        )
+    return _stream_at(reader, index, seg_index)
 
 
 def _stream_at(reader: Any, index: int, seg_index: int) -> BlackrockStream:

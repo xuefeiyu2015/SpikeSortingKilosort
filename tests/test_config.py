@@ -278,7 +278,7 @@ def test_the_utah_only_template_differs_only_by_the_missing_probe():
     # The array half is untouched -- except the .ns2 behaviour channels, which
     # exist only to be compared with a OneBox, and this session has none.
     from dataclasses import replace
-    assert utah.blackrock == replace(one.blackrock, analog_file=None, analog_channels={})
+    assert utah.blackrock == replace(one.blackrock, analog_file=None, analog_inputs={})
     assert utah.sorts_blackrock is True
 
     stated = {
@@ -1620,3 +1620,46 @@ def test_extraction_never_creates_the_recordings_folder(tmp_path):
     with pytest.raises(FileNotFoundError, match="neuropixels_dir does not exist"):
         extract.extract_neuropixels_edges(session)
     assert not session.paths.dir_for("neuropixels").exists()
+
+
+def test_the_sync_channel_id_is_the_front_end_count_plus_the_analog_input():
+    spec = cfg.BlackrockSpec.from_dict({})
+    assert (spec.nsp_frontend_channels, spec.sync_1hz_input, spec.burst_input) == (32, 7, 8)
+    assert spec.channel_id(spec.sync_1hz_input) == 39
+    assert spec.channel_id(spec.burst_input) == 40
+    bigger = cfg.BlackrockSpec.from_dict({"nsp_frontend_channels": 128})
+    assert bigger.channel_id(7) == 135
+    with pytest.raises(ValueError, match="ainp<n> with n >= 1"):
+        cfg.BlackrockSpec.from_dict({"sync_1hz_input": 0})
+
+
+@pytest.mark.parametrize("key", ["sync_1hz_channel", "burst_channel"])
+def test_the_old_sync_channel_keys_say_what_replaced_them(tmp_path, key):
+    body = _TWO_SYSTEMS.replace(
+        'sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"',
+        f'sync_file: "{{blackrock_dir}}/NSP-Athos_001.ns5"\n  {key}: 39',
+    )
+    with pytest.raises(ValueError, match="retired.*sync_1hz_input / burst_input"):
+        cfg.load_session_config(_write_session(tmp_path, body), "windows_rig", CONFIG_DIR)
+
+
+def test_blackrock_analog_inputs_replace_the_positional_analog_channels(tmp_path):
+    with_inputs = _TWO_SYSTEMS.replace(
+        'sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"',
+        'sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"\n'
+        '  analog_file: "{blackrock_dir}/NSP-Athos_001.ns2"\n'
+        "  analog_inputs: {photodiode: 4}",
+    ) + "  analog_channels: {photodiode: 4}\n"     # the OneBox's: still a setting
+    session = cfg.load_session_config(
+        _write_session(tmp_path, with_inputs), "windows_rig", CONFIG_DIR
+    )
+    assert session.blackrock.analog_inputs == {"photodiode": 4}
+    assert session.blackrock.channel_id(4) == 36
+
+    old = with_inputs.replace("analog_inputs: {photodiode: 4}", "analog_channels: {photodiode: 3}")
+    with pytest.raises(ValueError, match="retired.*now analog_inputs"):
+        cfg.load_session_config(_write_session(tmp_path, old), "windows_rig", CONFIG_DIR)
+
+    zero = with_inputs.replace("analog_inputs: {photodiode: 4}", "analog_inputs: {photodiode: 0}")
+    with pytest.raises(ValueError, match="ainp numbers, n >= 1"):
+        cfg.load_session_config(_write_session(tmp_path, zero), "windows_rig", CONFIG_DIR)

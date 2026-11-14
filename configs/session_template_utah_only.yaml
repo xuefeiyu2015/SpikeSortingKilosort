@@ -44,6 +44,8 @@ blackrock:
   # ---------- edit for this session ----------
   spike_file: "{blackrock_dir}/HUB-Athos_001.ns6"   # Utah array spikes
   sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"    # the two sync channels
+  nsp_frontend_channels: 32   # electrode channels on this NSP: its analog inputs
+                              # are numbered after them -- see "Sync channels"
   # This array's channel map: its own .cmp, or a .json/.mat built from one.
   # Read by extension, so there is one key whatever the format. Per array,
   # not per session -- see "Probes".
@@ -111,8 +113,8 @@ blackrock:
     clear_cache: false           # free GPU memory between steps: slower, smaller
 
   # ---------- defaults: change only if you know what they mean ----------
-  sync_1hz_channel: 1    # NSP-*.ns5 channel carrying the 1 Hz square wave
-  burst_channel: 2       # ...and the one carrying the 14 s coded burst
+  sync_1hz_input: 7      # analog input carrying the 1 Hz wave: ainp7
+  burst_input: 8         # ...and the 14 s coded burst: ainp8 -- see "Sync channels"
   sync_threshold: 2.5    # rising-edge thresholds, in volts after neo scaling
   burst_threshold: 2.5
   stream_id: null        # pin one when a .nsX exposes several streams
@@ -189,18 +191,21 @@ kilosort: {}
 #   whether to sort, which is what kilosort_on_* is for.
 #
 # Outputs -- one folder per system, beside its own recording
-#   {blackrock_dir}/kilosort4/          sorted Utah array, NSP edge files,
-#                                       and export/
-#   {neuropixels_dir}/kilosort4/        sorted Neuropixels, SpikeGLX edge files,
-#                                       the time map onto Blackrock time,
+#   {blackrock_dir}/kilosort4/          sorted Utah array and export/
+#                                       (only when the array is sorted)
+#   {neuropixels_dir}/kilosort4/        sorted Neuropixels, every edge file
+#                                       (Blackrock's too), the time map onto
+#                                       Blackrock time,
 #                                       the LF band, and export/
 #
 #   Everything derived from one recording lands in one directory, so handing an
 #   analysis a sorting means handing it a folder rather than a tour of three
 #   trees. There is no system or probe level above it: the directory this file
-#   names already says which recording it is. The time map goes with the
-#   Neuropixels sorting it maps: Blackrock's own times need no map, and a
-#   local sorting then stays local, reading only Blackrock's edge files.
+#   names already says which recording it is. Synchronization belongs to the
+#   Neuropixels sorting: the time map and the Blackrock edge files it was
+#   fitted from sit beside it, so a local sorting stays local and the Blackrock
+#   share is only read. {blackrock_dir}/kilosort4/ exists only when the Utah
+#   array is sorted.
 #
 # Where the SpikeGLX run went
 #   A session names one binary -- bin_file -- and nothing else. There is no
@@ -424,3 +429,16 @@ kilosort: {}
 #   one of these (cluster_init_seed, max_cluster_subset, batch_downsampling are
 #   recent), the sort stops at once naming it: delete that line.
 #   `run_sorting_pipeline.py --dry-run` makes the same check without a GPU.
+#
+# Sync channels
+#   sync_1hz_input / burst_input are the analog inputs the cables go into, as
+#   labelled on the NSP: ainp7 -> 7. The .ns5 header lists each channel by an
+#   ID, and the NSP numbers its analog inputs after its front-end (electrode)
+#   channels, so the ID is nsp_frontend_channels + input: ainp7 is 39 on a
+#   32-channel NSP and 135 on a 128-channel one. The count is a property of the
+#   rig, not the session. The reader also checks that the channel with that ID
+#   is named ainp<n>, so a wrong count stops with the count the file implies
+#   rather than reading another channel.
+#   analog_inputs (the .ns2 copies of the OneBox channels) are numbered the
+#   same way and found the same way, never by their place in the file: an
+#   input switched off in Central would otherwise shift every one after it.

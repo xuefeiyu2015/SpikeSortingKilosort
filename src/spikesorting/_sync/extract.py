@@ -495,11 +495,13 @@ def extract_blackrock_edges(
     report.note(f"Blackrock edge times are on the NSP clock: {time_map.summary()}")
 
     jobs = [
-        (BR_1HZ, spec.sync_1hz_channel, spec.sync_threshold, config.sync_period_s * 1000.0 / 2.0),
-        (BR_BURST, spec.burst_channel, spec.burst_threshold, 0.0),
+        (BR_1HZ, spec.sync_1hz_input, spec.sync_threshold, config.sync_period_s * 1000.0 / 2.0),
+        (BR_BURST, spec.burst_input, spec.burst_threshold, 0.0),
     ]
-    for name, channel, threshold, duration_ms in jobs:
-        stream = blackrock.stream_for_channel(reader, channel)
+    for name, analog_input, threshold, duration_ms in jobs:
+        stream = blackrock.stream_for_analog_input(
+            reader, analog_input, spec.nsp_frontend_channels
+        )
         if stream.n_segments > 1:
             report.note(
                 f"{spec.sync_file.name} has {stream.n_segments} segments (paused recording); "
@@ -521,11 +523,11 @@ def extract_blackrock_edges(
             None,
             sync_dir,
             report,
-            stream=f"{spec.sync_file.name} ch {stream.channel_id}",
+            stream=f"{spec.sync_file.name} ainp{analog_input} (ID {stream.channel_id})",
         )
         if times.size == 0:
             report.note(
-                f"No pulses on {spec.sync_file.name} channel {channel} at threshold "
+                f"No pulses on {spec.sync_file.name} ainp{analog_input} at threshold "
                 f"{threshold}. Check blackrock.{'sync' if name == BR_1HZ else 'burst'}_threshold "
                 "against the file's units."
             )

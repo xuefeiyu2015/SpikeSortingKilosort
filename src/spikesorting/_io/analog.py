@@ -144,16 +144,16 @@ def iter_onebox(
 
 def open_blackrock_analog(
     path: str | Path,
-    channels: dict[str, int],
+    inputs: dict[str, int],
+    frontend_channels: int,
     gap_tolerance_ms: float | None = None,
     tolerance_s: float | None = 1e-3,
-    by: str = "id",
 ) -> BlackrockAnalog:
-    """Open a ``.nsX`` and resolve the named channels (``{label: channel}``).
+    """Open a ``.nsX`` and resolve the named analog inputs (``{label: n}``).
 
-    ``by="id"`` for a channel id (the ``.ns5`` sync channels), ``by="position"``
-    for a 0-based place in the file (``blackrock.analog_channels``). What each
-    position resolved to is logged, so a wrong guess shows on the first run.
+    Each is ``ainp<n>``, found by ID ``frontend_channels + n`` and checked
+    against its name -- the rule the sync inputs follow
+    (``blackrock.stream_for_analog_input``). What each resolved to is logged.
 
     The NSP time map is measured from this file, as ``extract_sync`` does for the
     sync file: each ``.nsX`` is its own crystal.
@@ -162,12 +162,12 @@ def open_blackrock_analog(
 
     from . import blackrock
 
-    if by not in ("id", "position"):
-        raise ValueError(f"by must be 'id' or 'position', got {by!r}")
     path = Path(path)
     reader = blackrock.open_reader(path, gap_tolerance_ms=gap_tolerance_ms)
-    lookup = blackrock.stream_for_channel if by == "id" else blackrock.stream_for_position
-    streams = {name: lookup(reader, ch) for name, ch in channels.items()}
+    streams = {
+        name: blackrock.stream_for_analog_input(reader, n, frontend_channels)
+        for name, n in inputs.items()
+    }
     for name, stream in streams.items():
         logging.getLogger(__name__).info(
             "%s: %s -> channel id %s (%s), %g Hz",
