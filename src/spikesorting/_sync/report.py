@@ -206,6 +206,13 @@ def build_sync_report(
     drifting = [c["channel"] for c in checks if c.get("status") == "DRIFT"]
     if drifting:
         verdict_note += f"; WARNING: {', '.join(drifting)} drift against Blackrock's copy"
+    if validation and validation.get("passed") and validation.get("exports_accepted") is False:
+        line = (validation.get("line") or {}).get("fail_reason") or "it fails"
+        verdict_note += ("; the LFP and OneBox exports stay on their own clocks: they "
+                         f"can carry only the linear fit, and its burst check: {line}")
+    if validation and not validation.get("passed") and validation.get("exports_accepted"):
+        verdict_note += ("; the LFP and OneBox exports carry the linear fit, which "
+                         "passed its own burst check -- only the spike times' map failed")
     return {
         "verdict": verdict,
         "verdict_note": verdict_note,

@@ -1627,10 +1627,23 @@ def extract_sync(config: SessionConfig, system: str) -> Any | None:
     Edges land in the Neuropixels sorting's folder, ``<neuropixels_dir>/kilosort4/``
     -- Blackrock's too, since they exist only to align it -- which is computable
     before anything is sorted. Nothing is written under ``blackrock_dir``.
+
+    New edges void the map fitted from the old ones, so in a session with both
+    systems any acceptance is withdrawn first -- ``validation.json`` and the
+    sync report removed, the LFP and OneBox exports put back on their own
+    clocks -- for this probe, or for every probe when Blackrock's edges, which
+    each probe's map uses, are re-extracted. Re-running only this stage then
+    leaves nothing labelled Blackrock time from the old map.
     """
     _check(system)
     if not config.has_data(system):
         return None
+
+    if config.aligns_systems:
+        affected = ([config] if system == "neuropixels"
+                    else [probe_config for _, probe_config in config.per_probe()])
+        for probe_config in affected:
+            _withdraw_acceptance(probe_config)
 
     if system == "neuropixels":
         return extract.extract_neuropixels_edges(config)
@@ -1675,7 +1688,7 @@ def extract_lfp(config: SessionConfig, system: str) -> Path | None:
     # If a map was already accepted -- a re-export after alignment -- put it on
     # the Blackrock clock now. Otherwise validate_remapping stamps it once it
     # accepts one.
-    mapping = _fitted_map(config) if _alignment_accepted(config) else None
+    mapping = _fitted_map(config) if _exports_accepted(config) else None
     if mapping is not None:
         stamp_lfp_timebase(config, mapping)
     return path
@@ -1725,7 +1738,7 @@ def extract_analog(config: SessionConfig, system: str) -> Path | None:
         f" (decimated {config.analog_decimate}x)" if config.analog_decimate > 1 else "",
     )
 
-    onebox_map = _fitted_onebox_map(config) if _alignment_accepted(config) else None
+    onebox_map = _fitted_onebox_map(config) if _exports_accepted(config) else None
     if onebox_map is not None:
         stamp_analog_timebase(config, onebox_map)
     else:
@@ -2104,7 +2117,7 @@ def time_remapping(
         log.info("no sorting at %s; wrote the time map only", results_dir)
         _save_map(aligned_dir, mapping, offset, config, obx_map, method="map_only",
                   cycles_from=cycles_from, cycle_vote=vote, coarse_tried=tried,
-                  inputs=_edge_inputs(br_1hz, npx_1hz))
+                  inputs=_sync_inputs(config))
         return TimeMap(mapping, offset, "map_only", burst_match=match)
 
     from ._export.curated import parse_params_py
@@ -2153,7 +2166,7 @@ def time_remapping(
 
     _save_map(aligned_dir, mapping, offset, config, obx_map, method=method,
               cycles_from=cycles_from, tprime_error=tprime_error, cycle_vote=vote,
-              coarse_tried=tried, inputs=_edge_inputs(br_1hz, npx_1hz))
+              coarse_tried=tried, inputs=_sync_inputs(config))
     log.info("the map and %s are provisional until validate_remapping accepts them",
              out_path.name)
     return TimeMap(mapping, offset, method, aligned_path=out_path, burst_match=match)
@@ -2246,16 +2259,50 @@ def _checked_tprime_output(path: Path, n_events: int) -> np.ndarray:
     return mapped
 
 
-def _edge_inputs(br_1hz: np.ndarray | None, npx_1hz: np.ndarray | None) -> dict[str, str]:
-    """SHA-256 of the two 1 Hz trains a map is fitted from, as loaded."""
+#: Every edge file a map depends on: the two 1 Hz trains it is fitted from, the
+#: OneBox's 1 Hz that puts the OneBox on the probe clock (and so sets
+#: ``onebox_to_blackrock``), and the bursts it is checked against.
+_SYNC_INPUTS = (extract.BR_1HZ, extract.NPX_1HZ, extract.NPX_OBX_1HZ,
+                extract.BR_BURST, extract.NPX_BURST)
+
+
+def _edge_digest(edges: np.ndarray | None) -> str:
+    """SHA-256 of one edge train as loaded; a missing file hashes as empty."""
     import hashlib
 
-    def digest(edges):
-        flat = np.ascontiguousarray(
-            np.asarray(edges if edges is not None else [], dtype=np.float64).ravel())
-        return hashlib.sha256(flat.tobytes()).hexdigest()
+    flat = np.ascontiguousarray(
+        np.asarray(edges if edges is not None else [], dtype=np.float64).ravel())
+    return hashlib.sha256(flat.tobytes()).hexdigest()
 
-    return {extract.BR_1HZ: digest(br_1hz), extract.NPX_1HZ: digest(npx_1hz)}
+
+_UNREADABLE = "unreadable"
+
+
+def _sync_inputs(config: SessionConfig) -> dict[str, str]:
+    """SHA-256 of every sync edge file a map depends on, as on disk now.
+
+    A file that cannot be read is ``"unreadable"`` rather than an exception, so
+    the acceptance check that asks says "changed" and the export falls back to
+    its own clock instead of the run stopping.
+    """
+    digests = {}
+    for name in _SYNC_INPUTS:
+        try:
+            digests[name] = _edge_digest(_load_edges(config, name))
+        except (OSError, ValueError):
+            digests[name] = _UNREADABLE
+    return digests
+
+
+def _changed_inputs(config: SessionConfig, recorded: dict | None) -> list[str]:
+    """Which sync edge files differ from what ``recorded`` hashed (all, if nothing was).
+
+    An unreadable file is always changed, whatever was recorded.
+    """
+    current = _sync_inputs(config)
+    recorded = recorded or {}
+    return [name for name in _SYNC_INPUTS
+            if current[name] == _UNREADABLE or recorded.get(name) != current[name]]
 
 
 def _map_digest(config: SessionConfig) -> str | None:
@@ -2268,7 +2315,7 @@ def _map_digest(config: SessionConfig) -> str | None:
         return None
 
 
-def _acceptance_problem(config: SessionConfig) -> str | None:
+def _acceptance_problem(config: SessionConfig, decision: str = "accepted") -> str | None:
     """Why this probe's map cannot be treated as accepted now, or None if it can.
 
     Three things, all checked on disk every time, so an export run on its own --
@@ -2277,7 +2324,8 @@ def _acceptance_problem(config: SessionConfig) -> str | None:
 
     - ``validation.json["accepted"]`` (a burst PASS or ``CONSISTENT (no burst)``);
     - the ``time_map.json`` it accepted is the one on disk (its SHA-256);
-    - that map was fitted from the 1 Hz edge files on disk now (its ``inputs``).
+    - that map was fitted from, and checked against, the sync edge files on
+      disk now (its ``inputs``: both 1 Hz trains, the OneBox 1 Hz, both bursts).
     """
     aligned = config.paths.aligned
     try:
@@ -2285,8 +2333,9 @@ def _acceptance_problem(config: SessionConfig) -> str | None:
             validation = json.load(handle)
     except (OSError, ValueError):
         return "no validation.json"
-    if not validation.get("accepted"):
-        return f"validate_remapping did not accept it ({validation.get('verdict')})"
+    if validation.get(decision) is not True:
+        what = "it" if decision == "accepted" else "its line for the exports"
+        return f"validate_remapping did not accept {what} ({validation.get('verdict')})"
     if validation.get("time_map_sha256") != _map_digest(config):
         return ("time_map.json is not the map validate_remapping accepted; "
                 "re-run time_remapping and validate_remapping")
@@ -2295,11 +2344,10 @@ def _acceptance_problem(config: SessionConfig) -> str | None:
             inputs = json.load(handle).get("inputs")
     except (OSError, ValueError):
         return "time_map.json cannot be read"
-    current = _edge_inputs(_load_edges(config, extract.BR_1HZ),
-                           _load_edges(config, extract.NPX_1HZ))
-    if inputs != current:
-        return ("the 1 Hz edge files changed since the map was fitted; "
-                "re-run time_remapping and validate_remapping")
+    changed = _changed_inputs(config, inputs)
+    if changed:
+        return (f"the sync edge files changed since the map was fitted "
+                f"({', '.join(changed)}); re-run time_remapping and validate_remapping")
     return None
 
 
@@ -2315,6 +2363,20 @@ def _alignment_accepted(config: SessionConfig) -> bool:
     return problem is None
 
 
+def _exports_accepted(config: SessionConfig) -> bool:
+    """Whether the *line* may be stamped into the LFP and OneBox exports.
+
+    They can only carry a line (``t0_blackrock``/``fs_blackrock``), so this is
+    the line's own decision, ``validation.json["exports_accepted"]``, bound to
+    the same map and edges as ``accepted``. Without TPrime the two are one
+    decision; with it they can differ either way.
+    """
+    problem = _acceptance_problem(config, "exports_accepted")
+    if problem is not None and (config.paths.aligned / "validation.json").exists():
+        log.info("exports not stamped: %s", problem)
+    return problem is None
+
+
 def _withdraw_acceptance(config: SessionConfig) -> None:
     """Forget an earlier acceptance and take the exports back to their own clocks.
 
@@ -2323,9 +2385,43 @@ def _withdraw_acceptance(config: SessionConfig) -> None:
     """
     (config.paths.aligned / "validation.json").unlink(missing_ok=True)
     export_dir = config.paths.export_for("neuropixels")
-    for name in ("sync_report.json", "sync_report.txt"):
+    for name in ("sync_report.json", "sync_report.txt",
+                 # the bundle's copies of the records being withdrawn
+                 "validation.json", "time_map.json"):
         (export_dir / name).unlink(missing_ok=True)
     _unstamp_exports(config)
+    _remove_aligned_spike_exports(config)
+
+
+def _remove_aligned_spike_exports(config: SessionConfig) -> None:
+    """Delete the spike exports stamped with a map that is being withdrawn.
+
+    ``sorted_spikes.mat`` and ``waveforms.mat`` carry a time per spike; on
+    Blackrock time those came from the withdrawn map, and next to LFP and OneBox
+    exports back on their own clocks they would leave the bundle on two clocks.
+    ``export_results`` writes all three again (waveforms included) on the map
+    accepted then, or in sorter time. Exports in sorter time are kept: they
+    never used a map. Without a readable ``sorting_summary_info.json`` saying
+    which, they go too.
+    """
+    export_dir = config.paths.export_for("neuropixels")
+    summary = export_dir / "sorting_summary_info.json"
+    products = (sorted(export_dir.glob("*.sorted_spikes.mat"))
+                + sorted(export_dir.glob("*.waveforms.mat")))
+    if not products and not summary.exists():
+        return
+    try:
+        with open(summary, "r", encoding="utf-8") as handle:
+            timebase = json.load(handle).get("timebase")
+    except (OSError, ValueError):
+        timebase = None
+    if timebase not in (None, "blackrock"):
+        return
+    for path in [*products, summary]:
+        if path.exists():
+            path.unlink()
+            log.info("removed %s: its spike times were on the withdrawn map; "
+                     "export_results writes it again", path.name)
 
 
 def _stamp_accepted(config: SessionConfig, mapping: align.LinearMap) -> None:
@@ -2703,7 +2799,7 @@ def validate_remapping(
     include the OneBox-to-probe drift as well as the alignment's error.
 
     Returns ``None`` when only one system is declared. With both, a missing map
-    -- or one not fitted from the 1 Hz edge files now on disk -- is
+    -- or one not fitted from the sync edge files now on disk -- is
     :class:`Unvalidated` and not accepted, so a run that could not fit cannot
     publish an earlier run's map. With no burst on one side it still writes the sync report and returns an
     :class:`Unvalidated` saying so -- the 1 Hz fit residuals in ``time_map.json``
@@ -2728,13 +2824,13 @@ def validate_remapping(
 
     with open(map_path, "r", encoding="utf-8") as handle:
         payload = json.load(handle)
-    current = _edge_inputs(_load_edges(config, extract.BR_1HZ),
-                           _load_edges(config, extract.NPX_1HZ))
-    if payload.get("inputs") != current:
+    changed = _changed_inputs(config, payload.get("inputs"))
+    if changed:
         return _refuse(config, (
-            "time_map.json was not fitted from the 1 Hz edge files now on disk"
+            "time_map.json was not fitted from the sync edge files now on disk "
+            f"(changed: {', '.join(changed)})"
             if payload.get("inputs") else
-            "time_map.json predates maps recording their 1 Hz edges")
+            "time_map.json predates maps recording their sync edges")
             + "; re-run time_remapping")
     mapping = align.LinearMap(
         slope=float(payload["slope"]),
@@ -2774,11 +2870,35 @@ def validate_remapping(
         if tprime_unchecked:
             log.warning("%s", tprime_unchecked)
             reason += "; " + tprime_unchecked
+        line_ok = verdict.startswith("CONSISTENT")
+        # The channels were compared through the line. TPrime's map is the line
+        # plus a constant per 1 Hz interval -- the line's residual at that
+        # interval's pair -- so their agreement speaks for TPrime only where
+        # that gap is inside the tolerance.
+        tprime_gap = None
+        if pairs is not None and not tprime_unchecked:
+            tprime_gap = float(np.max(np.abs(
+                _tprime_model(pairs, mapping, pairs[1]) - mapping.apply(pairs[1]))))
+            if line_ok and tprime_gap > config.alignment_tolerance_s:
+                too_far = (
+                    f"the spikes went through TPrime, which is up to "
+                    f"{tprime_gap * 1e3:.3f} ms from the line the channels were "
+                    f"compared through (tolerance "
+                    f"{config.alignment_tolerance_s * 1e3:g} ms), so their agreement "
+                    "does not check it; the LFP and OneBox exports carry the line")
+                log.warning("%s", too_far)
+                reason += "; " + too_far
+                verdict = "NOT VALIDATED"
+                path = _write_sync_report(config, None, refused=too_far)
         result = Unvalidated(path, reason, verdict)
         settled = {"verdict": verdict, "n_checked": 0, "reason": result.reason}
         if tprime_unchecked:
             settled["map_checked"] = "tprime (could not be checked)"
-        _settle_acceptance(config, mapping, result.passed, settled)
+        elif tprime_gap is not None:
+            settled["map_checked"] = "tprime (against the line)"
+            settled["tprime_line_gap_s"] = tprime_gap
+        _settle_acceptance(config, mapping, result.passed, settled,
+                           exports_accepted=line_ok)
         return result
 
     br_onsets = burst.group_burst_onsets(br_burst, config.burst_interval_s / 2)
@@ -2830,10 +2950,13 @@ def validate_remapping(
             "max_residual_s": line_report.max_residual_s,
             "median_residual_s": line_report.median_residual_s,
             "passed": line_report.passed,
+            "fail_reason": line_report.fail_reason,
         }
     validation["verdict"] = "PASS" if report.passed else "FAIL"
-    _settle_acceptance(config, mapping, report.passed, validation)
-    _write_sync_report(config, validation)
+    # The exports carry the line, so they need the line to have passed too.
+    _settle_acceptance(config, mapping, report.passed, validation,
+                       exports_accepted=line_report.passed)
+    _write_sync_report(config, {**validation, "exports_accepted": line_report.passed})
 
     if figures and report.n_checked:
         axes = plots.plot_alignment_residuals(
@@ -2879,22 +3002,43 @@ def _write_refusal_report(config: SessionConfig, reason: str) -> Path:
 
 def _settle_acceptance(
     config: SessionConfig, mapping: align.LinearMap | None, accepted: bool,
-    validation: dict,
+    validation: dict, exports_accepted: bool | None = None,
 ) -> None:
-    """Write ``validation.json`` with the decision, and publish or withhold the map."""
+    """Write ``validation.json`` with the decision, and publish or withhold the map.
+
+    Two decisions, the same unless the spikes went through TPrime: ``accepted``
+    for the spike times (the map they went through), ``exports_accepted`` for
+    the line stamped into the LFP and OneBox exports. Either can hold without
+    the other; ``exports_accepted`` defaults to ``accepted``.
+    """
+    exports_ok = bool(accepted if exports_accepted is None else exports_accepted)
     # Bound to the exact map judged: a different time_map.json is not accepted.
     validation = {**validation, "accepted": bool(accepted),
+                  "exports_accepted": exports_ok,
                   "time_map_sha256": _map_digest(config)}
     with open(config.paths.aligned / "validation.json", "w", encoding="utf-8") as handle:
         json.dump(validation, handle, indent=2)
-    if accepted:
+    if exports_ok:
         _stamp_accepted(config, mapping)
+    elif accepted:
+        _unstamp_exports(config)
+        log.warning(
+            "the spike times' map (TPrime) passed but its line did not (%s): the "
+            "aligned spike times are used, the LFP and OneBox exports stay on their "
+            "own clocks", (validation.get("line") or {}).get("fail_reason") or "line FAIL",
+        )
     else:
         _unstamp_exports(config)
         log.warning(
             "map not accepted (%s): the LFP and OneBox exports stay on their own "
             "clocks and export_results will not use the aligned spike times",
             validation.get("verdict"),
+        )
+    if exports_ok and not accepted:
+        log.warning(
+            "the line passed but the map the spikes went through did not (%s): the "
+            "LFP and OneBox exports carry the line, export_results will not use the "
+            "aligned spike times", validation.get("reason") or validation.get("verdict"),
         )
 
 

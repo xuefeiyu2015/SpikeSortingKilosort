@@ -444,6 +444,46 @@ def test_without_a_burst_corrupt_tprime_pairs_withdraw_an_earlier_acceptance(
     assert "Verdict: NOT VALIDATED" in text and reason in text
 
 
+@pytest.mark.parametrize("wander_s, accepted", [(0.0002, True), (0.003, False)])
+def test_without_a_burst_a_tprime_map_far_from_the_line_is_not_accepted(
+        tmp_path, monkeypatch, wander_s, accepted):
+    # The photodiode and eye agree -- through the line. TPrime's map is the
+    # line plus each interval's 1 Hz residual; 3 ms of wander puts it 3 ms from
+    # what the channels checked, so the spike times are not accepted. The LFP
+    # and OneBox exports carry the line, which the channels did check.
+    import json
+
+    import spikesorting as ss
+    from spikesorting._sync import catgt
+
+    _, _, session = _remap_with_a_planted_cycle_error(tmp_path, monkeypatch, with_session=True)
+    aligned = session.paths.aligned
+    payload = json.loads((aligned / "time_map.json").read_text())
+    payload["method"] = "tprime"
+    (aligned / "time_map.json").write_text(json.dumps(payload))
+    pair_file = aligned / "npx_1hz_trimmed.txt"
+    t = catgt.read_edge_file(pair_file)
+    catgt.write_edge_file(pair_file, t + wander_s * np.sin(2 * np.pi * np.arange(t.size) / 200))
+
+    outcome = ss.validate_remapping(session, figures=False)
+    validation = json.loads((aligned / "validation.json").read_text())
+    sync = json.loads((session.paths.export_for("neuropixels") / "sync_report.json").read_text())
+
+    assert outcome.passed is accepted
+    assert validation["accepted"] is accepted
+    assert validation["exports_accepted"] is True
+    assert validation["map_checked"] == "tprime (against the line)"
+    assert validation["tprime_line_gap_s"] == pytest.approx(wander_s, rel=0.05)
+    assert ss.pipeline._exports_accepted(session)
+    if accepted:
+        assert sync["verdict"] == "CONSISTENT (no burst)"
+    else:
+        assert outcome.verdict == sync["verdict"] == "NOT VALIDATED"
+        assert "from the line the channels were compared through" in outcome.reason
+        assert "from the line" in sync["verdict_note"]
+        assert {c["channel"] for c in sync["independent_checks"]} == {"photodiode", "eye_x"}
+
+
 def _two_probe_session(tmp_path):
     """Two probes of one run, one OneBox, exported once -- as the driver does it."""
     import spikesorting as ss
