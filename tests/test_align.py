@@ -214,3 +214,17 @@ def test_compose_linear_maps_is_inner_then_outer():
 def test_fit_same_run_map_refuses_trains_that_do_not_pair():
     with pytest.raises(ValueError, match="cannot fit"):
         align.fit_same_run_map(np.array([0.5]), np.array([0.0, 1.0]))
+
+
+def test_matches_outside_the_shared_interval_cannot_cover_misses_inside_it():
+    # Every burst inside the interval is 100 ms off; those outside are perfect.
+    # Counting the outside matches against the inside expectation used to pass.
+    reference = np.arange(30) * 14.0
+    mapped = reference.copy()
+    inside = (reference >= 100.0) & (reference <= 240.0)
+    mapped[inside] += 0.1
+
+    report = align.validate_alignment(mapped, reference, shared_interval_s=(100.0, 240.0))
+
+    assert not report.passed
+    assert report.n_checked == 0

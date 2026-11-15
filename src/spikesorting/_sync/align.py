@@ -271,13 +271,24 @@ def validate_alignment(
     ``shared_interval_s`` is the stretch both systems recorded, on the
     reference clock (the matched 1 Hz edges). Given it, a burst *either* system
     holds inside it is expected -- so a burst channel that stops partway on one
-    side is a shortfall, not a short session. Without it the window is where the
+    side is a shortfall, not a short session -- and only bursts inside it are
+    matched and judged, so matches outside cannot make up for misses inside.
+    Without it the window is where the
     detected bursts overlap, and the expected count is the smaller side's.
     """
     from .burst import match_times  # local import keeps the two modules independent
 
     mapped = np.asarray(mapped_s, dtype=np.float64).reshape(-1)
     reference = np.asarray(reference_s, dtype=np.float64).reshape(-1)
+
+    if shared_interval_s is not None:
+        # One window for everything: matching, residuals and coverage. Matches
+        # outside it would otherwise count toward a coverage measured inside
+        # it, and could hide every burst inside being wrong.
+        start = float(shared_interval_s[0]) - match_tolerance_s
+        stop = float(shared_interval_s[1]) + match_tolerance_s
+        reference = reference[(reference >= start) & (reference <= stop)]
+        mapped = mapped[(mapped >= start) & (mapped <= stop)]
 
     if mapped.size == 0 or reference.size == 0:
         empty = np.empty(0, dtype=np.float64)
@@ -293,9 +304,7 @@ def validate_alignment(
     max_res = float(np.abs(residuals).max())
 
     if shared_interval_s is not None:
-        start = float(shared_interval_s[0]) - match_tolerance_s
-        stop = float(shared_interval_s[1]) + match_tolerance_s
-        combine = max
+        combine = max                      # start/stop: the window set above
     else:
         start = max(reference.min(), mapped.min()) - match_tolerance_s
         stop = min(reference.max(), mapped.max()) + match_tolerance_s

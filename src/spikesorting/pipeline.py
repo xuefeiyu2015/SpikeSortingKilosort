@@ -1743,6 +1743,19 @@ def _onebox_binary(config: SessionConfig) -> Path | None:
     return layout.obx if layout is not None else None
 
 
+def _onebox_export_dir(config: SessionConfig) -> Path:
+    """Where the session's one OneBox analog export is: the first probe's ``export/``.
+
+    One OneBox per run, so the driver exports it once, with the first probe's
+    config. Every probe *reads* it from there -- to pick its cycle and to check
+    its map -- and applies its own ``onebox_to_blackrock``; only the first
+    probe's map is stamped into it. A one-probe session is its own first probe.
+    """
+    if config.neuropixels.bin_files is None or not config.probes:
+        return config.paths.export_for("neuropixels")
+    return config.for_probe(config.probes[0]).paths.export_for("neuropixels")
+
+
 def _fitted_onebox_map(config: SessionConfig) -> align.LinearMap | None:
     """``onebox_to_blackrock`` from this probe's ``time_map.json``, if there is one."""
     map_path = config.paths.aligned / "time_map.json"
@@ -2245,18 +2258,61 @@ def _edge_inputs(br_1hz: np.ndarray | None, npx_1hz: np.ndarray | None) -> dict[
     return {extract.BR_1HZ: digest(br_1hz), extract.NPX_1HZ: digest(npx_1hz)}
 
 
-def _alignment_accepted(config: SessionConfig) -> bool:
-    """Whether ``validate_remapping`` accepted this probe's current map.
+def _map_digest(config: SessionConfig) -> str | None:
+    """SHA-256 of this probe's ``time_map.json`` as it is on disk, or None."""
+    import hashlib
 
-    ``validation.json["accepted"]``: a burst PASS, or ``CONSISTENT (no burst)``.
-    ``time_remapping`` deletes the file whenever it fits a new map, so an
-    acceptance can never outlive the map it was given to.
-    """
     try:
-        with open(config.paths.aligned / "validation.json", "r", encoding="utf-8") as h:
-            return bool(json.load(h).get("accepted"))
+        return hashlib.sha256((config.paths.aligned / "time_map.json").read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _acceptance_problem(config: SessionConfig) -> str | None:
+    """Why this probe's map cannot be treated as accepted now, or None if it can.
+
+    Three things, all checked on disk every time, so an export run on its own --
+    after ``extract_sync`` was re-run, say -- cannot label anything Blackrock
+    time with a map fitted from other edges:
+
+    - ``validation.json["accepted"]`` (a burst PASS or ``CONSISTENT (no burst)``);
+    - the ``time_map.json`` it accepted is the one on disk (its SHA-256);
+    - that map was fitted from the 1 Hz edge files on disk now (its ``inputs``).
+    """
+    aligned = config.paths.aligned
+    try:
+        with open(aligned / "validation.json", "r", encoding="utf-8") as handle:
+            validation = json.load(handle)
     except (OSError, ValueError):
-        return False
+        return "no validation.json"
+    if not validation.get("accepted"):
+        return f"validate_remapping did not accept it ({validation.get('verdict')})"
+    if validation.get("time_map_sha256") != _map_digest(config):
+        return ("time_map.json is not the map validate_remapping accepted; "
+                "re-run time_remapping and validate_remapping")
+    try:
+        with open(aligned / "time_map.json", "r", encoding="utf-8") as handle:
+            inputs = json.load(handle).get("inputs")
+    except (OSError, ValueError):
+        return "time_map.json cannot be read"
+    current = _edge_inputs(_load_edges(config, extract.BR_1HZ),
+                           _load_edges(config, extract.NPX_1HZ))
+    if inputs != current:
+        return ("the 1 Hz edge files changed since the map was fitted; "
+                "re-run time_remapping and validate_remapping")
+    return None
+
+
+def _alignment_accepted(config: SessionConfig) -> bool:
+    """Whether this probe's map is accepted *and* still the map of these edges.
+
+    See :func:`_acceptance_problem`. An acceptance that no longer holds is
+    logged, since everything that asks then stays on its own clock.
+    """
+    problem = _acceptance_problem(config)
+    if problem is not None and (config.paths.aligned / "validation.json").exists():
+        log.warning("alignment not used: %s", problem)
+    return problem is None
 
 
 def _withdraw_acceptance(config: SessionConfig) -> None:
@@ -2429,7 +2485,7 @@ def _cycle_from_behaviour(
                       "neuropixels.analog_channels to pick the cycle with"), []
     try:
         onebox = analog.load_onebox_analog(
-            analog.find_onebox_analog(config.paths.export_for("neuropixels")),
+            analog.find_onebox_analog(_onebox_export_dir(config)),
             require_blackrock=False,
         )
         br = analog.open_blackrock_analog(
@@ -2826,7 +2882,9 @@ def _settle_acceptance(
     validation: dict,
 ) -> None:
     """Write ``validation.json`` with the decision, and publish or withhold the map."""
-    validation = {**validation, "accepted": bool(accepted)}
+    # Bound to the exact map judged: a different time_map.json is not accepted.
+    validation = {**validation, "accepted": bool(accepted),
+                  "time_map_sha256": _map_digest(config)}
     with open(config.paths.aligned / "validation.json", "w", encoding="utf-8") as handle:
         json.dump(validation, handle, indent=2)
     if accepted:
@@ -2928,7 +2986,7 @@ def _write_sync_report(
     names: list[str] = []
     try:
         names = list(analog.load_onebox_analog(
-            analog.find_onebox_analog(export_dir), require_blackrock=False
+            analog.find_onebox_analog(_onebox_export_dir(config)), require_blackrock=False
         ).names)
     except (OSError, ValueError):
         pass                               # no analog export for this probe
@@ -2998,7 +3056,7 @@ def _independent_checks(config: SessionConfig) -> list[dict[str, Any]]:
                           "OneBox copy cannot be put on Blackrock time")
     try:
         onebox = analog.load_onebox_analog(
-            analog.find_onebox_analog(config.paths.export_for("neuropixels")),
+            analog.find_onebox_analog(_onebox_export_dir(config)),
             require_blackrock=False,
         )
     except (OSError, ValueError) as error:

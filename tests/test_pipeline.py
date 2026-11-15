@@ -87,6 +87,24 @@ def raw_reader(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _plant_acceptance(session):
+    """An acceptance as validate_remapping leaves one: bound to the map on disk
+    (writing a minimal one if there is none) and to the edge files on disk."""
+    from spikesorting._sync import extract as _extract
+
+    aligned = session.paths.aligned
+    aligned.mkdir(parents=True, exist_ok=True)
+    map_path = aligned / "time_map.json"
+    payload = (json.loads(map_path.read_text()) if map_path.exists()
+               else {"slope": 1.0, "intercept": 0.0, "n_points": 0})
+    payload["inputs"] = pipeline._edge_inputs(
+        pipeline._load_edges(session, _extract.BR_1HZ),
+        pipeline._load_edges(session, _extract.NPX_1HZ))
+    map_path.write_text(json.dumps(payload), encoding="utf-8")
+    (aligned / "validation.json").write_text(json.dumps(
+        {"accepted": True, "time_map_sha256": pipeline._map_digest(session)}))
+
+
 def test_the_package_exports_the_workflow_and_nothing_else():
     # Opening `import spikesorting` should read as the pipeline. A `step_*` or a
     # second surface reappearing here is the regression this guards.
@@ -786,7 +804,7 @@ def test_an_lfp_exported_after_alignment_picks_up_the_map_immediately(tmp_path):
     # A map not yet accepted is not stamped in.
     assert timebase_of(ss.extract_lfp(session, "neuropixels")) == "stream"
 
-    (aligned / "validation.json").write_text(json.dumps({"accepted": True}))
+    _plant_acceptance(session)
     path = ss.extract_lfp(session, "neuropixels")
 
     assert path is not None
@@ -1463,6 +1481,53 @@ def test_a_fit_that_raises_on_nonempty_edges_still_withdraws_the_old_pass(tmp_pa
     assert not (export / "sync_report.json").exists()
     assert not (export / "sync_report.txt").exists()
     assert _analog_fields(path)["timebase"] == "onebox"
+
+
+def test_an_export_after_the_edges_changed_does_not_use_the_old_acceptance(tmp_path):
+    # Accepted, then extract_sync re-run (here: the Blackrock 1 Hz file
+    # rewritten) and the exports called on their own, with no re-alignment.
+    # Nothing may come out labelled Blackrock time from the old map.
+    from types import SimpleNamespace
+
+    session = _analog_session(tmp_path)
+    ss.extract_analog(session, "neuropixels")
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+    assert pipeline._alignment_accepted(session)
+
+    session.paths.sorted_for("neuropixels").mkdir(parents=True, exist_ok=True)
+    samples = np.array([10, 20, 30])
+    aligned = pipeline._aligned_spike_path(session, "neuropixels")
+    np.save(aligned, np.array([1.0, 2.0, 3.0]))
+    pipeline._write_aligned_identity(aligned, samples, "linear_fit")
+    phy = SimpleNamespace(spike_samples=samples)
+    assert pipeline._resolve_spike_seconds(session, "neuropixels", phy)[1] == "blackrock"
+
+    edges = session.paths.sync_for("blackrock") / "blackrock_1hz.txt"
+    times = np.loadtxt(edges)
+    np.savetxt(edges, times + 0.5)
+
+    assert not pipeline._alignment_accepted(session)
+    assert "edge files changed" in pipeline._acceptance_problem(session)
+    assert pipeline._resolve_spike_seconds(session, "neuropixels", phy)[1] == "sorter"
+    path = ss.extract_analog(session, "neuropixels")        # re-export: not stamped
+    assert _analog_fields(path)["timebase"] == "onebox"
+
+
+def test_an_acceptance_belongs_to_the_map_it_judged(tmp_path):
+    # Same edges, but time_map.json is not the file that was validated.
+    session = _analog_session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+
+    map_path = session.paths.aligned / "time_map.json"
+    payload = json.loads(map_path.read_text())
+    payload["intercept"] += 1.0
+    map_path.write_text(json.dumps(payload))
+
+    assert "not the map validate_remapping accepted" in pipeline._acceptance_problem(session)
 
 
 def test_single_system_sessions_still_have_nothing_to_map(tmp_path):
@@ -2207,7 +2272,7 @@ def test_aligned_times_are_bound_to_the_sorting_they_were_mapped_from(tmp_path):
     session = _session(tmp_path)
     sorted_dir = session.paths.sorted_for("neuropixels")
     sorted_dir.mkdir(parents=True, exist_ok=True)
-    (session.paths.aligned / "validation.json").write_text(json.dumps({"accepted": True}))
+    _plant_acceptance(session)
     aligned = pipeline._aligned_spike_path(session, "neuropixels")
     old = np.array([10, 20, 30])
     np.save(aligned, np.array([1.0, 2.0, 3.0]))
@@ -2244,7 +2309,7 @@ def test_an_aligned_array_is_checked_before_it_is_exported(tmp_path, caplog, pay
 
     session = _session(tmp_path)
     session.paths.sorted_for("neuropixels").mkdir(parents=True, exist_ok=True)
-    (session.paths.aligned / "validation.json").write_text(json.dumps({"accepted": True}))
+    _plant_acceptance(session)
     aligned = pipeline._aligned_spike_path(session, "neuropixels")
     samples = np.array([10, 20])
     pipeline._write_aligned_identity(aligned, samples, "tprime")
@@ -2488,6 +2553,7 @@ def test_the_sync_report_says_not_validated_without_bursts(tmp_path):
     # Nothing independent confirms the cycle: not accepted, so the runner stops.
     assert result.passed is False
     validation = json.loads((session.paths.aligned / "validation.json").read_text())
+    assert validation.pop("time_map_sha256") == pipeline._map_digest(session)
     assert validation == {"verdict": "NOT VALIDATED", "n_checked": 0,
                           "reason": result.reason, "accepted": False}
     sync = json.loads(

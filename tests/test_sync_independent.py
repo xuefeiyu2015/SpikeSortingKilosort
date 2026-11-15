@@ -442,3 +442,85 @@ def test_without_a_burst_corrupt_tprime_pairs_withdraw_an_earlier_acceptance(
     assert {c["channel"] for c in sync["independent_checks"]} == {"photodiode", "eye_x"}
     text = (export / "sync_report.txt").read_text()
     assert "Verdict: NOT VALIDATED" in text and reason in text
+
+
+def _two_probe_session(tmp_path):
+    """Two probes of one run, one OneBox, exported once -- as the driver does it."""
+    import spikesorting as ss
+
+    signals = _world()
+    run = tmp_path / "run_g0"
+    for probe in (0, 1):
+        folder = run / f"run_g0_imec{probe}"
+        folder.mkdir(parents=True)
+        (folder / f"run_g0_t0.imec{probe}.ap.bin").write_bytes(b"")
+    session_file = tmp_path / "s.yaml"
+    session_file.write_text(
+        f"blackrock_dir: '{tmp_path / 'br'}'\nneuropixels_dir: '{run}'\n"
+        "blackrock:\n  sync_file: '{blackrock_dir}/NSP_001.ns5'\n"
+        "  analog_file: '{blackrock_dir}/NSP_001.ns2'\n"
+        "  analog_inputs: {eye_x: 1, photodiode: 4}\n  nsp_frontend_channels: 128\n"
+        "neuropixels:\n  bin_files:\n"
+        "    - '{neuropixels_dir}/run_g0_imec0/run_g0_t0.imec0.ap.bin'\n"
+        "    - '{neuropixels_dir}/run_g0_imec1/run_g0_t0.imec1.ap.bin'\n"
+        "  analog_channels: {eye_x: 1, photodiode: 4}\n",
+        encoding="utf-8",
+    )
+    session = ss.load_session_config(session_file, "mac")
+    probes = [config for _, config in session.per_probe()]
+
+    n = int((T0 + DURATION - C) / M * OBX_FS)
+    world = signals(M * np.arange(n) / OBX_FS + C)
+    data = np.zeros((n, 7), dtype=np.int16)
+    data[:, 1] = np.round(world["eye_x"] * 300).astype(np.int16)
+    data[:, 4] = np.round(world["photodiode"] * 20000).astype(np.int16)
+    obx = run / "run_g0_t0.obx0.obx.bin"
+    obx.write_bytes(data.tobytes())
+    obx.with_suffix(".meta").write_text(
+        f"nSavedChans=7\nobSampRate={OBX_FS}\ntypeThis=obx\nsnsXaDwSy=5,1,1\n"
+        "obAiRangeMax=5\nobMaxInt=32768\n", encoding="utf-8",
+    )
+    # Once, into the first probe's export/, on the OneBox clock.
+    spikeglx.export_onebox_analog(
+        obx, probes[0].paths.export_for("neuropixels"),
+        named={"eye_x": 1, "photodiode": 4}, burst_row=0,
+    )
+
+    nbr = int(DURATION / BR_PERIOD)
+    late = signals(T0 + np.arange(nbr) * BR_PERIOD - FILTER_DELAY)
+    columns = {"129": late["eye_x"], "130": 0 * late["eye_x"],
+               "131": 0 * late["eye_x"], "132": late["photodiode"]}
+    reader = _Reader(columns, ["129", "130", "131", "132"], BR_FS, T0)
+    for config in probes:
+        _plant_1hz_without_burst(config)
+    return probes, reader
+
+
+def test_without_a_burst_the_second_probe_uses_the_one_onebox_export(tmp_path, monkeypatch):
+    # The OneBox analog is exported once, under probe 0. Probe 1 must still pick
+    # its 1 Hz cycle from it and confirm its map with it -- through its own map
+    # -- rather than finding nothing in its own export/ and staying 1hz_only.
+    import json
+
+    import spikesorting as ss
+    from spikesorting._sync import burst
+
+    probes, reader = _two_probe_session(tmp_path)
+    monkeypatch.setattr(analog, "open_blackrock_analog", _open_with(reader))
+    true_offset = C + (M - 1.0) * DURATION / 2
+    monkeypatch.setattr(burst, "estimate_offset", lambda *a, **k: true_offset + 3.0)
+
+    for config in probes:
+        ss.time_remapping(config, "neuropixels")
+        payload = json.loads((config.paths.aligned / "time_map.json").read_text())
+        assert payload["cycles_from"] == "photodiode", config.probe_tag
+        assert payload["cycle_vote"]["shift_s"] == pytest.approx(-3.0)
+        outcome = ss.validate_remapping(config, figures=False)
+        assert outcome.verdict == "CONSISTENT (no burst)", config.probe_tag
+        assert json.loads((config.paths.aligned / "validation.json").read_text())["accepted"]
+        sync = json.loads((config.paths.export_for("neuropixels") / "sync_report.json").read_text())
+        assert {c["channel"] for c in sync["independent_checks"]} == {"photodiode", "eye_x"}
+
+    second = probes[1].paths.export_for("neuropixels")
+    assert not list(second.glob("*.analog.mat"))          # no duplicate export
+    assert probes[0].paths.aligned != probes[1].paths.aligned   # each its own map
