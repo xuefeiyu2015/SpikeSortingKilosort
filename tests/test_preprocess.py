@@ -371,6 +371,54 @@ def test_the_spikeinterface_chain_keeps_length_scale_and_type():
     assert abs(float(np.median(traces))) < 5               # DC gone, CAR applied
 
 
+def test_the_median_is_taken_over_the_reference_rows_only():
+    # Two electrodes carrying one signal, two rows that are not electrodes. The
+    # median over all four is half the signal; over the electrodes, all of it.
+    pytest.importorskip("spikeinterface.core")
+    import spikeinterface.core as sc
+
+    from spikesorting._preprocess import si
+
+    t = np.arange(30000) / 30000.0
+    shared = 1000.0 * np.sin(2 * np.pi * 1000.0 * t)
+    traces = np.zeros((t.size, 4), dtype=np.int16)
+    traces[:, 0] = traces[:, 1] = shared.astype(np.int16)
+    traces[:, 2:] = 5000                                    # an analog input's DC
+    raw = sc.NumpyRecording([traces], sampling_frequency=30000.0)
+    spec = cfg.replace(cfg.BLACKROCK_PREPROCESS, gfix=None)
+    middle = slice(3000, 27000)                             # away from filter edges
+
+    every_row = si.build_chain(raw, spec).get_traces()[middle, 0].astype(float)
+    electrodes = si.build_chain(raw, spec, reference_rows=[0, 1]).get_traces()[middle, 0]
+
+    assert np.abs(every_row).max() > 300                    # half the signal left in
+    assert np.abs(electrodes).max() <= 1                    # the shared signal removed
+    with pytest.raises(ValueError, match="not rows"):
+        si.build_chain(raw, spec, reference_rows=[0, 7])
+
+
+def test_the_reference_rows_are_recorded_so_bad_channels_remake_the_binary(tmp_path):
+    from spikesorting import pipeline
+
+    ns6 = tmp_path / "b" / "z.ns6"
+    ns6.parent.mkdir()
+    ns6.write_bytes(b"")
+    probe = tmp_path / "utah.json"
+    probe.write_text(
+        '{"chanMap": [0, 1, 2, 3, 5], "xc": [0, 0, 0, 0, 0], "yc": [0, 1, 2, 3, 4],'
+        ' "kcoords": [0, 1, 2, 3, 4], "n_chan": 5}', encoding="utf-8")
+    body = (f"blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '{ns6}'\n"
+            f"  probe_file: '{probe}'\n  kilosort:\n    bad_channels: [{{}}]\n")
+
+    def expected(bad):
+        config = _load(tmp_path, body.replace("{}", bad))
+        return pipeline._preprocess_expected(config, "blackrock")
+
+    # row 4 is not on the probe (an analog input), row 2 is bad
+    assert expected("2")["settings"]["reference_rows"] == [0, 1, 3, 5]
+    assert provenance.stale_reasons(expected("2"), expected("3"))
+
+
 def test_phase_shift_without_the_adc_offsets_says_what_to_turn_off():
     from spikesorting._preprocess import si
 

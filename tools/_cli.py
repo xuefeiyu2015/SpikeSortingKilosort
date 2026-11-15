@@ -225,6 +225,17 @@ class Runner:
 
         seconds = time.perf_counter() - started
         took = _elapsed(seconds)
+        if getattr(value, "passed", None) is False:
+            # A check that ran and failed (validate_remapping's burst check):
+            # the stage worked, its verdict is the failure. Stop here, so nothing
+            # is exported on a time base the check just rejected.
+            self.failures += 1
+            self.last_failed = True
+            self.stopped = True
+            self._record(shown, verb, "failed check", seconds, wall, value)
+            print(f"[!!] {label}  ({took})\n       {_describe(value)}\n"
+                  "       stopping: nothing is exported on a map that failed its check")
+            return value
         self._record(shown, verb, "nothing to do" if value is None else "ok",
                      seconds, wall, value)
         if value is None:

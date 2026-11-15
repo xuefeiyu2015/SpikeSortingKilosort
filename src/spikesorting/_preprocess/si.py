@@ -17,17 +17,26 @@ nothing on a machine without it.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 __all__ = ["build_chain", "motion_chain", "read_neuropixels", "write"]
 
 
-def build_chain(recording: Any, spec: Any, job_kwargs: dict | None = None) -> Any:
+def build_chain(
+    recording: Any,
+    spec: Any,
+    job_kwargs: dict | None = None,
+    reference_rows: Sequence[int] | None = None,
+) -> Any:
     """The preprocessed recording, as a lazy SpikeInterface chain.
 
     ``spec`` is a :class:`.._config.PreprocessSpec`. Motion correction is the
     one step that computes on construction (it detects and localises peaks to
     estimate the motion), which is why it takes ``job_kwargs``.
+
+    ``reference_rows`` are the rows the common median is taken over -- the
+    probe's electrodes minus ``bad_channels``. It is still *subtracted* from
+    every row, so the binary keeps its shape. ``None`` takes every row.
     """
     import spikeinterface.preprocessing as spre
 
@@ -42,7 +51,19 @@ def build_chain(recording: Any, spec: Any, job_kwargs: dict | None = None) -> An
         rec = spre.phase_shift(rec)
     rec = spre.bandpass_filter(rec, freq_min=spec.highpass_hz, freq_max=spec.lowpass_hz)
     if spec.car_mode == "gblcar":
-        rec = spre.common_reference(rec, reference="global", operator="median")
+        ref_ids = None
+        if reference_rows is not None:
+            ids = list(rec.channel_ids)
+            outside = [r for r in reference_rows if not 0 <= r < len(ids)]
+            if outside or not len(reference_rows):
+                raise ValueError(
+                    f"reference rows {outside or '(none)'} are not rows of this "
+                    f"{len(ids)}-channel recording"
+                )
+            ref_ids = [ids[r] for r in reference_rows]
+        rec = spre.common_reference(
+            rec, reference="global", operator="median", ref_channel_ids=ref_ids
+        )
     elif spec.car_mode is not None:
         raise ValueError(f"car_mode {spec.car_mode!r} has no SpikeInterface equivalent")
     if spec.motion is not None:

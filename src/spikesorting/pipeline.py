@@ -389,6 +389,8 @@ def _preprocess_expected(config: SessionConfig, system: str) -> dict[str, Any]:
 
     spec = config.preprocess_for(system)
     settings: dict[str, Any] = asdict(spec)
+    if spec.method == "spikeinterface" and spec.car_mode:
+        settings["reference_rows"] = _reference_rows(config, system)
     if system == "blackrock":
         brk = config.blackrock
         settings["reader"] = {
@@ -404,6 +406,25 @@ def _preprocess_expected(config: SessionConfig, system: str) -> dict[str, Any]:
         "settings": settings,
         "source": provenance.source_fingerprint(_input_path(config, system)),
     }
+
+
+def _reference_rows(config: SessionConfig, system: str) -> list[int]:
+    """The rows the common median is taken over: the probe's, minus ``bad_channels``.
+
+    A ``.ns6`` can carry rows that are not electrodes of this array (analog
+    inputs, a second array's bank), and a bad channel is one Kilosort is told to
+    ignore -- neither belongs in the reference every other channel has
+    subtracted from it. Rows are binary rows, as ``chanMap`` and
+    ``bad_channels`` both are. Recorded in ``preprocess.json``, so a changed
+    ``bad_channels`` remakes the binary.
+    """
+    probe = setup_probe(config, system)
+    rows = {int(r) for r in np.asarray(probe["chanMap"]).ravel()}
+    bad = {int(r) for r in (config.kilosort_for(system).get("bad_channels") or [])}
+    kept = sorted(rows - bad)
+    if not kept:
+        raise ValueError(f"every {system} channel is in bad_channels; nothing to reference")
+    return kept
 
 
 def _stale_reasons(config: SessionConfig, system: str) -> tuple[list[str], dict | None]:
@@ -465,8 +486,9 @@ def _run_preprocessing(config: SessionConfig, system: str, directory: Path) -> d
     jobs = _job_kwargs(config)
     directory.mkdir(parents=True, exist_ok=True)
 
+    rows = _reference_rows(config, system) if spec.car_mode else None
     if system == "blackrock":
-        recording = si.build_chain(_read_blackrock(config), spec, jobs)
+        recording = si.build_chain(_read_blackrock(config), spec, jobs, rows)
         path = si.write(recording, directory / f"{config.blackrock.spike_file.stem}.bin", jobs)
         return _record_of(recording, path, steps=_si_steps(spec))
 
@@ -480,6 +502,7 @@ def _run_preprocessing(config: SessionConfig, system: str, directory: Path) -> d
         ),
         spec,
         jobs,
+        rows,
     )
     path = si.write(recording, directory / f"{info.path.stem}.bin", jobs)
     return _record_of(recording, path, steps=_si_steps(spec))
@@ -497,7 +520,8 @@ def _si_steps(spec: Any) -> list[str]:
     steps = ["phase_shift"] if spec.phase_shift else []
     steps.append(f"bandpass_filter {spec.highpass_hz:g}-{spec.lowpass_hz:g} Hz")
     if spec.car_mode:
-        steps.append("common_reference global median (gblcar)")
+        steps.append("common_reference global median (gblcar), over the probe's "
+                     "channels minus bad_channels")
     if spec.motion:
         steps.append(f"correct_motion preset={spec.motion}")
     return steps
@@ -601,7 +625,8 @@ def _read_blackrock(config: SessionConfig) -> Any:
     file: the probe's ``chanMap`` is what selects electrodes, and dropping them
     here would shift every contact after the removed one. (They are filtered and
     re-referenced along with the rest, which costs nothing -- Kilosort never
-    reads them -- but the median is taken over every channel in the file.)
+    reads them. The median itself is taken over the probe's channels minus
+    ``bad_channels`` only: see :func:`_reference_rows`.)
     """
     spec = config.blackrock
     if spec.spike_file is None:
@@ -1002,11 +1027,15 @@ def _work_dir(config: SessionConfig, system: str) -> Path | None:
     return Path(config.cache_dir) / name
 
 
-_PREVIOUS_CURATION = (".phy", "phy.log", "cluster_*.tsv")
+_PREVIOUS_CURATION = (
+    ".phy", "phy.log", "cluster_*.tsv",
+    # time_remapping's per-spike arrays, one per spike of the *old* sort
+    "*_spike_seconds.npy", "*_spike_seconds_blackrock.npy",
+)
 
 
 def _clear_previous_curation(final_dir: Path) -> None:
-    """Remove what Phy left from a previous sort before a new one lands here.
+    """Remove what was derived from a previous sort before a new one lands here.
 
     Kilosort overwrites its own arrays but knows nothing of Phy's: the ``.phy/``
     cache (spikes-per-cluster and cluster stats for the *old* cluster ids),
@@ -1014,6 +1043,11 @@ def _clear_previous_curation(final_dir: Path) -> None:
     merged on top of them fails to open in Phy, and the labels would name
     clusters that no longer exist. Every ``cluster_*.tsv`` goes, including
     Kilosort's own, because the new sort writes its own set.
+
+    So do the per-spike times ``time_remapping`` wrote: one entry per spike of
+    the old sort, and ``export_results`` would take them as the new sort's
+    Blackrock times whenever the counts happened to agree. The time map itself
+    stays -- it describes the sync edges, not the spikes.
     """
     for pattern in _PREVIOUS_CURATION:
         for path in final_dir.glob(pattern):
@@ -1269,8 +1303,13 @@ def _unit_page_data(
     spike_times_s: dict[int, np.ndarray] | None,
     table,
     measured: dict | None,
+    window: tuple[float, float] | None = None,
 ) -> list[dict[str, Any]]:
     """What ``plots.save_unit_pages`` draws, one dict per unit, ordered by channel.
+
+    ``window`` is the sorted recording's ``(start_s, duration_s)`` -- the rate
+    is binned over it, as ``units.csv`` divides by it; without one, over the
+    span of the spikes.
 
     The waveform is exactly what ``sorted_spikes.mat`` holds: ``MeanWaveform``
     +/- ``StdWaveform`` from :func:`export_waveforms`, in uV or ADC as it says.
@@ -1291,8 +1330,8 @@ def _unit_page_data(
         )
 
     # On the NSP or Blackrock axis the recording starts nowhere near zero, so
-    # the rate is binned over the window the times actually span.
-    start, duration = final.recording_window(phy, unit_ids, spike_times_s)
+    # the rate is binned over the recording's window on that axis.
+    start, duration = window or final.recording_window(phy, unit_ids, spike_times_s)
     units = []
     for unit_id in unit_ids:
         unit_id = int(unit_id)
@@ -1378,6 +1417,7 @@ def _write_summary(
     measured: dict | None,
     curated: bool,
     time_map: Any = None,
+    window: tuple[float, float] | None = None,
 ) -> Path:
     """The manifest that makes the bundle self-describing.
 
@@ -1398,6 +1438,11 @@ def _write_summary(
         "time_units": "seconds",
         "curated": curated,
         "n_units_exported": int(np.asarray(unit_ids).size),
+        # What units.csv's firing rates and presence ratios are taken over.
+        "recording_window": (
+            {"start_s": window[0], "duration_s": window[1], "from": "samples sorted"}
+            if window else {"from": "span of the exported spikes"}
+        ),
         **({"nsp_time_map": time_map.to_dict()} if time_map is not None else {}),
         "waveforms": (
             {
@@ -2115,10 +2160,15 @@ def _fit_1hz(
 ) -> tuple[np.ndarray, np.ndarray, align.LinearMap]:
     """Trim both 1 Hz trains to their overlap, pair them under ``coarse``, fit a line.
 
+    Returns ``(blackrock, probe, line)`` where the two edge arrays are the
+    **matched pairs** -- same length, element ``i`` of each the same pulse --
+    not the trimmed trains. TPrime aligns edge *sequences*, so an edge present
+    in only one recording (a pulse dropped mid-session, not just at the ends)
+    would shift every later interval by a cycle; handing it the pairs the line
+    was fitted through means a dropped pulse costs one longer interval instead.
+
     ``coarse`` maps probe seconds onto Blackrock time to within a quarter
-    period, or is a constant offset. Trimming matters because TPrime aligns
-    edge *sequences*: an edge present in only one recording shifts the
-    correspondence by whole cycles.
+    period, or is a constant offset.
     """
     if not callable(coarse):
         constant = float(coarse)
@@ -2138,7 +2188,15 @@ def _fit_1hz(
     )
     if ref_idx.size < 2:
         raise ValueError(f"only {ref_idx.size} matched 1 Hz edges; cannot fit a time map")
-    return br_trim, npx_trim, align.fit_linear_map(npx_trim[other_idx], br_trim[ref_idx])
+    unpaired = br_trim.size + npx_trim.size - 2 * ref_idx.size
+    if unpaired:
+        log.warning(
+            "%d 1 Hz edge(s) inside the overlap had no partner on the other system "
+            "(Blackrock %d, SpikeGLX %d, %d pairs); only the pairs are used",
+            unpaired, br_trim.size, npx_trim.size, ref_idx.size,
+        )
+    br_pairs, npx_pairs = br_trim[ref_idx], npx_trim[other_idx]
+    return br_pairs, npx_pairs, align.fit_linear_map(npx_pairs, br_pairs)
 
 
 #: How far, in seconds, a 1 Hz-only offset may be from the truth. It is
@@ -2421,19 +2479,49 @@ def validate_remapping(
 
     br_onsets = burst.group_burst_onsets(br_burst, config.burst_interval_s / 2)
     npx_onsets = burst.group_burst_onsets(npx_burst, config.burst_interval_s / 2)
-    report = align.validate_alignment(
+    line_report = align.validate_alignment(
         mapping.apply(npx_onsets), br_onsets, tolerance_s=config.alignment_tolerance_s
     )
-    log.info("%s", report.summary())
+    # Check the map the spikes actually went through: TPrime's per-interval
+    # offsets when it ran, the line otherwise.
+    checked_map = "linear_fit"
+    report = line_report
+    if payload.get("method") == "tprime":
+        tprime_mapped = _tprime_model(aligned_dir, mapping, npx_onsets)
+        if tprime_mapped is None:
+            log.warning(
+                "the spikes went through TPrime, but its edge pairs in %s are not "
+                "matched (written before they were), so only the line is checked; "
+                "re-run time_remapping", aligned_dir,
+            )
+        else:
+            checked_map = "tprime"
+            report = align.validate_alignment(
+                tprime_mapped, br_onsets, tolerance_s=config.alignment_tolerance_s
+            )
+            log.info("line: %s", line_report.summary())
+    log.info("%s: %s", checked_map, report.summary())
 
     validation = {
+        "map_checked": checked_map,
         "n_checked": report.n_checked,
+        "n_expected": report.n_expected,
+        "coverage": report.coverage,
+        "span_s": report.span_s,
         "max_residual_s": report.max_residual_s,
         "median_residual_s": report.median_residual_s,
         "tolerance_s": report.tolerance_s,
         "passed": report.passed,
+        "fail_reason": report.fail_reason,
         "burst_clock": "probe" if obx_map is not None else "onebox",
     }
+    if checked_map != "linear_fit":
+        validation["line"] = {
+            "n_checked": line_report.n_checked,
+            "max_residual_s": line_report.max_residual_s,
+            "median_residual_s": line_report.median_residual_s,
+            "passed": line_report.passed,
+        }
     with open(aligned_dir / "validation.json", "w", encoding="utf-8") as handle:
         json.dump(validation, handle, indent=2)
     _write_sync_report(config, validation)
@@ -2449,6 +2537,30 @@ def validate_remapping(
         log.info("wrote %s", path)
 
     return report
+
+
+def _tprime_model(
+    aligned_dir: Path, mapping: align.LinearMap, npx_times: np.ndarray
+) -> np.ndarray | None:
+    """``npx_times`` through the map TPrime applied, or None without matched pairs.
+
+    Exactly what :func:`_run_tprime_shifted` hands TPrime -- the probe edges and
+    times scaled by the line's slope, Blackrock's with its intercept removed --
+    put through TPrime's measured rule (:func:`align.interval_offset_map`), then
+    the intercept added back.
+    """
+    try:
+        br = catgt.read_edge_file(aligned_dir / "blackrock_1hz_trimmed.txt")
+        npx = catgt.read_edge_file(aligned_dir / "npx_1hz_trimmed.txt")
+    except OSError:
+        return None
+    if br.size != npx.size or not br.size:
+        return None
+    slope, intercept = float(mapping.slope), float(mapping.intercept)
+    mapped = align.interval_offset_map(
+        slope * np.asarray(npx_times, dtype=np.float64), slope * npx, br - intercept
+    )
+    return mapped + intercept
 
 
 def _write_sync_report(config: SessionConfig, validation: dict | None) -> Path | None:
@@ -2587,6 +2699,75 @@ def _aligned_spike_path(config: SessionConfig, system: str) -> Path:
     return config.paths.sorted_for(system) / f"{system}_spike_seconds_blackrock.npy"
 
 
+def _sorted_window(
+    config: SessionConfig, system: str, phy, timebase: str, nsp_map: Any = None
+) -> tuple[float, float] | None:
+    """``(start_s, duration_s)`` of the samples Kilosort sorted, on ``timebase``.
+
+    The denominator of every firing rate and the span of the presence ratio.
+    Taken from the sort's own record -- the binary's sample count
+    (``preprocess.json``, or its size) cut to the ``tmin``/``tmax`` Kilosort was
+    given -- not from the spikes, whose first and last fall wherever the units
+    happened to fire. Mapped onto ``timebase`` the way the spike times were.
+    A recording with a pause (segments) spans the pause on the NSP and
+    Blackrock axes, as its spike times do.
+
+    ``None`` when the record is missing, so the caller falls back to the span
+    of the spikes.
+    """
+    path = config.paths.sorted_for(system) / "run_info.json"
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            run_info = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    settings = run_info.get("settings") or {}
+    n_samples = (run_info.get("preprocessing") or {}).get("n_samples")
+    if n_samples is None:
+        try:
+            n_samples = Path(run_info["binary"]).stat().st_size // (2 * int(settings["n_chan_bin"]))
+        except (KeyError, TypeError, ValueError, OSError):
+            return None
+    fs = float(phy.fs)
+    tmin = float(settings.get("tmin") or 0.0)
+    tmax = settings.get("tmax")
+    tmax = float("inf") if tmax is None else float(tmax)
+    first = max(0, int(tmin * fs))
+    stop = int(min(float(n_samples), tmax * fs))
+    if stop <= first:
+        return None
+    edges = np.array([first, stop - 1])
+    if timebase == "sorter":
+        times = edges / fs
+    elif timebase == "nsp" and nsp_map is not None:
+        times = nsp_map.apply(edges)
+    elif timebase == "blackrock":
+        try:
+            with open(config.paths.aligned / "time_map.json", "r", encoding="utf-8") as handle:
+                line = json.load(handle)
+        except (OSError, ValueError):
+            return None
+        times = float(line["slope"]) * (edges / fs) + float(line["intercept"])
+    else:
+        return None
+    return float(times[0]), float(times[1] - times[0]) + 1.0 / fs
+
+
+def _older_than_the_sorting(path: Path, results_dir: Path) -> bool:
+    """Whether ``path`` was written before the sorting in ``results_dir``.
+
+    A sorting copied in from elsewhere (the cluster) lands beside whatever the
+    last one left, and a per-spike file from that one can have the same length.
+    ``_publish`` keeps Kilosort's mtimes, so a file derived from *this* sort is
+    never older than its ``spike_times.npy``.
+    """
+    spikes = results_dir / "spike_times.npy"
+    try:
+        return path.stat().st_mtime < spikes.stat().st_mtime
+    except OSError:
+        return False
+
+
 def _resolve_spike_seconds(
     config: SessionConfig, system: str, phy
 ) -> tuple[np.ndarray | None, str, object | None]:
@@ -2608,13 +2789,16 @@ def _resolve_spike_seconds(
     results_dir = config.paths.sorted_for(system)
     aligned_path = _aligned_spike_path(config, system)
     if aligned_path.exists():
-        aligned = np.load(aligned_path)
-        if aligned.size == phy.spike_samples.size:
+        stale = _older_than_the_sorting(aligned_path, results_dir)
+        aligned = None if stale else np.load(aligned_path)
+        if aligned is not None and aligned.size == phy.spike_samples.size:
             return aligned, "blackrock", None
         log.warning(
-            "aligned times (%d) do not match spike count (%d); exporting in the "
-            "sorter timebase instead",
-            aligned.size, phy.spike_samples.size,
+            "%s; exporting in the sorter timebase instead -- run time_remapping",
+            f"{aligned_path.name} predates spike_times.npy, so it is from an earlier sort"
+            if stale else
+            f"aligned times ({aligned.size}) do not match spike count "
+            f"({phy.spike_samples.size})",
         )
     elif system == "blackrock":
         spike_file = config.blackrock.spike_file
@@ -3103,8 +3287,16 @@ def export_results(
     # never from Kilosort's whitened templates.
     measured = export_waveforms(config, system)
     lap("measure waveforms (reads the binary)")
+    window = _sorted_window(config, system, phy, timebase, time_map)
+    if window is None:
+        log.warning(
+            "no run_info.json record of the samples sorted; firing rates and "
+            "presence use the span of the spikes instead"
+        )
     table = final.build_unit_table(
-        phy, unit_ids, spike_times_s, **_measured_means(measured))
+        phy, unit_ids, spike_times_s,
+        **({"start_s": window[0], "duration_s": window[1]} if window else {}),
+        **_measured_means(measured))
     units_csv = final.export_unit_table(out_dir, table)
 
     # The spikes in the format the lab's online-spike code already reads, plus
@@ -3126,7 +3318,8 @@ def export_results(
     )
     log.info("exported %d units -> %s", unit_ids.size, mat_path)
     summary = _write_summary(
-        config, system, out_dir, timebase, unit_ids, measured, phy.curated, time_map
+        config, system, out_dir, timebase, unit_ids, measured, phy.curated, time_map,
+        window,
     )
     paths = {"units": units_csv, "sorted_spikes": mat_path, "summary": summary}
     paths.update(_copy_records(config, system, out_dir))
@@ -3134,7 +3327,7 @@ def export_results(
 
     if figures and unit_ids.size:
         figure_dir = config.paths.figures_for(system)
-        units = _unit_page_data(phy, unit_ids, spike_times_s, table, measured)
+        units = _unit_page_data(phy, unit_ids, spike_times_s, table, measured, window)
         if max_unit_figures is not None:
             units = units[:max_unit_figures]
         plots.save_unit_pages(

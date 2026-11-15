@@ -135,6 +135,50 @@ def test_the_runner_keeps_each_stages_time_and_breakdown(monkeypatch):
     assert run.stages_for("blackrock")[0]["status"] == "nothing to do"
 
 
+def test_a_failed_check_stops_the_run_before_anything_is_exported(monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    import _cli
+    from _cli import Runner
+
+    report = SimpleNamespace(passed=False, summary=lambda: "alignment FAIL: 50% matched")
+    exported = []
+
+    def validate_remapping(config, figures):
+        return report
+
+    def export_results(config, system):
+        exported.append(system)
+        return {"n_units": 1}
+
+    monkeypatch.setattr(_cli, "skip_reason", lambda *a, **k: None)
+    run = Runner(SimpleNamespace())
+    assert run(validate_remapping, None, True, system="neuropixels") is report
+    run(export_results, None, "neuropixels", system="neuropixels")
+
+    assert exported == []
+    assert run.stages_for("neuropixels")[0]["status"] == "failed check"
+    out = capsys.readouterr().out
+    assert "[!!] validate_remapping(neuropixels)" in out and "50% matched" in out
+    assert run.finish("exporting pipeline") == 1
+
+
+def test_a_passing_check_is_an_ordinary_stage(monkeypatch):
+    from types import SimpleNamespace
+
+    import _cli
+    from _cli import Runner
+
+    monkeypatch.setattr(_cli, "skip_reason", lambda *a, **k: None)
+    run = Runner(SimpleNamespace())
+
+    def validate_remapping(config, figures):
+        return SimpleNamespace(passed=True, summary=lambda: "alignment PASS")
+
+    run(validate_remapping, None, True, system="neuropixels")
+    assert not run.stopped and run.failures == 0
+
+
 def test_the_run_log_keeps_what_was_printed_and_logged_and_saves_it_per_stream(tmp_path):
     import logging
     import sys

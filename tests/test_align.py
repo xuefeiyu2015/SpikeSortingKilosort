@@ -100,6 +100,50 @@ def test_validate_alignment_reports_nothing_matched():
     assert "NOT validated" in report.summary()
 
 
+def test_validate_alignment_fails_when_part_of_the_session_is_off():
+    # The second half lands 80 ms off: those bursts find no partner within
+    # 50 ms, so the residuals alone (first half, all exact) would read PASS.
+    reference = np.arange(0.0, 7000.0, 14.0)
+    mapped = reference.copy()
+    mapped[reference.size // 2:] += 0.08
+    report = align.validate_alignment(mapped, reference, tolerance_s=1e-3)
+    assert report.max_residual_s < 1e-9
+    assert report.n_expected >= reference.size - 1     # the shifted last one may fall outside
+    assert report.coverage == pytest.approx(0.5, abs=0.01)
+    assert not report.passed
+    assert "50% of the bursts matched" in report.summary()
+
+
+def test_validate_alignment_tolerates_a_few_missing_bursts():
+    # A burst one system missed is not a mismatch: it lowers both counts.
+    reference = np.arange(0.0, 7000.0, 14.0)
+    mapped = np.delete(reference, [10, 200, 300]) + 2e-4
+    report = align.validate_alignment(mapped, reference, tolerance_s=1e-3)
+    assert report.passed
+    assert report.n_checked == report.n_expected == reference.size - 3
+
+
+def test_validate_alignment_needs_more_than_two_bursts():
+    reference = np.array([0.0, 14.0])
+    report = align.validate_alignment(reference + 1e-4, reference, tolerance_s=1e-3)
+    assert not report.passed
+    assert "fewer than 3" in report.fail_reason
+
+
+def test_interval_offset_map_is_tprimes_rule():
+    # One offset per interval, the interval chosen by the reference ("to")
+    # edges. As TPrime is fed here, the two lists differ only by a residual.
+    frm = np.array([0.0, 1.0, 2.0, 3.0])
+    to = frm + np.array([0.0, 1e-3, 3e-3, 2e-3])
+    # before the first edge; mid-interval; just past to[1] (1.001) but before
+    # it on frm's side -- the reference decides; and past the last edge.
+    t = np.array([-0.5, 0.5, 1.0005, 1.0015, 9.0])
+    offsets = np.array([0.0, 0.0, 0.0, 1e-3, 2e-3])
+    assert np.allclose(align.interval_offset_map(t, frm, to), t + offsets)
+    with pytest.raises(ValueError, match="matched edge pairs"):
+        align.interval_offset_map(t, frm, to[:-1])
+
+
 def test_validate_alignment_handles_empty_input():
     report = align.validate_alignment(np.empty(0), np.arange(3.0))
     assert report.n_checked == 0

@@ -1529,6 +1529,42 @@ def test_tprime_switches_interval_at_the_probe_edge_despite_drift(tmp_path, monk
     assert np.allclose(np.load(result.aligned_path), expected, rtol=0, atol=2e-6)
 
 
+def test_a_dropped_1hz_pulse_reaches_tprime_as_matched_pairs(tmp_path, monkeypatch):
+    # One interior Blackrock pulse missing: the line is fitted on the pairs, and
+    # TPrime must get those same pairs. The trimmed trains (600 vs 599 edges)
+    # used to reach it, crash its log line with a ValueError the TPrime
+    # fallback does not catch, and -- had they got through -- shift every
+    # interval after the gap by one cycle.
+    from spikesorting._sync import catgt, tprime
+
+    session, origin = _ptp_session_with_a_sorting(tmp_path)
+    npx = np.arange(0.0, 600.0, 1.0) + 5.0
+    br = np.delete(npx + origin, 250)
+    catgt.write_edge_file(session.paths.sync_for("blackrock") / "blackrock_1hz.txt", br)
+    seen = {}
+
+    def fake_tprime(tprime_dir, args, timeout_s=None):
+        flags = dict(a.lstrip("-").split("=", 1) for a in args)
+        to = catgt.read_edge_file(flags["tostream"])
+        frm = catgt.read_edge_file(flags["fromstream"].split(",", 1)[1])
+        _, src, dst = flags["events"].split(",")
+        seen["sizes"] = (to.size, frm.size)
+        seen["gap"] = float(np.abs(to - frm).max())
+        np.save(dst, _tprime_rule(to, frm, np.load(src)))
+
+    monkeypatch.setattr(tprime, "run_tprime", fake_tprime)
+    result = ss.time_remapping(session, "neuropixels")
+
+    assert result.method == "tprime"
+    assert seen["sizes"][0] == seen["sizes"][1]
+    assert seen["gap"] < 1e-5
+    assert np.allclose(np.load(result.aligned_path), origin + np.array([10.0, 20.0, 30.0]),
+                       rtol=0, atol=1e-5)
+    aligned = session.paths.aligned
+    assert (catgt.read_edge_file(aligned / "blackrock_1hz_trimmed.txt").size
+            == catgt.read_edge_file(aligned / "npx_1hz_trimmed.txt").size)
+
+
 def test_a_stuck_tprime_falls_back_to_the_fitted_line(tmp_path, monkeypatch):
     from spikesorting._sync import tprime
 
@@ -1611,6 +1647,33 @@ def test_the_burst_is_mapped_off_the_onebox_clock_before_validation(tmp_path):
     br_burst = np.loadtxt(session.paths.sync_for("blackrock") / "blackrock_burst.txt")
     mapped = composed["slope"] * obx_burst + composed["intercept"]
     assert np.abs(mapped - br_burst).max() < 1e-5
+
+
+def test_validation_checks_the_map_the_spikes_went_through(tmp_path):
+    # Spikes mapped by TPrime follow its per-interval offsets, not the line. Here
+    # those offsets are 3 ms off for the second half: the line still passes, the
+    # check of what the spikes got must not.
+    from spikesorting._sync import catgt
+
+    session = _session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    aligned = session.paths.aligned
+    time_map = json.loads((aligned / "time_map.json").read_text())
+    time_map["method"] = "tprime"
+    (aligned / "time_map.json").write_text(json.dumps(time_map))
+    br = catgt.read_edge_file(aligned / "blackrock_1hz_trimmed.txt")
+    br[br.size // 2:] += 3e-3
+    catgt.write_edge_file(aligned / "blackrock_1hz_trimmed.txt", br)
+
+    report = ss.validate_remapping(session, figures=False)
+
+    validation = json.loads((aligned / "validation.json").read_text())
+    assert validation["map_checked"] == "tprime"
+    assert validation["line"]["passed"]
+    assert not report.passed and report.max_residual_s > 2e-3
+    sync = json.loads((session.paths.export_for("neuropixels") / "sync_report.json").read_text())
+    assert sync["verdict"] == "FAIL"
 
 
 def test_without_the_onebox_1hz_wave_the_onebox_drift_fails_validation(tmp_path):
@@ -1893,7 +1956,8 @@ def test_a_resort_clears_phys_state_from_the_previous_one(tmp_path):
     final, work = tmp_path / "kilosort4", tmp_path / "cache"
     (final / ".phy").mkdir(parents=True)
     (final / ".phy" / "spikes_per_cluster.pkl").write_bytes(b"old")
-    for name in ("phy.log", "cluster_info.tsv", "cluster_group.tsv", "cluster_mylabel.tsv"):
+    for name in ("phy.log", "cluster_info.tsv", "cluster_group.tsv", "cluster_mylabel.tsv",
+                 "neuropixels_spike_seconds.npy", "neuropixels_spike_seconds_blackrock.npy"):
         (final / name).write_text("old")
     for name in ("nsp_time_map.json", "sync_edges.txt"):  # not the sorting's
         (final / name).write_text("keep")
@@ -1910,6 +1974,67 @@ def test_a_resort_clears_phys_state_from_the_previous_one(tmp_path):
         "spike_times.npy", "sync_edges.txt",
     ]
     assert (final / "cluster_group.tsv").read_text() == "new"
+
+
+def test_aligned_times_from_an_earlier_sort_are_not_exported(tmp_path):
+    # A sorting copied in from the cluster lands beside the last one's aligned
+    # times. Same spike count, different spikes: they must not be taken as
+    # Blackrock time for the new sort.
+    import os
+    from types import SimpleNamespace
+
+    session = _session(tmp_path)
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    sorted_dir.mkdir(parents=True, exist_ok=True)
+    aligned = pipeline._aligned_spike_path(session, "neuropixels")
+    np.save(aligned, np.array([1.0, 2.0, 3.0]))
+    np.save(sorted_dir / "spike_times.npy", np.array([10, 20, 30]))
+    phy = SimpleNamespace(spike_samples=np.array([10, 20, 30]))
+
+    os.utime(aligned, (1_000_000, 1_000_000))                 # older than the sort
+    seconds, timebase, _ = pipeline._resolve_spike_seconds(session, "neuropixels", phy)
+    assert seconds is None and timebase == "sorter"
+
+    os.utime(aligned, None)                                   # written after it
+    os.utime(sorted_dir / "spike_times.npy", (1_000_000, 1_000_000))
+    seconds, timebase, _ = pipeline._resolve_spike_seconds(session, "neuropixels", phy)
+    assert timebase == "blackrock" and np.array_equal(seconds, [1.0, 2.0, 3.0])
+
+
+def test_firing_rates_are_taken_over_the_samples_sorted_not_the_spikes(tmp_path):
+    # 600 s of binary, Kilosort told tmin=100, tmax=400: the window is those
+    # 300 s on whichever axis the spike times are, wherever the spikes fall.
+    from types import SimpleNamespace
+
+    session = _session(tmp_path)
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    sorted_dir.mkdir(parents=True, exist_ok=True)
+    phy = SimpleNamespace(fs=30000.0)
+
+    assert pipeline._sorted_window(session, "neuropixels", phy, "sorter") is None
+
+    (sorted_dir / "run_info.json").write_text(json.dumps({
+        "settings": {"tmin": 100.0, "tmax": 400.0, "n_chan_bin": 385},
+        "preprocessing": {"n_samples": 600 * 30000},
+    }))
+    start, duration = pipeline._sorted_window(session, "neuropixels", phy, "sorter")
+    assert start == pytest.approx(100.0) and duration == pytest.approx(300.0)
+
+    (sorted_dir / "time_map.json").write_text(json.dumps({"slope": 1.00002, "intercept": 1.8e9}))
+    start, duration = pipeline._sorted_window(session, "neuropixels", phy, "blackrock")
+    assert start == pytest.approx(1.8e9 + 100.002, abs=1e-6)
+    assert duration == pytest.approx(300.006, abs=1e-4)
+
+    nsp = SimpleNamespace(apply=lambda samples: 5.0 + np.asarray(samples) / 29999.0)
+    start, duration = pipeline._sorted_window(session, "neuropixels", phy, "nsp", nsp)
+    assert start == pytest.approx(5.0 + 100 * 30000 / 29999.0)
+
+    # No tmax and a binary shorter than tmax: the binary's end.
+    (sorted_dir / "run_info.json").write_text(json.dumps({
+        "settings": {"tmin": 0, "tmax": None}, "preprocessing": {"n_samples": 60 * 30000},
+    }))
+    assert pipeline._sorted_window(session, "neuropixels", phy, "sorter") == pytest.approx(
+        (0.0, 60.0))
 
 
 def test_the_figure_draws_exactly_the_mean_the_mat_holds(tmp_path, kilosort_results, raw_reader):

@@ -87,6 +87,8 @@ def build_sync_report(
         verdict_note = (
             f"held-out 14 s burst within {tolerance_ms:g} ms"
             if validation["passed"]
+            else f"held-out 14 s burst: {validation.get('fail_reason')}"
+            if validation.get("fail_reason")
             else f"held-out 14 s burst exceeds {tolerance_ms:g} ms"
         )
 
@@ -94,6 +96,8 @@ def build_sync_report(
     if validation and validation.get("n_checked"):
         held_out = {
             "n": int(validation["n_checked"]),
+            "n_expected": validation.get("n_expected"),
+            "map_checked": validation.get("map_checked"),
             "median_ms": _ms(validation["median_residual_s"]),
             "max_ms": _ms(validation["max_residual_s"]),
             "passed": bool(validation["passed"]),
@@ -312,8 +316,9 @@ def render_sync_report(report: dict[str, Any], title: str = "") -> str:
         else:
             extra = (f"rms {_fmt(s.get('rms_ms'), 4)}" if "rms_ms" in s
                      else f"median {_fmt(s.get('median_ms'), 4)}")
+            n = f"{s['n']}/{s['n_expected']}" if s.get("n_expected") else f"{s['n']}"
             lines.append(
-                f"{s['signal']:<32} n={s['n']:<6} max {_fmt(s['max_ms'], 4)}  {extra}"
+                f"{s['signal']:<32} n={n:<6} max {_fmt(s['max_ms'], 4)}  {extra}"
             )
         lines.append(f"    {s['path']}  [{s['role']}]")
 
