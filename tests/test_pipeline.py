@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,6 +18,7 @@ import pytest
 import spikesorting as ss
 from spikesorting import _config as cfg
 from spikesorting import pipeline
+from conftest import record_edge_rate
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 
@@ -97,6 +99,7 @@ def _plant_acceptance(session):
     map_path = aligned / "time_map.json"
     payload = (json.loads(map_path.read_text()) if map_path.exists()
                else {"slope": 1.0, "intercept": 0.0, "n_points": 0})
+    record_edge_rate(session.paths.sync_for("neuropixels"))
     payload["inputs"] = pipeline._sync_inputs(session)
     map_path.write_text(json.dumps(payload), encoding="utf-8")
     (aligned / "validation.json").write_text(json.dumps(
@@ -963,6 +966,73 @@ def _npx_session(tmp_path, body_extra="", probe=0, npx_dir=None):
     )
 
 
+@pytest.mark.parametrize("how", ["re-sort failed", "rewrite interrupted",
+                                 "rewrite interrupted, binary gone"])
+def test_waveforms_are_not_cut_from_a_binary_the_sorting_did_not_read(
+        tmp_path, monkeypatch, caplog, how):
+    # Sorted; then the binary is preprocessed again (a changed filter) and the
+    # re-sort fails -- or the rewrite itself is cut short, which leaves no
+    # preprocess.json. The old sorting survives beside traces it was not made
+    # from: a warning says so, the waveform export skips it, and an old
+    # waveforms.mat is removed from the bundle rather than left looking current.
+    import logging
+
+    kilosort = _fake_kilosort(monkeypatch, [])
+    session = _npx_session(tmp_path)
+    ss.sort_with_kilosort(session, "neuropixels")
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    run_info = json.loads((sorted_dir / "run_info.json").read_text())
+    assert run_info["preprocessing"]
+    old_waveforms = (sorted_dir / "export"
+                     / f"{pipeline._export_stem(session, 'neuropixels')}.waveforms.mat")
+    old_waveforms.parent.mkdir(parents=True, exist_ok=True)
+    old_waveforms.write_bytes(b"cut from the old traces")
+
+    if how == "re-sort failed":
+        path = tmp_path / "s.yaml"
+        path.write_text(path.read_text() + "  preprocess:\n    highpass_hz: 400\n")
+        changed = cfg.load_session_config(path, "mac", CONFIG_DIR)
+
+        def fails(**_):
+            raise RuntimeError("CUDA out of memory")
+
+        monkeypatch.setattr(kilosort, "run_kilosort", fails)
+        with caplog.at_level(logging.WARNING, logger="spikesorting"):
+            with pytest.raises(RuntimeError):
+                ss.sort_with_kilosort(changed, "neuropixels")
+        assert "Phy now shows it the new traces" in caplog.text
+        assert (sorted_dir / "spike_times.npy").exists()
+    else:
+        preprocessed = session.paths.preprocessed_for("neuropixels")
+        (preprocessed / "preprocess.json").unlink()
+        if how.endswith("binary gone"):           # CatGT empties its -dest first
+            Path(run_info["binary"]).unlink()
+
+    with caplog.at_level(logging.WARNING, logger="spikesorting"):
+        assert ss.export_waveforms(session, "neuropixels") is None
+    assert "re-sort" in caplog.text
+    assert not old_waveforms.exists()
+
+
+def test_a_binary_on_a_share_that_is_away_keeps_the_old_waveforms(tmp_path, monkeypatch):
+    # The whole preprocessed/ folder is missing -- a share not answering looks
+    # just like that. Nothing shows a rewrite, so the old waveforms.mat stays.
+    import shutil
+
+    _fake_kilosort(monkeypatch, [])
+    session = _npx_session(tmp_path)
+    ss.sort_with_kilosort(session, "neuropixels")
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    old_waveforms = (sorted_dir / "export"
+                     / f"{pipeline._export_stem(session, 'neuropixels')}.waveforms.mat")
+    old_waveforms.parent.mkdir(parents=True, exist_ok=True)
+    old_waveforms.write_bytes(b"cut from the old traces")
+    shutil.rmtree(session.paths.preprocessed_for("neuropixels"))
+
+    assert ss.export_waveforms(session, "neuropixels") is None
+    assert old_waveforms.exists()
+
+
 def test_the_kilosort_block_is_split_into_settings_and_arguments(tmp_path, monkeypatch):
     # Kilosort takes its parameters in two places and which one a parameter lives
     # in has moved between releases, so the split is read from the installed
@@ -1544,6 +1614,9 @@ def test_re_extracting_the_sync_takes_the_old_stamps_off_the_exports(tmp_path, m
     for system in ("neuropixels", "blackrock"):
         # Blackrock's .ns5 reader is not here; what matters is what comes first.
         monkeypatch.setattr(_extract, "extract_blackrock_edges", lambda config: None)
+        # The .ns5 is a placeholder path here; it answers, as a real one would.
+        monkeypatch.setattr(pipeline.reachable, "check_reachable",
+                            lambda path: SimpleNamespace(summary=lambda: "stub"))
         ss.extract_sync(session, system)
         assert _analog_fields(path)["timebase"] == "onebox", system
         assert not (session.paths.aligned / "validation.json").exists()
@@ -1598,6 +1671,7 @@ def test_a_tprime_pass_does_not_stamp_a_line_that_fails(tmp_path):
     catgt.write_edge_file(br_sync / "blackrock_1hz.txt", br_1hz)
     catgt.write_edge_file(br_sync / "blackrock_burst.txt", br_burst)
     catgt.write_edge_file(npx_sync / "npx_1hz.txt", to_probe(br_1hz))
+    record_edge_rate(npx_sync)
     catgt.write_edge_file(npx_sync / "npx_obx_1hz.txt", to_probe(br_1hz))  # OneBox = probe clock
     catgt.write_edge_file(npx_sync / "npx_burst.txt", to_probe(br_burst))
 
@@ -1653,6 +1727,55 @@ def test_withdrawing_a_map_removes_the_spike_exports_stamped_with_it(
         assert path.exists() is not removed, path.name
 
 
+def test_a_standalone_refusal_leaves_no_stale_copy_or_aligned_spikes(tmp_path):
+    # Accepted and exported; then an edge file goes bad and validate_remapping
+    # is run on its own. Refused -- and the bundle must not keep a copy saying
+    # accepted, or spike times on the map it just refused.
+    session = _analog_session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+    export = session.paths.export_for("neuropixels")
+    pipeline._copy_records(session, "neuropixels", export)
+    products = [export / "run.sorted_spikes.mat", export / "run.waveforms.mat",
+                export / "sorting_summary_info.json"]
+    products[0].write_bytes(b"spikes")
+    products[1].write_bytes(b"spikes")
+    products[2].write_text(json.dumps({"timebase": "blackrock"}))
+
+    (session.paths.sync_for("neuropixels") / "npx_burst.txt").write_text("not a number\n")
+    assert not ss.validate_remapping(session, figures=False).passed
+
+    assert not (export / "validation.json").exists()
+    assert not (export / "time_map.json").exists()
+    for path in products:
+        assert not path.exists(), path.name
+
+
+def test_an_unreachable_recording_keeps_the_edges_already_written(tmp_path, monkeypatch):
+    # The notebook's fallback: the share is not answering, so extract_sync
+    # raises -- before withdrawing or deleting anything, so the same
+    # recording's edges and their acceptance are still there to use.
+    session = _analog_session(tmp_path)
+    path = ss.extract_analog(session, "neuropixels")
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+    edges = sorted(p.name for p in session.paths.sync_for("neuropixels").glob("*.txt"))
+
+    def silent(path, **_):
+        raise TimeoutError(f"{path} did not answer")
+
+    monkeypatch.setattr(pipeline.reachable, "check_reachable", silent)
+    for system in ("neuropixels", "blackrock"):
+        with pytest.raises(OSError):
+            ss.extract_sync(session, system)
+
+    assert sorted(p.name for p in session.paths.sync_for("neuropixels").glob("*.txt")) == edges
+    assert pipeline._alignment_accepted(session)
+    assert _analog_fields(path)["timebase"] == "blackrock"
+
+
 def test_an_unreadable_edge_file_voids_the_acceptance_without_raising(tmp_path):
     # A standalone export must fall back to its own clock, not stop.
     session = _analog_session(tmp_path)
@@ -1695,6 +1818,44 @@ def test_a_line_that_passes_is_stamped_when_the_tprime_map_is_not_accepted(tmp_p
     assert "only the spike times' map failed" in sync["verdict_note"]
 
 
+def test_a_meta_rate_edited_after_extraction_voids_the_map(tmp_path):
+    # Edges were converted at 30000 Hz; then imSampRate is edited. Spikes
+    # converted at the new rate would sit on a different clock from the edges
+    # the map came from -- 333 ppm, seconds by the end -- and the burst check,
+    # which sees only edges, would still pass. So everything refuses, by name.
+    from spikesorting._io import spikeglx
+
+    session = _analog_session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+
+    meta = spikeglx.meta_path_for(session.neuropixels.bin_file)
+    meta.write_text(meta.read_text().replace("imSampRate=30000", "imSampRate=29990"))
+
+    problem = pipeline._acceptance_problem(session)
+    assert "29990 Hz in the .meta now" in problem and "30000 Hz" in problem
+    assert "re-run extract_sync" in problem
+    result = ss.validate_remapping(session, figures=False)
+    assert not result.passed and "29990" in result.reason
+    with pytest.raises(ValueError, match="re-run extract_sync"):
+        ss.time_remapping(session, "neuropixels")
+
+
+def test_a_sorting_at_another_rate_than_the_edges_is_refused(tmp_path):
+    # The sorting's params.py says 29990 Hz, the edges were extracted at
+    # 30000: converting spikes with either would mix the two.
+    session = _analog_session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    sorted_dir.mkdir(parents=True, exist_ok=True)
+    np.save(sorted_dir / "spike_times.npy", np.arange(10, dtype=np.int64) * 3000)
+    (sorted_dir / "params.py").write_text("sample_rate = 29990.0\n")
+
+    with pytest.raises(ValueError, match=r"sorting used 29990 Hz.*re-sort"):
+        ss.time_remapping(session, "neuropixels")
+
+
 def test_single_system_sessions_still_have_nothing_to_map(tmp_path):
     from spikesorting import _config as cfg
 
@@ -1719,6 +1880,7 @@ def test_time_remapping_recovers_a_planted_offset_and_drift(tmp_path):
     npx = (br - offset) * (1 + ppm)
     catgt.write_edge_file(session.paths.sync_for("blackrock") / "blackrock_1hz.txt", br)
     catgt.write_edge_file(session.paths.sync_for("neuropixels") / "npx_1hz.txt", npx)
+    record_edge_rate(session.paths.sync_for("neuropixels"))
 
     result = ss.time_remapping(session, "neuropixels")
 
@@ -1743,6 +1905,7 @@ def test_the_neuropixels_side_writes_nothing_into_the_blackrock_folder(tmp_path)
     br = np.arange(0.0, 600.0, 1.0) + 100.0
     catgt.write_edge_file(session.paths.sync_for("blackrock") / "blackrock_1hz.txt", br)
     catgt.write_edge_file(session.paths.sync_for("neuropixels") / "npx_1hz.txt", br - 12.0)
+    record_edge_rate(session.paths.sync_for("neuropixels"))
 
     sorted_dir = session.paths.sorted_for("neuropixels")
     sorted_dir.mkdir(parents=True, exist_ok=True)
@@ -1776,6 +1939,7 @@ def _ptp_session_with_a_sorting(tmp_path):
     origin = 1_792_273_300.0
     npx = np.arange(0.0, 600.0, 1.0) + 5.0
     catgt.write_edge_file(session.paths.sync_for("neuropixels") / "npx_1hz.txt", npx)
+    record_edge_rate(session.paths.sync_for("neuropixels"))
     catgt.write_edge_file(session.paths.sync_for("blackrock") / "blackrock_1hz.txt",
                           npx + origin)
     sorted_dir = session.paths.sorted_for("neuropixels")
@@ -1972,6 +2136,7 @@ def _plant_burst_on_the_onebox_clock(session, with_onebox_1hz):
     catgt.write_edge_file(br_sync / "blackrock_1hz.txt", br_1hz)
     catgt.write_edge_file(br_sync / "blackrock_burst.txt", br_burst)
     catgt.write_edge_file(npx_sync / "npx_1hz.txt", to_probe(br_1hz))
+    record_edge_rate(npx_sync)
     catgt.write_edge_file(npx_sync / "npx_burst.txt", to_onebox(to_probe(br_burst)))
     if with_onebox_1hz:
         catgt.write_edge_file(npx_sync / "npx_obx_1hz.txt", to_onebox(to_probe(br_1hz)))
@@ -2280,6 +2445,7 @@ def test_two_probes_are_each_fitted_onto_blackrock_time_on_their_own(tmp_path):
         sync_dir = session.paths.sync_for("neuropixels")
         sync_dir.mkdir(parents=True, exist_ok=True)
         catgt.write_edge_file(sync_dir / "npx_1hz.txt", (br - offset) * (1 + ppm))
+        record_edge_rate(sync_dir)
 
         result = ss.time_remapping(session, "neuropixels")
         assert result.mapping.intercept == pytest.approx(offset, abs=1e-6)

@@ -35,6 +35,7 @@ the NumPy detector stands alone.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,6 +61,9 @@ NPX_1HZ = "npx_1hz"
 NPX_BURST = "npx_burst"
 #: The sync file's clock map, beside the edge files it put on the NSP clock.
 SYNC_NSP_MAP = "nsp_time_map_sync.json"
+#: The AP rate the Neuropixels edges were converted to seconds with. Spike
+#: samples must be converted with the same one, or the map shifts them.
+NPX_EDGE_RATE = "npx_edges_rate.json"
 NPX_OBX_1HZ = "npx_obx_1hz"
 BR_1HZ = "blackrock_1hz"
 BR_BURST = "blackrock_burst"
@@ -373,10 +377,15 @@ def extract_neuropixels_edges(
     sync_dir = config.paths.sync_for("neuropixels")
     sync_dir.mkdir(parents=True, exist_ok=True)
     _clear_edges(sync_dir, (NPX_1HZ, NPX_BURST, NPX_OBX_1HZ))
+    (sync_dir / NPX_EDGE_RATE).unlink(missing_ok=True)
 
     catgt_times = _run_catgt_extraction(config, report)
 
     ap_info = _resolve_ap_stream(config)
+    if ap_info is not None:
+        with open(sync_dir / NPX_EDGE_RATE, "w", encoding="utf-8") as handle:
+            json.dump({"ap_fs": float(ap_info.fs), "ap_file": str(ap_info.path)},
+                      handle, indent=2)
     if ap_info is None:
         report.note("Neuropixels 1 Hz extraction skipped: no AP binary found.")
     elif ap_info.sy_index is None:

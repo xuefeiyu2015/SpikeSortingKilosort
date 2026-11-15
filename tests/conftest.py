@@ -124,6 +124,15 @@ def spikeglx_run(
     return built
 
 
+def record_edge_rate(folder, fs: float = 30_000.0) -> None:
+    """What extract_sync writes beside hand-planted Neuropixels edges: their AP rate."""
+    import json
+
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "npx_edges_rate.json").write_text(json.dumps({"ap_fs": float(fs)}))
+
+
 def coded_burst_times(
     n_bursts: int,
     interval_s: float = 14.0,

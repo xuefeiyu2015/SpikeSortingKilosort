@@ -289,6 +289,8 @@ def _plant_1hz_without_burst(session):
         folder.mkdir(parents=True, exist_ok=True)
         for name, times in files.items():
             catgt.write_edge_file(folder / f"{name}.txt", times)
+    from conftest import record_edge_rate
+    record_edge_rate(session.paths.sync_for("neuropixels"))
 
 
 def _remap_with_a_planted_cycle_error(tmp_path, monkeypatch, drop=(), with_session=False):
@@ -482,6 +484,35 @@ def test_without_a_burst_a_tprime_map_far_from_the_line_is_not_accepted(
         assert "from the line the channels were compared through" in outcome.reason
         assert "from the line" in sync["verdict_note"]
         assert {c["channel"] for c in sync["independent_checks"]} == {"photodiode", "eye_x"}
+
+
+def test_without_a_burst_one_tprime_interval_off_the_line_is_caught(tmp_path, monkeypatch):
+    # One 1 Hz pair 3 ms off the line. TPrime switches interval at the
+    # Blackrock edges, so evaluating its map at the probe edges skips this
+    # interval entirely (it read 0 ms); the gap is the largest pair residual.
+    import json
+
+    import spikesorting as ss
+    from spikesorting._sync import catgt
+
+    _, _, session = _remap_with_a_planted_cycle_error(tmp_path, monkeypatch, with_session=True)
+    aligned = session.paths.aligned
+    payload = json.loads((aligned / "time_map.json").read_text())
+    payload["method"] = "tprime"
+    (aligned / "time_map.json").write_text(json.dumps(payload))
+    pair_file = aligned / "blackrock_1hz_trimmed.txt"
+    br = catgt.read_edge_file(pair_file)
+    j = br.size // 2
+    br[j] += 0.003                             # this interval: 3 ms off the line
+    br[j + 1] -= 1e-5                          # the next probe edge lands past it
+    catgt.write_edge_file(pair_file, br)
+
+    outcome = ss.validate_remapping(session, figures=False)
+    validation = json.loads((aligned / "validation.json").read_text())
+
+    assert validation["tprime_line_gap_s"] == pytest.approx(0.003, rel=0.01)
+    assert not outcome.passed and validation["accepted"] is False
+    assert validation["exports_accepted"] is True
 
 
 def _two_probe_session(tmp_path):

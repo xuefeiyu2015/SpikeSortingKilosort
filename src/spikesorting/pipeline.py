@@ -916,39 +916,52 @@ def sort_with_kilosort(
         return _dry_run(config, system, probe, final_dir)
 
     reused = not _stale_reasons(config, system)[0]
-    binary = _binary_for(config, system)
-    t_preprocessed = time.perf_counter()
-
-    settings, kwargs = _kilosort_arguments(config, system, binary)
-
-    import torch
-    from kilosort import run_kilosort
-
-    work_dir = _work_dir(config, system) or final_dir
-    work_dir.mkdir(parents=True, exist_ok=True)
-    log.info("sorting %s -> %s", binary.summary(), work_dir)
-    if work_dir == final_dir:  # sorting in place: clear before Kilosort writes
-        _clear_previous_curation(final_dir)
-
+    # A rebuild replaces the binary the existing sorting (if any) was made
+    # from; if this sort does not finish, that sorting is left beside new traces.
+    left_behind = not reused and (final_dir / "spike_times.npy").exists()
     try:
-        t_kilosort = time.perf_counter()
-        ops, spike_times, clusters, *_rest = run_kilosort(
-            settings=settings,
-            probe=probe,
-            filename=binary.path,
-            data_dtype="int16",
-            results_dir=work_dir,
-            device=torch.device(config.machine.device),
-            **kwargs,
-        )
-        t_sorted = time.perf_counter()
-        if work_dir != final_dir:
+        binary = _binary_for(config, system)
+        t_preprocessed = time.perf_counter()
+
+        settings, kwargs = _kilosort_arguments(config, system, binary)
+
+        import torch
+        from kilosort import run_kilosort
+
+        work_dir = _work_dir(config, system) or final_dir
+        work_dir.mkdir(parents=True, exist_ok=True)
+        log.info("sorting %s -> %s", binary.summary(), work_dir)
+        if work_dir == final_dir:  # sorting in place: clear before Kilosort writes
             _clear_previous_curation(final_dir)
-            _publish(work_dir, final_dir)
-            _repoint_params(final_dir, binary)
-    finally:
-        if work_dir != final_dir:
-            shutil.rmtree(work_dir, ignore_errors=True)
+
+        try:
+            t_kilosort = time.perf_counter()
+            ops, spike_times, clusters, *_rest = run_kilosort(
+                settings=settings,
+                probe=probe,
+                filename=binary.path,
+                data_dtype="int16",
+                results_dir=work_dir,
+                device=torch.device(config.machine.device),
+                **kwargs,
+            )
+            t_sorted = time.perf_counter()
+            if work_dir != final_dir:
+                _clear_previous_curation(final_dir)
+                _publish(work_dir, final_dir)
+                _repoint_params(final_dir, binary)
+        finally:
+            if work_dir != final_dir:
+                shutil.rmtree(work_dir, ignore_errors=True)
+    except BaseException:
+        if left_behind:
+            log.warning(
+                "the preprocessed binary was rebuilt and this sort did not finish: "
+                "the existing sorting in %s was made from the previous binary, so Phy "
+                "now shows it the new traces, and the waveform export will skip it "
+                "until it is re-sorted", final_dir,
+            )
+        raise
     t_published = time.perf_counter()
 
     result = SortSummary(
@@ -1634,10 +1647,24 @@ def extract_sync(config: SessionConfig, system: str) -> Any | None:
     clocks -- for this probe, or for every probe when Blackrock's edges, which
     each probe's map uses, are re-extracted. Re-running only this stage then
     leaves nothing labelled Blackrock time from the old map.
+
+    The source (the AP binary, or the ``.ns5``) is checked first: one that is
+    missing or not answering raises an ``OSError`` before anything is withdrawn
+    or deleted, so the edges already written stay usable.
     """
     _check(system)
     if not config.has_data(system):
         return None
+
+    # Before anything is withdrawn or deleted: a recording that is not there or
+    # not answering raises here and leaves the earlier edges -- the same
+    # recording's -- and their acceptance as they were. A read that fails
+    # partway still clears them below, since half a file's edges must not be
+    # fitted from.
+    source = (config.neuropixels.bin_file if system == "neuropixels"
+              else config.blackrock.sync_file)
+    if source is not None:
+        log.info("%s: %s", source, reachable.check_reachable(source).summary())
 
     if config.aligns_systems:
         affected = ([config] if system == "neuropixels"
@@ -2055,6 +2082,10 @@ def time_remapping(
             "is no map from this run, and any earlier acceptance has been withdrawn. "
             "Run extract_sync, and check the sync channels were recorded."
         )
+    rate_problem = _rate_problem(config)
+    if rate_problem:
+        raise ValueError(rate_problem)
+    edge_fs = _edge_rate(config)
 
     # 1. Coarse map from the 14 s coded bursts, paired by code so drift cannot
     #    pick the wrong cycle -- and a line, so it holds at both ends of hours.
@@ -2120,14 +2151,9 @@ def time_remapping(
                   inputs=_sync_inputs(config))
         return TimeMap(mapping, offset, "map_only", burst_match=match)
 
-    from ._export.curated import parse_params_py
-
-    params = parse_params_py(results_dir / "params.py")
-    fs = float(params.get("sample_rate", 0.0) or 0.0)
-    if not fs:
-        raise ValueError(
-            f"no sample_rate in {results_dir / 'params.py'}; cannot convert spike times"
-        )
+    # The rate the edges were converted with; _rate_problem has already checked
+    # the sorting's own (params.py) agrees, so the map applies to these seconds.
+    fs = edge_fs
 
     # Kilosort writes sample indices; TPrime needs seconds. Skipping this is the
     # easiest way to produce a confidently wrong alignment.
@@ -2315,6 +2341,57 @@ def _map_digest(config: SessionConfig) -> str | None:
         return None
 
 
+def _edge_rate(config: SessionConfig) -> float | None:
+    """The AP rate the Neuropixels edges were converted to seconds with, if recorded."""
+    try:
+        with open(config.paths.sync_for("neuropixels") / extract.NPX_EDGE_RATE,
+                  "r", encoding="utf-8") as handle:
+            return float(json.load(handle)["ap_fs"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _rate_problem(config: SessionConfig) -> str | None:
+    """Why spike samples and the edges would be on different rates, or None.
+
+    A rate error shared by both is absorbed by the clock fit; a *mix* -- the
+    ``.meta`` edited after extraction, or a sorting made at another rate --
+    shifts every spike by up to (rate difference x session length), and the
+    burst check, which sees only edges, cannot notice. So the edges' rate
+    (recorded at extraction) must equal the ``.meta``'s now and, when there is
+    a sorting, the one in its ``params.py``.
+    """
+    recorded = _edge_rate(config)
+    if recorded is None:
+        return ("the Neuropixels edges were extracted before their AP rate was "
+                "recorded; re-run extract_sync")
+    try:
+        current = float(_neuropixels_stream(config).fs)
+    except (OSError, ValueError) as error:
+        # Not readable here (no .meta, share away): an edit cannot be detected,
+        # but that is no reason to void a map. The sorting's rate still is.
+        log.info("AP rate not re-read (%s); checking the sorting's rate only", error)
+        current = recorded
+    if abs(current - recorded) > 1e-6:
+        return (f"the AP rate is {current:g} Hz in the .meta now, but the edges were "
+                f"extracted at {recorded:g} Hz; re-run extract_sync, then time_remapping")
+    params_path = config.paths.sorted_for("neuropixels") / "params.py"
+    if params_path.exists():
+        from ._export.curated import parse_params_py
+
+        try:
+            sorted_fs = float(parse_params_py(params_path).get("sample_rate") or 0.0)
+        except (OSError, ValueError, SyntaxError) as error:
+            return f"cannot read the sorting's rate from {params_path} ({error})"
+        if not sorted_fs:
+            return f"no sample_rate in {params_path}; cannot convert spike times"
+        if abs(sorted_fs - recorded) > 1e-6:
+            return (f"the sorting used {sorted_fs:g} Hz (params.py) but the edges "
+                    f"were extracted at {recorded:g} Hz; re-sort (the .meta changed "
+                    "since the sort), then time_remapping")
+    return None
+
+
 def _acceptance_problem(config: SessionConfig, decision: str = "accepted") -> str | None:
     """Why this probe's map cannot be treated as accepted now, or None if it can.
 
@@ -2348,7 +2425,7 @@ def _acceptance_problem(config: SessionConfig, decision: str = "accepted") -> st
     if changed:
         return (f"the sync edge files changed since the map was fitted "
                 f"({', '.join(changed)}); re-run time_remapping and validate_remapping")
-    return None
+    return _rate_problem(config)
 
 
 def _alignment_accepted(config: SessionConfig) -> bool:
@@ -2385,12 +2462,23 @@ def _withdraw_acceptance(config: SessionConfig) -> None:
     """
     (config.paths.aligned / "validation.json").unlink(missing_ok=True)
     export_dir = config.paths.export_for("neuropixels")
-    for name in ("sync_report.json", "sync_report.txt",
-                 # the bundle's copies of the records being withdrawn
-                 "validation.json", "time_map.json"):
+    for name in ("sync_report.json", "sync_report.txt"):
         (export_dir / name).unlink(missing_ok=True)
+    _remove_copied_sync_records(config)
     _unstamp_exports(config)
     _remove_aligned_spike_exports(config)
+
+
+def _remove_copied_sync_records(config: SessionConfig) -> None:
+    """Delete the bundle's copies of ``validation.json`` and ``time_map.json``.
+
+    They describe the decision they were copied after; once a new one is made
+    or an old one withdrawn they are stale, and ``export_results`` copies the
+    current records again.
+    """
+    export_dir = config.paths.export_for("neuropixels")
+    for name in ("validation.json", "time_map.json"):
+        (export_dir / name).unlink(missing_ok=True)
 
 
 def _remove_aligned_spike_exports(config: SessionConfig) -> None:
@@ -2832,6 +2920,9 @@ def validate_remapping(
             if payload.get("inputs") else
             "time_map.json predates maps recording their sync edges")
             + "; re-run time_remapping")
+    rate_problem = _rate_problem(config)
+    if rate_problem:
+        return _refuse(config, rate_problem)
     mapping = align.LinearMap(
         slope=float(payload["slope"]),
         intercept=float(payload["intercept"]),
@@ -2872,13 +2963,14 @@ def validate_remapping(
             reason += "; " + tprime_unchecked
         line_ok = verdict.startswith("CONSISTENT")
         # The channels were compared through the line. TPrime's map is the line
-        # plus a constant per 1 Hz interval -- the line's residual at that
-        # interval's pair -- so their agreement speaks for TPrime only where
-        # that gap is inside the tolerance.
+        # plus a constant per 1 Hz interval -- that interval's pair residual --
+        # and every interval is reached by some time (it starts at a Blackrock
+        # edge, not a probe edge, so sampling at the probe edges can skip one).
+        # The exact gap is therefore the largest pair residual; the channels'
+        # agreement speaks for TPrime only where it is inside the tolerance.
         tprime_gap = None
         if pairs is not None and not tprime_unchecked:
-            tprime_gap = float(np.max(np.abs(
-                _tprime_model(pairs, mapping, pairs[1]) - mapping.apply(pairs[1]))))
+            tprime_gap = float(np.max(np.abs(pairs[0] - mapping.apply(pairs[1]))))
             if line_ok and tprime_gap > config.alignment_tolerance_s:
                 too_far = (
                     f"the spikes went through TPrime, which is up to "
@@ -3018,6 +3110,12 @@ def _settle_acceptance(
                   "time_map_sha256": _map_digest(config)}
     with open(config.paths.aligned / "validation.json", "w", encoding="utf-8") as handle:
         json.dump(validation, handle, indent=2)
+    # Every route to a decision, a standalone run included, leaves one clock in
+    # the bundle: no stale copied records, and nothing on Blackrock time from a
+    # map not accepted now.
+    _remove_copied_sync_records(config)
+    if not accepted:
+        _remove_aligned_spike_exports(config)
     if exports_ok:
         _stamp_accepted(config, mapping)
     elif accepted:
@@ -3551,6 +3649,43 @@ def _uv_per_digit(
     )
 
 
+def _inside(path: Path, directory: Path) -> bool:
+    """Whether ``path`` lies under ``directory`` (neither has to exist)."""
+    try:
+        Path(path).resolve().relative_to(Path(directory).resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _binary_changed_since_sort(
+    config: SessionConfig, system: str, run_info: dict, binary: Path,
+) -> str | None:
+    """Why the preprocessed binary may not be the one this sorting read, or None.
+
+    Preprocessing rewrites the binary in place, so a re-sort that fails after
+    the rewrite -- or a rewrite cut short, which leaves no record at all, since
+    the record is removed first -- leaves the old sorting beside new traces.
+    The record the sort saw is in ``run_info.json``; the binary is the same only
+    while ``preprocess.json`` still exists and says the same. A sorting of a
+    binary outside ``preprocessed/`` (made before this pipeline preprocessed)
+    has no record to compare and is not judged.
+    """
+    directory = config.paths.preprocessed_for(system)
+    if not _inside(binary, directory):
+        return None
+    current = provenance.read(directory)
+    if current is None:
+        return (f"{directory / provenance.SIDECAR} is missing or unreadable -- a "
+                "rewrite was started and not finished")
+    at_sort = run_info.get("preprocessing")
+    if not at_sort:
+        return "run_info.json does not record the preprocessing this sorting read"
+    if provenance.normalise(current) != provenance.normalise(at_sort):
+        return f"{binary.name} was preprocessed again after this sorting was made"
+    return None
+
+
 def export_waveforms(
     config: SessionConfig, system: str = "blackrock"
 ) -> dict | None:
@@ -3599,12 +3734,33 @@ def export_waveforms(
     binary = Path(run_info["binary"])
     n_chan = int(run_info["settings"]["n_chan_bin"])
     fs = float(run_info["settings"]["fs"])
+    stale = results_dir / "export" / f"{_export_stem(config, system)}.waveforms.mat"
     if not binary.exists():
         log.warning(
             "the binary this sorting read is gone (%s), so there is nothing to "
             "measure a waveform from; the rest of the export is unaffected",
             binary,
         )
+        # A rewrite cut short empties preprocessed/ and leaves no record: the
+        # folder is there, the record is not. Then an old waveforms.mat cannot
+        # be checked against anything and goes. A folder that is missing or not
+        # answering (the share is away) proves nothing, so the file is kept.
+        directory = config.paths.preprocessed_for(system)
+        if (stale.exists() and _inside(binary, directory) and directory.is_dir()
+                and not (directory / provenance.SIDECAR).exists()):
+            log.warning("removed %s: %s holds no %s, so a rewrite was started and "
+                        "not finished; re-sort", stale.name, directory, provenance.SIDECAR)
+            stale.unlink()
+        return None
+    changed = _binary_changed_since_sort(config, system, run_info, binary)
+    if changed:
+        log.warning(
+            "not measuring waveforms: %s. The traces there are no longer the ones "
+            "this sorting was made from; re-sort first.%s", changed,
+            f" Removed {stale.name}, which belongs to another state of the "
+            "binary." if stale.exists() else "",
+        )
+        stale.unlink(missing_ok=True)
         return None
     preprocessing = _kilosort_preprocessing(results_dir)
     chain = _waveform_chain(run_info, binary, preprocessing)

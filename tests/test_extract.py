@@ -7,6 +7,8 @@ without CatGT, TPrime, Kilosort or a GPU, which is exactly the HPC configuration
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 from conftest import coded_burst_times, square_wave
@@ -246,6 +248,9 @@ def test_a_onebox_gone_on_a_rerun_takes_its_burst_with_it(tmp_path):
     assert not (sync_dir / "npx_burst.txt").exists()
     assert not (sync_dir / "npx_obx_1hz.txt").exists()
     assert (sync_dir / "npx_1hz.txt").exists()          # the AP stream still ran
+    # ...at the rate the edges were converted with, for the spikes to use too.
+    rate = json.loads((sync_dir / extract.NPX_EDGE_RATE).read_text())
+    assert rate["ap_fs"] == spikeglx.stream_info(ap).fs
 
 
 def test_catgt_edge_files_are_told_apart_by_stream_not_by_kind(tmp_path):
@@ -375,6 +380,7 @@ def _sync_only_session(tmp_path, neuropixels_block):
         encoding="utf-8",
     )
     session = cfg.load_session_config(path, "mac", None)
+    session.blackrock.sync_file.write_bytes(b"")   # there to be reached; neo is faked
     for _, probe_config in session.per_probe():
         probe_config.paths.dir_for("neuropixels").mkdir(parents=True, exist_ok=True)
         probe_config.paths.mkdirs()
@@ -396,7 +402,7 @@ def test_blackrock_pulses_land_in_the_neuropixels_folder_not_on_the_share(tmp_pa
     folder = session.paths.sorted_for("neuropixels")
     for name in ("blackrock_1hz.txt", "blackrock_burst.txt", extract.SYNC_NSP_MAP):
         assert (folder / name).exists(), name
-    assert list(br.iterdir()) == []                 # not even a kilosort4/
+    assert [p.name for p in br.iterdir()] == ["NSP-x.ns5"]                 # not even a kilosort4/
 
 
 def test_two_probes_each_get_the_blackrock_pulses_from_one_read(tmp_path, monkeypatch):
@@ -417,7 +423,7 @@ def test_two_probes_each_get_the_blackrock_pulses_from_one_read(tmp_path, monkey
         assert np.allclose(np.loadtxt(folder / "blackrock_1hz.txt"), np.arange(5.0))
         assert (folder / extract.SYNC_NSP_MAP).exists()
     assert not (run / cfg.SORTER_NAME).exists()     # nothing above the probe folders
-    assert list(br.iterdir()) == []
+    assert [p.name for p in br.iterdir()] == ["NSP-x.ns5"]
 
 
 def test_a_blackrock_read_that_fails_leaves_no_old_pulses(tmp_path, monkeypatch):
