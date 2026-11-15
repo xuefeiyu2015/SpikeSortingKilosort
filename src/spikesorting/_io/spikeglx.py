@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import numpy as np
 
@@ -36,6 +36,7 @@ __all__ = [
     "read_sy_word",
     "raw_to_volts",
     "uv_per_digit",
+    "ap_acquisition_channels",
     "RunLayout",
     "run_layout",
     "probe_number",
@@ -139,12 +140,19 @@ def _sy_index(meta: dict[str, str], stream_type: str, n_chan: int) -> int | None
 
 
 def stream_info(
-    bin_path: str | Path, n_chan: int | None = None, fs: float | None = None
+    bin_path: str | Path,
+    n_chan: int | None = None,
+    fs: float | None = None,
+    has_sy: bool | None = None,
 ) -> StreamInfo:
     """Read the meta beside ``bin_path`` and derive the stream's shape.
 
     ``n_chan`` and ``fs`` override the meta, and stand in for it entirely when no
-    ``.meta`` exists beside the binary.
+    ``.meta`` exists beside the binary. So does ``has_sy`` -- whether the last
+    row is the SY word -- which only the meta can otherwise say: a bare binary
+    without it raises rather than guessing, since guessing "yes" drops a neural
+    channel and "no" filters the sync word as if it were one. With a meta it is
+    not consulted.
     """
     bin_path = Path(bin_path)
     if not bin_path.exists():
@@ -176,6 +184,18 @@ def stream_info(
     # Trust the file on disk over fileSizeBytes: the meta can lag a truncated file.
     n_samples = bin_path.stat().st_size // (2 * n_chan)
 
+    if meta:
+        sy_index = _sy_index(meta, stype, n_chan)
+    elif has_sy is None:
+        raise ValueError(
+            f"no .meta beside {bin_path.name}, so nothing says whether its last row is "
+            "the SY word. State it in the session: neuropixels.has_sy_word: true "
+            "(SpikeGLX output, as the Kilosort demo file is) or false (neural "
+            "channels only)."
+        )
+    else:
+        sy_index = n_chan - 1 if has_sy else None
+
     return StreamInfo(
         path=bin_path,
         meta=meta,
@@ -183,7 +203,7 @@ def stream_info(
         n_chan=n_chan,
         fs=float(fs),
         n_samples=n_samples,
-        sy_index=_sy_index(meta, stype, n_chan),
+        sy_index=sy_index,
     )
 
 
@@ -383,6 +403,31 @@ def uv_per_digit(meta: dict[str, str]) -> tuple[np.ndarray, str]:
         if 0 <= acq < gains.size and gains[acq] > 0:
             out[row] = 1e6 * volts_per_count / gains[acq]
     return out, f"gain {source}"
+
+
+def ap_acquisition_channels(meta: dict[str, str], rows: Any) -> list[int]:
+    """The acquisition channel ID of each AP row of an imec binary, in order.
+
+    ``rows`` are binary rows -- what ``bad_channels`` and ``chanMap`` count --
+    and CatGT's ``-chnexcl`` wants the channel each was *acquired* as. They
+    differ once ``snsSaveChanSubset`` saved a subset (row 2 of ``0:1,202:383``
+    is channel 202). A row that is not an AP channel -- the SY word, an LF row,
+    past the end -- raises: it cannot be excluded from a reference it is not in.
+    """
+    n_saved = int(meta["nSavedChans"])
+    saved_ap = (int(meta["snsApLfSy"].split(",")[0]) if "snsApLfSy" in meta
+                else n_saved)
+    chans = _saved_channels(meta, n_saved)
+    out: list[int] = []
+    for row in rows:
+        row = int(row)
+        if not 0 <= row < saved_ap:
+            raise ValueError(
+                f"bad channel {row} is not an AP row of this binary (it saves "
+                f"{saved_ap} AP channels, rows 0..{saved_ap - 1})"
+            )
+        out.append(int(chans[row]))
+    return out
 
 
 #: A SpikeGLX AP/LF filename: ``<run>_g<gate>_t<trigger>.imec<probe>.ap.bin``.

@@ -9,11 +9,12 @@
                          it, always the NumPy detector, and the two compared.
     lfp                  the LF band, when the session says export_lfp: true.
                          Extraction only -- it goes out on the probe's own clock,
-                         and time_remapping stamps the Blackrock axis into it
-                         afterwards without re-reading the samples.
+                         and validate_remapping stamps the Blackrock axis into it
+                         once the map is accepted, without re-reading the samples.
     analog               every OneBox XA input (eye, pupil, photodiode, the
                          burst), when export_analog: true. Same as the LFP: on
-                         the OneBox clock, stamped with onebox_to_blackrock.
+                         the OneBox clock, stamped with onebox_to_blackrock
+                         once the map is accepted.
     time_remapping       coarse offset from the 14 s bursts, then a fine fit on
                          the 1 Hz train, onto Blackrock time. Blackrock is the
                          reference timebase; this maps onto it, never the reverse.
@@ -140,10 +141,13 @@ def _export(config) -> int:
 
     # Blackrock is the reference timebase, so it is what the other system is
     # mapped *onto* rather than a system to remap. Each probe gets its own fit:
-    # separate oscillators, separate SY words, separate time_map.json. This is
-    # also what stamps the Blackrock axis into the LFP extracted above.
+    # separate oscillators, separate SY words, separate time_map.json. The map
+    # and the aligned spike times are provisional until validated.
     per_stream(ss.time_remapping)
 
+    # Accepting a map (burst PASS, or CONSISTENT without a burst) is what stamps
+    # Blackrock time into the LFP and OneBox exports and lets export_results use
+    # the aligned spikes. Anything else is a failure: the run stops here.
     for label, probe_config in per_probe_config():
         run(ss.validate_remapping, probe_config, probe_config.export_figures,
             system="neuropixels", label=label, config=probe_config)

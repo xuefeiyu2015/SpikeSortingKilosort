@@ -50,6 +50,7 @@ def make_session(tmp_path, bin_file, _name="synthetic", n_chan=385, fs=30000, **
         f"  bin_file: '{bin_file}'",
         f"  n_chan_bin: {n_chan if n_chan is not None else 'null'}",
         f"  sample_rate: {fs if fs is not None else 'null'}",
+        "  has_sy_word: true",                 # read only when there is no .meta
         "  sync_bit: 6",
         "  sync_pulse_ms: 500",
     ]
@@ -203,6 +204,48 @@ def test_a_run_without_a_onebox_has_no_onebox_edges(tmp_path):
     assert extract.NPX_OBX_1HZ not in report.edge_sets
     assert not (session.paths.sync_for("neuropixels") / "npx_obx_1hz.txt").exists()
     assert "-xd=1," not in report.catgt_commands[0]
+
+
+def test_a_stream_skipped_on_a_rerun_leaves_no_edge_file_behind(tmp_path):
+    # Same output folder, binary now declared as carrying no SY word: the 1 Hz
+    # file from the earlier run must go, or time_remapping fits a map from a
+    # train this recording never produced. Missing, it raises instead.
+    bin_file = write_ap_with_sync(tmp_path / "synthetic.imec0.ap.bin", duration_s=10.0)
+    session = make_session(tmp_path, bin_file)
+    extract.extract_neuropixels_edges(session)
+    edge = session.paths.sync_for("neuropixels") / "npx_1hz.txt"
+    assert edge.exists()
+
+    yaml = tmp_path / "configs" / "synthetic.yaml"
+    yaml.write_text(yaml.read_text().replace("has_sy_word: true", "has_sy_word: false"))
+    rerun = cfg.load_session_config(yaml, "test", tmp_path / "configs")
+    report = extract.extract_neuropixels_edges(rerun)
+
+    assert extract.NPX_1HZ not in report.edge_sets
+    assert not edge.exists()
+
+
+def test_a_onebox_gone_on_a_rerun_takes_its_burst_with_it(tmp_path):
+    # A leftover npx_burst.txt is the worst case: validation would check the map
+    # against another recording's held-out bursts and could PASS.
+    from conftest import spikeglx_run
+
+    ap = spikeglx_run(tmp_path / "npx", obx_phase=0.4)[0]
+    session = make_session(tmp_path, ap, n_chan=None, fs=None)
+    extract.extract_neuropixels_edges(session)
+    sync_dir = session.paths.sync_for("neuropixels")
+    assert (sync_dir / "npx_burst.txt").exists()
+    assert (sync_dir / "npx_obx_1hz.txt").exists()
+
+    obx = spikeglx.run_layout(ap).obx
+    obx.unlink()
+    obx.with_suffix(".meta").unlink(missing_ok=True)
+    report = extract.extract_neuropixels_edges(session)
+
+    assert extract.NPX_BURST not in report.edge_sets
+    assert not (sync_dir / "npx_burst.txt").exists()
+    assert not (sync_dir / "npx_obx_1hz.txt").exists()
+    assert (sync_dir / "npx_1hz.txt").exists()          # the AP stream still ran
 
 
 def test_catgt_edge_files_are_told_apart_by_stream_not_by_kind(tmp_path):
@@ -375,3 +418,29 @@ def test_two_probes_each_get_the_blackrock_pulses_from_one_read(tmp_path, monkey
         assert (folder / extract.SYNC_NSP_MAP).exists()
     assert not (run / cfg.SORTER_NAME).exists()     # nothing above the probe folders
     assert list(br.iterdir()) == []
+
+
+def test_a_blackrock_read_that_fails_leaves_no_old_pulses(tmp_path, monkeypatch):
+    # The previous run's pulses are removed before the .ns5 is opened, so a
+    # read that fails cannot leave them to be aligned against.
+    _fake_blackrock(monkeypatch, np.arange(5.0))
+    session, _ = _sync_only_session(
+        tmp_path,
+        f"neuropixels_dir: '{tmp_path / 'local' / 'run_g0_imec0'}'\n"
+        f"neuropixels:\n  bin_file: '{tmp_path}/local/run_g0_imec0/run_g0_t0.imec0.ap.bin'\n",
+    )
+    extract_sync(session, "blackrock")
+    folder = session.paths.sorted_for("neuropixels")
+    assert (folder / "blackrock_1hz.txt").exists()
+
+    from spikesorting._io import blackrock
+
+    def unreadable(path, **_):
+        raise OSError("share went away")
+
+    monkeypatch.setattr(blackrock, "open_reader", unreadable)
+    with pytest.raises(OSError):
+        extract_sync(session, "blackrock")
+
+    for name in ("blackrock_1hz.txt", "blackrock_burst.txt", extract.SYNC_NSP_MAP):
+        assert not (folder / name).exists(), name

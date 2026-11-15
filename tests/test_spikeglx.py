@@ -80,9 +80,26 @@ def test_stream_info_without_meta_requires_explicit_params(tmp_path):
     with pytest.raises(FileNotFoundError, match="pass n_chan and fs"):
         spikeglx.stream_info(path)
 
-    info = spikeglx.stream_info(path, n_chan=385, fs=30000.0)
+    # Without a .meta nothing says whether the last row is the SY word.
+    with pytest.raises(ValueError, match="has_sy_word"):
+        spikeglx.stream_info(path, n_chan=385, fs=30000.0)
+
+    info = spikeglx.stream_info(path, n_chan=385, fs=30000.0, has_sy=True)
     assert info.n_chan == 385 and info.fs == 30000.0
     assert info.sy_index == 384
+
+
+def test_a_bare_binary_of_neural_channels_only_keeps_every_one(tmp_path):
+    # 32 neural channels, no SY row: guessing a trailing SY word dropped channel 32.
+    path = write_stream(tmp_path, name="bare32.imec0.ap.bin", meta=False)
+    info = spikeglx.stream_info(path, n_chan=32, fs=30000.0, has_sy=False)
+    assert info.sy_index is None
+
+
+def test_with_a_meta_the_meta_decides_whether_there_is_a_sy_word(tmp_path):
+    path = write_stream(tmp_path)
+    assert (spikeglx.stream_info(path, has_sy=False).sy_index
+            == spikeglx.stream_info(path).sy_index is not None)
 
 
 def test_read_channel_negative_index_is_the_sy_word(tmp_path):

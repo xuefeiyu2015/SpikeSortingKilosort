@@ -51,6 +51,7 @@ def build_preprocess_args(
     spec: Any,
     dest: str | Path,
     extractors: list[ExtractorSpec] = (),
+    excluded: list[int] = (),
 ) -> list[str]:
     """The CatGT argument list for one probe's preprocessing pass.
 
@@ -58,6 +59,10 @@ def build_preprocess_args(
     ``-maxsecs`` or ``-save``: the output has to start at the raw file's first
     sample and keep every channel, or spike sample indices stop meaning the same
     thing as the sync edges from the raw file.
+
+    ``excluded`` are *acquisition* channel IDs (:func:`excluded_channels`),
+    passed as ``-chnexcl={probe;ids}``: CatGT leaves them out of ``gblcar``,
+    ``gbldmx`` and ``gfix`` and still writes them, so the layout is unchanged.
     """
     args = [
         f"-dir={Path(layout.directory)}",
@@ -78,11 +83,25 @@ def build_preprocess_args(
         args.append(f"-{spec.car_mode}")
     if spec.gfix is not None:
         args.append("-gfix=" + ",".join(_num(v) for v in spec.gfix))
+    if excluded:
+        args.append(f"-chnexcl={{{layout.probe};{','.join(str(c) for c in excluded)}}}")
     if not spec.phase_shift:
         args.append("-no_tshift")
     args.extend(e.to_flag() for e in extractors)
     args.extend(["-out_prb_fld", "-no_catgt_fld", f"-dest={Path(dest)}"])
     return args
+
+
+def excluded_channels(spec: Any, acquisition_ids: list[int]) -> list[int]:
+    """The ``-chnexcl`` list CatGT gets: sorted, unique, and empty when moot.
+
+    Exclusion only changes CatGT's output through a common reference or
+    ``gfix``; with neither on it would change nothing, so it is not passed --
+    and, being recorded, would otherwise remake an identical binary.
+    """
+    if spec.car_mode is None and spec.gfix is None:
+        return []
+    return sorted({int(c) for c in acquisition_ids})
 
 
 def find_output(dest: str | Path, layout: RunLayout) -> Path:

@@ -446,6 +446,29 @@ def test_a_bare_binary_is_read_without_its_sy_word_and_written_flat(tmp_path):
     assert np.array_equal(written, data[:, :4])
 
 
+@pytest.mark.parametrize("has_sy_word, kept", [(True, 31), (False, 32)])
+def test_the_session_says_whether_a_bare_binary_ends_in_a_sy_word(tmp_path, has_sy_word, kept):
+    # 32 rows, no .meta. Which are neural is the session's statement; unstated,
+    # the stream refuses rather than guess (the guess dropped channel 32).
+    from spikesorting import pipeline
+    from spikesorting._preprocess import si
+
+    pytest.importorskip("spikeinterface.core")
+    source = tmp_path / "np" / "bare.imec0.ap.bin"
+    source.parent.mkdir()
+    source.write_bytes(np.zeros((300, 32), dtype=np.int16).tobytes())
+    body = f"neuropixels:\n  bin_file: '{source}'\n  n_chan_bin: 32\n  sample_rate: 30000\n"
+
+    with pytest.raises(ValueError, match="has_sy_word"):
+        pipeline._neuropixels_stream(_load(tmp_path, body))
+
+    config = _load(tmp_path, body + f"  has_sy_word: {str(has_sy_word).lower()}\n")
+    info = pipeline._neuropixels_stream(config)
+    recording = si.read_neuropixels(info.path, info.n_chan, info.fs, info.sy_index,
+                                    has_meta=False)
+    assert recording.get_num_channels() == kept
+
+
 def test_only_the_named_binary_is_read_whatever_else_is_in_its_folder(tmp_path, monkeypatch):
     # neo's SpikeGLX reader walks a folder recursively, so a CatGT tcat output in
     # preprocessed/ below the run became a second segment with no LF band:
@@ -484,3 +507,184 @@ def test_only_the_named_binary_is_read_whatever_else_is_in_its_folder(tmp_path, 
     assert recording.has_probe()
     assert "inter_sample_shift" in recording.get_property_keys()
     assert np.array_equal(recording.get_traces(), data[:, :n_ap])
+
+
+# ---------------------------------------------------------------------------
+# A CatGT run is judged by what *it* wrote (CatGT mocked: never run here)
+# ---------------------------------------------------------------------------
+
+
+def _with_catgt(tmp_path, session):
+    """The session on a machine that has CatGT -- a stand-in launcher only."""
+    from dataclasses import replace
+
+    tool = tmp_path / "CatGT"
+    tool.mkdir(exist_ok=True)
+    (tool / "CatGT.exe").write_text("")
+    return replace(session, machine=replace(session.machine, catgt_dir=tool))
+
+
+def _fake_catgt(monkeypatch, writes: bool):
+    """Replace the CatGT launch; ``writes`` decides whether it leaves output."""
+    calls = []
+
+    def run(catgt_dir, args):
+        calls.append(args)
+        if not writes:
+            return None                        # exit 0, nothing written
+        dest = Path(next(a for a in args if a.startswith("-dest="))[len("-dest="):])
+        src = Path(next(a for a in args if a.startswith("-dir="))[len("-dir="):])
+        raw = next(src.rglob("*.imec0.ap.bin"))
+        out = dest / "run_g0_imec0" / "run_g0_tcat.imec0.ap.bin"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(raw.read_bytes())
+        out.with_suffix(".meta").write_text(raw.with_suffix(".meta").read_text())
+        return None
+
+    monkeypatch.setattr(catgt, "run_catgt", run)
+    return calls
+
+
+def _catgt_session(tmp_path, highpass=300, extra="", preprocess=""):
+    from conftest import spikeglx_run
+
+    binary = next((tmp_path / "npx").rglob("*.imec0.ap.bin"), None) \
+        or spikeglx_run(tmp_path / "npx")[0]
+    body = (f"neuropixels:\n  bin_file: '{binary}'\n"
+            f"  preprocess:\n    method: catgt\n    highpass_hz: {highpass}\n"
+            + preprocess + extra)
+    return _with_catgt(tmp_path, _load(tmp_path, body))
+
+
+def test_a_preprocessed_binary_still_matching_is_reused_without_catgt(tmp_path, monkeypatch):
+    from spikesorting import pipeline
+
+    calls = _fake_catgt(monkeypatch, writes=True)
+    first = pipeline._binary_for(_catgt_session(tmp_path), "neuropixels")
+    # A Kilosort setting is not a preprocessing one: the binary still stands.
+    again = pipeline._binary_for(
+        _catgt_session(tmp_path, extra="  kilosort:\n    nblocks: 0\n"), "neuropixels")
+
+    assert len(calls) == 1
+    assert again.path == first.path and again.path.exists()
+
+
+def test_a_required_rerun_that_writes_nothing_does_not_pass_off_the_old_binary(
+        tmp_path, monkeypatch):
+    # Made at 300 Hz, then the session asks for 500 Hz; CatGT "succeeds" but
+    # writes nothing. The 300 Hz file must not come back labelled 500 Hz.
+    from spikesorting import pipeline
+
+    _fake_catgt(monkeypatch, writes=True)
+    old = pipeline._binary_for(_catgt_session(tmp_path, highpass=300), "neuropixels")
+    assert old.path.exists()
+
+    _fake_catgt(monkeypatch, writes=False)
+    session = _catgt_session(tmp_path, highpass=500)
+    with pytest.raises(FileNotFoundError, match="wrote 0 files"):
+        pipeline._binary_for(session, "neuropixels")
+
+    assert not old.path.exists()
+    assert provenance.read(session.paths.preprocessed_for("neuropixels")) is None
+
+
+def test_extraction_never_reads_a_previous_catgt_runs_edges(tmp_path, monkeypatch):
+    # Stale CatGT edges at a phase the recording does not have; CatGT exits 0
+    # writing nothing. Without clearing, CatGT's "output" would beat NumPy's.
+    from conftest import spikeglx_run
+
+    binary = spikeglx_run(tmp_path / "npx")[0]
+    session = _with_catgt(tmp_path, _load(tmp_path, f"neuropixels:\n  bin_file: '{binary}'\n"))
+    _catgt_edges(session.paths.sync_for("neuropixels") / "catgt", 0.7 + np.arange(5.0))
+    calls = _fake_catgt(monkeypatch, writes=False)
+
+    report = extract.extract_neuropixels_edges(session)
+
+    assert len(calls) == 1
+    edge_set = report.edge_sets[extract.NPX_1HZ]
+    assert edge_set.source == "numpy"
+    assert np.allclose(edge_set.times_s, 0.25 + np.arange(5), atol=1e-6)
+    assert any("CatGT produced no edge file" in n for n in report.notes)
+
+
+# ---------------------------------------------------------------------------
+# bad_channels reach CatGT as -chnexcl, in acquisition channel IDs
+# ---------------------------------------------------------------------------
+
+
+def test_chnexcl_names_the_probe_and_its_excluded_channels(tmp_path):
+    layout = _layout(tmp_path)
+    spec = cfg.replace(cfg.NEUROPIXELS_PREPROCESS, gfix=(0.40, 0.10, 0.02))
+    args = catgt_pre.build_preprocess_args(layout, spec, tmp_path / "out", [], [5, 17])
+    assert "-chnexcl={0;5,17}" in args
+    assert not any(a.startswith("-chnexcl") for a in
+                   catgt_pre.build_preprocess_args(layout, spec, tmp_path / "out"))
+    # Nothing to exclude from without a reference or gfix: not passed at all.
+    bare = cfg.replace(cfg.NEUROPIXELS_PREPROCESS, car_mode=None, gfix=None)
+    assert catgt_pre.excluded_channels(bare, [5]) == []
+    assert catgt_pre.excluded_channels(spec, [17, 5, 5]) == [5, 17]
+
+
+def test_binary_rows_are_acquisition_channels_when_every_channel_was_saved():
+    meta = {"nSavedChans": "385", "snsApLfSy": "384,0,1", "snsSaveChanSubset": "all"}
+    assert spikeglx.ap_acquisition_channels(meta, [0, 17, 383]) == [0, 17, 383]
+
+
+def test_a_saved_subset_translates_rows_to_the_channels_acquired():
+    # Rows 0-1 are channels 0-1, row 2 is channel 202; the SY word is row 184.
+    meta = {"nSavedChans": "185", "snsApLfSy": "184,0,1",
+            "snsSaveChanSubset": "0:1,202:383,768"}
+    assert spikeglx.ap_acquisition_channels(meta, [2, 0, 183]) == [202, 0, 383]
+    with pytest.raises(ValueError, match="not an AP row"):
+        spikeglx.ap_acquisition_channels(meta, [184])
+
+
+def test_the_catgt_exclusions_are_recorded_so_changing_them_remakes_the_binary(tmp_path):
+    from spikesorting import pipeline
+
+    def expected(bad, preprocess=""):
+        session = _catgt_session(tmp_path, preprocess=preprocess,
+                                 extra=f"  kilosort:\n    bad_channels: {bad}\n")
+        return pipeline._preprocess_expected(session, "neuropixels")
+
+    assert expected("[2]")["settings"]["catgt_excluded"] == [2]
+    assert provenance.stale_reasons(expected("[2]"), expected("[3]"))
+    assert not provenance.stale_reasons(expected("[2]"), expected("[2]"))
+    # No reference and no gfix: CatGT's output does not depend on them, so a
+    # changed list does not remake an identical binary.
+    off = "    car_mode: null\n    gfix: null\n"
+    assert "catgt_excluded" not in expected("[2]", off)["settings"]
+    assert not provenance.stale_reasons(expected("[2]", off), expected("[3]", off))
+
+
+def test_gfix_alone_still_gets_the_exclusions(tmp_path):
+    from spikesorting import pipeline
+
+    session = _catgt_session(
+        tmp_path, preprocess="    car_mode: null\n    gfix: [0.40, 0.10, 0.02]\n",
+        extra="  kilosort:\n    bad_channels: [4, 1]\n")
+    assert pipeline._preprocess_expected(session, "neuropixels")[
+        "settings"]["catgt_excluded"] == [1, 4]
+
+
+def test_the_catgt_command_carries_the_exclusions(tmp_path, monkeypatch):
+    from spikesorting import pipeline
+
+    calls = _fake_catgt(monkeypatch, writes=True)
+    session = _catgt_session(tmp_path, extra="  kilosort:\n    bad_channels: [2]\n")
+    pipeline._binary_for(session, "neuropixels")
+    assert "-chnexcl={0;2}" in calls[0]
+    record = provenance.read(session.paths.preprocessed_for("neuropixels"))
+    assert record["settings"]["catgt_excluded"] == [2]
+
+
+def test_a_catgt_binary_made_before_exclusions_were_recorded_is_still_reused(tmp_path):
+    # No bad_channels: the record a binary was made with before this change
+    # matches what the session asks for now, so the rig does not remake it.
+    from spikesorting import pipeline
+
+    expected = pipeline._preprocess_expected(_catgt_session(tmp_path), "neuropixels")
+    assert "catgt_excluded" not in expected["settings"]
+    with_key = _catgt_session(tmp_path, extra="  kilosort:\n    bad_channels: [2]\n")
+    assert provenance.stale_reasons(
+        expected, pipeline._preprocess_expected(with_key, "neuropixels"))

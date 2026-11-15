@@ -79,6 +79,8 @@ class AlignmentReport:
     n_expected: int = 0
     #: Time from the first matched burst to the last.
     span_s: float = 0.0
+    #: Length of the stretch both systems recorded, when it was given.
+    shared_s: float | None = None
     #: Why it failed, when it did; empty on a pass.
     fail_reason: str = ""
 
@@ -93,7 +95,8 @@ class AlignmentReport:
         verdict = "PASS" if self.passed else "FAIL"
         text = (
             f"alignment {verdict}: {self.n_checked} of {self.n_expected} bursts matched "
-            f"({100 * self.coverage:.0f}%, over {self.span_s / 60:.1f} min), "
+            f"({100 * self.coverage:.0f}%, over {self.span_s / 60:.1f} min"
+            + (f" of {self.shared_s / 60:.1f}" if self.shared_s else "") + "), "
             f"max |residual| {self.max_residual_s * 1e3:.3f} ms, "
             f"median {self.median_residual_s * 1e3:.3f} ms "
             f"(tolerance {self.tolerance_s * 1e3:.3f} ms)"
@@ -249,6 +252,7 @@ def validate_alignment(
     match_tolerance_s: float = 0.05,
     min_coverage: float = MIN_BURST_COVERAGE,
     min_matched: int = MIN_BURSTS_MATCHED,
+    shared_interval_s: tuple[float, float] | None = None,
 ) -> AlignmentReport:
     """Step 9: compare already-mapped burst onsets against the reference ones.
 
@@ -263,6 +267,12 @@ def validate_alignment(
     what catches a map that is wrong over part of the session: those bursts
     land outside ``match_tolerance_s``, find no partner, and would otherwise
     simply be left out.
+
+    ``shared_interval_s`` is the stretch both systems recorded, on the
+    reference clock (the matched 1 Hz edges). Given it, a burst *either* system
+    holds inside it is expected -- so a burst channel that stops partway on one
+    side is a shortfall, not a short session. Without it the window is where the
+    detected bursts overlap, and the expected count is the smaller side's.
     """
     from .burst import match_times  # local import keeps the two modules independent
 
@@ -282,9 +292,15 @@ def validate_alignment(
     residuals = matched_ref - mapped[other_idx]
     max_res = float(np.abs(residuals).max())
 
-    start = max(reference.min(), mapped.min()) - match_tolerance_s
-    stop = min(reference.max(), mapped.max()) + match_tolerance_s
-    n_expected = int(min(
+    if shared_interval_s is not None:
+        start = float(shared_interval_s[0]) - match_tolerance_s
+        stop = float(shared_interval_s[1]) + match_tolerance_s
+        combine = max
+    else:
+        start = max(reference.min(), mapped.min()) - match_tolerance_s
+        stop = min(reference.max(), mapped.max()) + match_tolerance_s
+        combine = min
+    n_expected = int(combine(
         np.count_nonzero((reference >= start) & (reference <= stop)),
         np.count_nonzero((mapped >= start) & (mapped <= stop)),
     ))
@@ -314,6 +330,8 @@ def validate_alignment(
         residuals_s=residuals,
         n_expected=n_expected,
         span_s=float(matched_ref.max() - matched_ref.min()),
+        shared_s=(float(shared_interval_s[1] - shared_interval_s[0])
+                  if shared_interval_s is not None else None),
         fail_reason="; ".join(reasons),
     )
 

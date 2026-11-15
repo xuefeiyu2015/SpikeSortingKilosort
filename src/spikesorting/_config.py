@@ -504,6 +504,9 @@ class NeuropixelsSpec:
     #: Sampling rate. Only needed for a bare binary with no .meta beside it
     #: (the Kilosort demo file); otherwise read from the meta.
     sample_rate: float | None = None
+    #: Whether the binary's last row is the SY word. Required for a bare binary
+    #: with no .meta (the demo file: true); with a .meta, the meta decides.
+    has_sy_word: bool | None = None
     #: SY-word bit carrying the SMA1 1 Hz square wave. 6 is the SpikeGLX default.
     sync_bit: int = 6
     #: High duration of the 1 Hz square wave, in ms (1 s period, 50% duty).
@@ -576,11 +579,15 @@ class NeuropixelsSpec:
             thresh = (float(thresh), 0.0)
         n_chan = data.get("n_chan_bin")
         rate = data.get("sample_rate")
+        has_sy = data.get("has_sy_word")
+        if has_sy is not None and not isinstance(has_sy, bool):
+            raise ValueError(f"neuropixels.has_sy_word must be true or false, got {has_sy!r}")
         return cls(
             bin_file=_as_path(data.get("bin_file")),
             lf_file=_as_path(data.get("lf_file")),
             n_chan_bin=int(n_chan) if n_chan is not None else None,
             sample_rate=float(rate) if rate is not None else None,
+            has_sy_word=has_sy,
             sync_bit=int(data.get("sync_bit", 6)),
             sync_pulse_ms=int(data.get("sync_pulse_ms", 500)),
             burst_word=int(data.get("burst_word", 0)),

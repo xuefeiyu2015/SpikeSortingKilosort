@@ -7,6 +7,8 @@ across the session -- a rate error -- may read as DRIFT.
 
 from __future__ import annotations
 
+import json
+
 from pathlib import Path
 
 import numpy as np
@@ -188,6 +190,12 @@ def _session(tmp_path, stamped_slope):
     matlab.update_mat(path, {"analog": {
         "timebase": "blackrock", "blackrock_slope": stamped_slope, "blackrock_intercept": C,
     }})
+    # The check applies the fitted map itself (the export is stamped only once
+    # the map is accepted), so the same map goes into time_map.json.
+    session.paths.aligned.mkdir(parents=True, exist_ok=True)
+    (session.paths.aligned / "time_map.json").write_text(json.dumps({
+        "onebox_to_blackrock": {"slope": stamped_slope, "intercept": C},
+    }), encoding="utf-8")
 
     # Blackrock .ns2: its own rate, and the stored copy FILTER_DELAY late.
     nbr = int(DURATION / BR_PERIOD)
@@ -350,6 +358,8 @@ def test_without_a_burst_agreeing_channels_make_the_map_consistent(tmp_path, mon
 
     outcome = ss.validate_remapping(session, figures=False)
     assert outcome.verdict == "CONSISTENT (no burst)"
+    assert outcome.passed                       # independent evidence: accepted
+    assert json.loads((session.paths.aligned / "validation.json").read_text())["accepted"]
     sync = json.loads((session.paths.export_for("neuropixels") / "sync_report.json").read_text())
     assert sync["verdict"] == "CONSISTENT (no burst)"
     assert "coarse match by photodiode in place of the burst" in sync["verdict_note"]
@@ -358,3 +368,77 @@ def test_without_a_burst_agreeing_channels_make_the_map_consistent(tmp_path, mon
     assert "coarse match (photodiode)" in text and "-3.000 s" in text
     assert "Coarse match:        photodiode, shift -3.000 s" in text
     assert "14 s burst: same OneBox clock" not in text
+
+
+@pytest.mark.parametrize("method, accepted", [("tprime", False), ("linear_fit", True)])
+def test_without_a_burst_a_tprime_map_that_cannot_be_checked_is_not_accepted(
+        tmp_path, monkeypatch, method, accepted):
+    # Photodiode and eye agree, but the spikes went through TPrime and its pairs
+    # are gone: agreement with the line does not vouch for TPrime's map. The
+    # same session on the line is still accepted.
+    import json
+
+    import spikesorting as ss
+
+    _, _, session = _remap_with_a_planted_cycle_error(tmp_path, monkeypatch, with_session=True)
+    aligned = session.paths.aligned
+    payload = json.loads((aligned / "time_map.json").read_text())
+    payload["method"] = method
+    (aligned / "time_map.json").write_text(json.dumps(payload))
+    (aligned / "npx_1hz_trimmed.txt").unlink()
+
+    outcome = ss.validate_remapping(session, figures=False)
+    validation = json.loads((aligned / "validation.json").read_text())
+    sync = json.loads((session.paths.export_for("neuropixels") / "sync_report.json").read_text())
+
+    assert outcome.passed is accepted
+    assert validation["accepted"] is accepted
+    if accepted:
+        assert outcome.verdict == sync["verdict"] == "CONSISTENT (no burst)"
+    else:
+        assert outcome.verdict == sync["verdict"] == "NOT VALIDATED"
+        assert validation["map_checked"] == "tprime (could not be checked)"
+        assert "cannot be checked" in outcome.reason
+        assert "cannot be checked" in sync["verdict_note"]
+        text = (session.paths.export_for("neuropixels") / "sync_report.txt").read_text()
+        assert "Verdict: NOT VALIDATED" in text
+
+
+@pytest.mark.parametrize("corrupt, reason", [
+    (lambda n: "nan\n" * n, "npx_1hz_trimmed.txt holds non-finite times"),
+    (lambda n: "not a number\n", "npx_1hz_trimmed.txt cannot be read"),
+])
+def test_without_a_burst_corrupt_tprime_pairs_withdraw_an_earlier_acceptance(
+        tmp_path, monkeypatch, corrupt, reason):
+    # Accepted first, on a valid TPrime map; then the probe's pair file is NaN
+    # (equal length, so it still "pairs") or not numbers at all (which used to
+    # raise and leave accepted: true on disk). Either way: refused, the reason
+    # written down, the photodiode and eye measurements kept.
+    import json
+
+    import spikesorting as ss
+
+    _, _, session = _remap_with_a_planted_cycle_error(tmp_path, monkeypatch, with_session=True)
+    aligned = session.paths.aligned
+    export = session.paths.export_for("neuropixels")
+    payload = json.loads((aligned / "time_map.json").read_text())
+    payload["method"] = "tprime"
+    (aligned / "time_map.json").write_text(json.dumps(payload))
+    assert ss.validate_remapping(session, figures=False).passed
+    assert json.loads((aligned / "validation.json").read_text())["accepted"] is True
+
+    pair_file = aligned / "npx_1hz_trimmed.txt"
+    pair_file.write_text(corrupt(len(pair_file.read_text().split())))
+    outcome = ss.validate_remapping(session, figures=False)
+
+    assert not outcome.passed and outcome.verdict == "NOT VALIDATED"
+    assert reason in outcome.reason
+    validation = json.loads((aligned / "validation.json").read_text())
+    assert validation["accepted"] is False
+    assert validation["map_checked"] == "tprime (could not be checked)"
+    assert reason in validation["reason"]
+    sync = json.loads((export / "sync_report.json").read_text())
+    assert sync["verdict"] == "NOT VALIDATED" and reason in sync["verdict_note"]
+    assert {c["channel"] for c in sync["independent_checks"]} == {"photodiode", "eye_x"}
+    text = (export / "sync_report.txt").read_text()
+    assert "Verdict: NOT VALIDATED" in text and reason in text

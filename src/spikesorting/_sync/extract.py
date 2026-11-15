@@ -178,7 +178,8 @@ def _resolve_ap_stream(config: SessionConfig) -> spikeglx.StreamInfo | None:
     npx = config.neuropixels
     if npx.bin_file is None:
         return None
-    return spikeglx.stream_info(npx.bin_file, npx.n_chan_bin, npx.sample_rate)
+    return spikeglx.stream_info(npx.bin_file, npx.n_chan_bin, npx.sample_rate,
+                                npx.has_sy_word)
 
 
 def _resolve_obx_stream(config: SessionConfig) -> spikeglx.StreamInfo | None:
@@ -282,8 +283,9 @@ def _run_catgt_extraction(
         )
         return {}
 
+    dest = catgt.fresh_dest(config.paths.sync_for("neuropixels") / "catgt")
     catgt.run_catgt(machine.catgt_dir, args)
-    produced = catgt.find_edge_files(config.paths.sync_for("neuropixels") / "catgt")
+    produced = catgt.find_edge_files(dest)
     return _match_edge_files(produced, specs, report)
 
 
@@ -345,6 +347,18 @@ def _match_edge_files(
     return result
 
 
+def _clear_edges(directory: Path, names: tuple[str, ...]) -> None:
+    """Remove the edge files an extraction is about to (re)write.
+
+    Done before reading anything, so a stream that is skipped this time -- no
+    SY word, no OneBox, a read that fails partway -- leaves no file rather than
+    the previous run's, which ``time_remapping`` would otherwise fit from and
+    validation would check against as though this recording had produced it.
+    """
+    for name in names:
+        (directory / f"{name}.txt").unlink(missing_ok=True)
+
+
 def extract_neuropixels_edges(
     config: SessionConfig,
     chunk_bytes: int = spikeglx.DEFAULT_CHUNK_BYTES,
@@ -358,6 +372,7 @@ def extract_neuropixels_edges(
     config.paths.require_dir("neuropixels")       # never create the recording's folder
     sync_dir = config.paths.sync_for("neuropixels")
     sync_dir.mkdir(parents=True, exist_ok=True)
+    _clear_edges(sync_dir, (NPX_1HZ, NPX_BURST, NPX_OBX_1HZ))
 
     catgt_times = _run_catgt_extraction(config, report)
 
@@ -467,6 +482,13 @@ def extract_blackrock_edges(
 
     report = ExtractionReport()
     spec = config.blackrock
+    if config.has_data("neuropixels"):
+        # Before any guard: a session that stops naming a sync_file must not keep
+        # aligning on the pulses an earlier run extracted.
+        for _, probe_config in config.per_probe():
+            directory = probe_config.paths.sync_for("blackrock")
+            _clear_edges(directory, (BR_1HZ, BR_BURST))
+            (directory / SYNC_NSP_MAP).unlink(missing_ok=True)
     if spec.sync_file is None:
         report.note("Blackrock extraction skipped: no blackrock.sync_file configured.")
         return report

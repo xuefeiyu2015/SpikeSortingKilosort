@@ -123,6 +123,31 @@ def test_validate_alignment_tolerates_a_few_missing_bursts():
     assert report.n_checked == report.n_expected == reference.size - 3
 
 
+def test_a_burst_channel_that_stops_early_is_measured_against_the_shared_interval():
+    # 100 bursts on Blackrock, only the first three on the other side. Judged by
+    # where the detected bursts overlap that is 3/3 over 28 s; judged by the
+    # stretch both systems recorded (the 1 Hz pairs) it is 3 of 100.
+    reference = np.arange(100) * 14.0 + 50.0
+    mapped = reference[:3] + 1e-4
+    alone = align.validate_alignment(mapped, reference, tolerance_s=1e-3)
+    assert alone.passed and alone.n_expected == 3            # the hole
+
+    report = align.validate_alignment(mapped, reference, tolerance_s=1e-3,
+                                      shared_interval_s=(40.0, 1440.0))
+    assert not report.passed
+    assert (report.n_checked, report.n_expected) == (3, 100)
+    assert report.shared_s == pytest.approx(1400.0)
+    assert "over 0.5 min of 23.3" in report.summary()
+
+
+def test_the_shared_interval_still_forgives_a_missed_burst_or_two():
+    reference = np.arange(100) * 14.0 + 50.0
+    mapped = np.delete(reference, [40, 41]) + 1e-4
+    report = align.validate_alignment(mapped, reference, tolerance_s=1e-3,
+                                      shared_interval_s=(40.0, 1440.0))
+    assert report.passed and (report.n_checked, report.n_expected) == (98, 100)
+
+
 def test_validate_alignment_needs_more_than_two_bursts():
     reference = np.array([0.0, 14.0])
     report = align.validate_alignment(reference + 1e-4, reference, tolerance_s=1e-3)

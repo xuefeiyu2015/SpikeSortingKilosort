@@ -21,6 +21,7 @@ Reference: https://billkarsh.github.io/SpikeGLX/More_help/CatGT_ReadMe.html
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +39,7 @@ __all__ = [
     "onebox_selection",
     "run_catgt",
     "find_edge_files",
+    "fresh_dest",
 ]
 
 #: CatGT stream-type selector (js) -> the command-line flag that enables it.
@@ -278,6 +280,22 @@ def _log_tail(path: Path, lines: int = 20) -> str:
     except OSError:
         return f"{path.name}: not found at {path}"
     return f"{path} (last {lines} lines):\n" + "\n".join(text[-lines:])
+
+
+def fresh_dest(dest: str | Path) -> Path:
+    """Empty ``dest`` for a CatGT run about to write into it, and return it.
+
+    Whatever is found there afterwards is then this run's output. CatGT reports
+    its errors in ``CatGT.log`` and can exit 0 having written nothing, so a
+    previous run's files left in place would be read back as new -- a binary
+    filtered with the old settings, or edges the NumPy detector disagrees with.
+    Only for a run that is actually starting: reuse never comes through here.
+    """
+    dest = Path(dest)
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)          # CatGT refuses a -dest that does not exist
+    return dest
 
 
 def find_edge_files(dest: str | Path) -> dict[str, Path]:

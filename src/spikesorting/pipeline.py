@@ -276,8 +276,12 @@ def _probe_from_meta(config: SessionConfig) -> dict | None:
     no ``.meta`` beside it, or a meta neither reader can use, so the caller can
     fall through to ``probe_file``.
     """
+    from ._io import spikeglx
     from ._probes import neuropixels as np_probes
 
+    bin_file = config.neuropixels.bin_file
+    if bin_file is None or not spikeglx.meta_path_for(bin_file).exists():
+        return None
     try:
         info = _neuropixels_stream(config)
     except FileNotFoundError:
@@ -310,14 +314,15 @@ def _probe_from_meta(config: SessionConfig) -> dict | None:
 def _neuropixels_stream(config: SessionConfig) -> Any:
     """The AP stream this session names.
 
-    ``n_chan_bin`` and ``sample_rate`` override the ``.meta`` beside the binary
-    and stand in for it entirely when there is none -- which is the demo file's
-    situation, and the only reason those two keys exist.
+    ``n_chan_bin``, ``sample_rate`` and ``has_sy_word`` stand in for the
+    ``.meta`` when there is none -- which is the demo file's situation, and the
+    only reason those keys exist.
     """
     from ._io import spikeglx
 
     npx = config.neuropixels
-    return spikeglx.stream_info(npx.bin_file, npx.n_chan_bin, npx.sample_rate)
+    return spikeglx.stream_info(npx.bin_file, npx.n_chan_bin, npx.sample_rate,
+                                npx.has_sy_word)
 
 
 # ----------------------------------------------------------------------------
@@ -391,6 +396,12 @@ def _preprocess_expected(config: SessionConfig, system: str) -> dict[str, Any]:
     settings: dict[str, Any] = asdict(spec)
     if spec.method == "spikeinterface" and spec.car_mode:
         settings["reference_rows"] = _reference_rows(config, system)
+    if spec.method == "catgt":
+        # Only when there is something to exclude: a binary made before this
+        # key existed, with no exclusions, is still the same binary.
+        excluded = _catgt_excluded(config)
+        if excluded:
+            settings["catgt_excluded"] = excluded
     if system == "blackrock":
         brk = config.blackrock
         settings["reader"] = {
@@ -401,6 +412,8 @@ def _preprocess_expected(config: SessionConfig, system: str) -> dict[str, Any]:
     else:
         npx = config.neuropixels
         settings["reader"] = {"n_chan_bin": npx.n_chan_bin, "sample_rate": npx.sample_rate}
+        if npx.has_sy_word is not None:
+            settings["reader"]["has_sy_word"] = npx.has_sy_word
     return {
         "engine": spec.method,
         "settings": settings,
@@ -425,6 +438,32 @@ def _reference_rows(config: SessionConfig, system: str) -> list[int]:
     if not kept:
         raise ValueError(f"every {system} channel is in bad_channels; nothing to reference")
     return kept
+
+
+def _catgt_excluded(config: SessionConfig) -> list[int]:
+    """``bad_channels`` as CatGT's ``-chnexcl`` wants them: acquisition channel IDs.
+
+    The same exclusion SpikeInterface's median gets from :func:`_reference_rows`,
+    translated: ``bad_channels`` are binary rows, CatGT counts the channels as
+    acquired, and the two differ once the run saved a subset. Empty when CatGT
+    would use neither a reference nor ``gfix``. Recorded in ``preprocess.json``,
+    so a change remakes the binary.
+    """
+    from ._io import spikeglx
+    from ._preprocess import catgt as catgt_pre
+
+    bad = config.kilosort_for("neuropixels").get("bad_channels") or []
+    spec = config.preprocess_for("neuropixels")
+    if not bad or (spec.car_mode is None and spec.gfix is None):
+        return []
+    meta_path = spikeglx.meta_path_for(config.neuropixels.bin_file)
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"bad_channels has to reach CatGT as acquisition channel IDs, read from "
+            f"{meta_path}, which is missing"
+        )
+    ids = spikeglx.ap_acquisition_channels(spikeglx.read_meta(meta_path), bad)
+    return catgt_pre.excluded_channels(spec, ids)
 
 
 def _stale_reasons(config: SessionConfig, system: str) -> tuple[list[str], dict | None]:
@@ -486,7 +525,9 @@ def _run_preprocessing(config: SessionConfig, system: str, directory: Path) -> d
     jobs = _job_kwargs(config)
     directory.mkdir(parents=True, exist_ok=True)
 
-    rows = _reference_rows(config, system) if spec.car_mode else None
+    # Only SpikeInterface takes reference rows; CatGT gets -chnexcl instead.
+    rows = (_reference_rows(config, system)
+            if spec.car_mode and spec.method != "catgt" else None)
     if system == "blackrock":
         recording = si.build_chain(_read_blackrock(config), spec, jobs, rows)
         path = si.write(recording, directory / f"{config.blackrock.spike_file.stem}.bin", jobs)
@@ -567,8 +608,8 @@ def _run_catgt_preprocessing(
 
     extractors = extract.catgt_extractors(config, layout)
     dest = directory / "catgt"
-    dest.mkdir(parents=True, exist_ok=True)  # CatGT refuses a -dest that does not exist
-    args = catgt_pre.build_preprocess_args(layout, spec, dest, extractors)
+    excluded = _catgt_excluded(config)
+    args = catgt_pre.build_preprocess_args(layout, spec, dest, extractors, excluded)
     launcher = catgt.catgt_script(config.machine.catgt_dir)
     log.info("CatGT: %s %s", launcher.name, " ".join(args))
     # CatGT prints nothing while it works; a long silence here is normal.
@@ -576,6 +617,10 @@ def _run_catgt_preprocessing(
         "CatGT is silent while it works (expect minutes per hour of recording); "
         "progress: %s", Path(config.machine.catgt_dir) / "CatGT.log",
     )
+    # Emptied only now that CatGT is about to run: a previous binary here was
+    # made with other settings (its record is already gone), and must not be
+    # found afterwards as though this run had written it.
+    catgt.fresh_dest(dest)
     try:
         catgt.run_catgt(config.machine.catgt_dir, args)
     except RuntimeError as error:
@@ -1031,6 +1076,7 @@ _PREVIOUS_CURATION = (
     ".phy", "phy.log", "cluster_*.tsv",
     # time_remapping's per-spike arrays, one per spike of the *old* sort
     "*_spike_seconds.npy", "*_spike_seconds_blackrock.npy",
+    "*_spike_seconds_blackrock.json",
 )
 
 
@@ -1626,10 +1672,10 @@ def extract_lfp(config: SessionConfig, system: str) -> Path | None:
     )
     log.info("wrote %s%s", path, f" (decimated {decimate}x)" if decimate > 1 else "")
 
-    # If a map was already fitted -- a re-export after alignment -- put it on the
-    # Blackrock clock now rather than making the caller run time_remapping again.
-    # Otherwise time_remapping stamps it when it runs.
-    mapping = _fitted_map(config)
+    # If a map was already accepted -- a re-export after alignment -- put it on
+    # the Blackrock clock now. Otherwise validate_remapping stamps it once it
+    # accepts one.
+    mapping = _fitted_map(config) if _alignment_accepted(config) else None
     if mapping is not None:
         stamp_lfp_timebase(config, mapping)
     return path
@@ -1646,7 +1692,8 @@ def extract_analog(config: SessionConfig, system: str) -> Path | None:
     The samples are written on the OneBox's own clock. Blackrock time comes from
     ``time_map.json["onebox_to_blackrock"]`` -- the OneBox -> probe fit composed
     with probe -> Blackrock, the same chain the held-out burst validates -- and
-    is stamped in now if that map exists, or by ``time_remapping`` when it runs.
+    is stamped in now if that map has been accepted, or by ``validate_remapping``
+    when it accepts one.
 
     One OneBox per run, so a session covering two probes exports it once: the
     exporting driver calls this with the first probe's config, and it lands in
@@ -1678,11 +1725,12 @@ def extract_analog(config: SessionConfig, system: str) -> Path | None:
         f" (decimated {config.analog_decimate}x)" if config.analog_decimate > 1 else "",
     )
 
-    onebox_map = _fitted_onebox_map(config)
+    onebox_map = _fitted_onebox_map(config) if _alignment_accepted(config) else None
     if onebox_map is not None:
         stamp_analog_timebase(config, onebox_map)
     else:
-        log.info("no onebox_to_blackrock map yet; time_remapping will stamp it")
+        log.info("no accepted onebox_to_blackrock map yet; validate_remapping "
+                 "will stamp it")
     return path
 
 
@@ -1710,22 +1758,6 @@ def _fitted_onebox_map(config: SessionConfig) -> align.LinearMap | None:
         n_points=0,
         residuals_s=np.empty(0),
     )
-
-
-def _stamp_exports(
-    config: SessionConfig,
-    mapping: align.LinearMap,
-    obx_map: align.LinearMap | None,
-) -> None:
-    """Put Blackrock time into every export written before the map existed."""
-    stamp_lfp_timebase(config, mapping)
-    if obx_map is not None:
-        stamp_analog_timebase(config, align.compose_linear_maps(mapping, obx_map))
-    elif list(config.paths.export_for("neuropixels").glob("*.analog.mat")):
-        log.warning(
-            "the OneBox analog export stays on the OneBox clock: no OneBox 1 Hz "
-            "edges to map it with (re-run extract_sync)"
-        )
 
 
 def stamp_analog_timebase(
@@ -1950,17 +1982,31 @@ def time_remapping(
     intra-burst pattern to pick the right cycle. Then both 1 Hz trains are
     trimmed to their overlap and a linear map is fitted -- by TPrime where it is
     installed, otherwise by least squares on the same matched edges. Both paths
-    write the same output file.
+    write the same output file, with a record of which sorting it mapped
+    (``*_spike_seconds_blackrock.json``, a hash of ``spike_times.npy``).
 
-    Returns ``None`` when only one system is declared, when asked for Blackrock itself
-    (there is nothing to map the reference onto), or when the edge files are
-    missing.
+    **Everything written here is provisional.** A new map withdraws any earlier
+    acceptance (``validation.json`` is removed, the LFP and OneBox exports go
+    back to their own clocks); :func:`validate_remapping` decides whether it is
+    published.
+
+    Returns ``None`` when only one system is declared, or when asked for Blackrock
+    itself (there is nothing to map the reference onto). Missing 1 Hz edge files
+    in a session with both systems **raise**: there is no map from this run, and
+    that is a failure, not a stage with nothing to do. Any earlier acceptance
+    is withdrawn first, before the edges are read, so no failure below --
+    missing edges, too few pairs, burst codes that never agree -- leaves it
+    standing.
     """
     _check(system)
     if not config.aligns_systems or system == REFERENCE_SYSTEM:
         return None
 
     from ._sync import tprime as tprime_mod
+
+    # Before reading anything: whatever an earlier run accepted was fitted from
+    # other edges, and a fit that raises below must not leave it standing.
+    _withdraw_acceptance(config)
 
     br_1hz = _load_edges(config, extract.BR_1HZ)
     npx_1hz = _load_edges(config, extract.NPX_1HZ)
@@ -1975,10 +2021,14 @@ def time_remapping(
         if values is None or values.size == 0
     ]
     if missing:
-        log.warning(
-            "missing or empty edge files: %s; run extract_sync first", ", ".join(missing)
+        # Both systems recorded, so there must be a map; the earlier acceptance
+        # is already withdrawn above.
+        raise FileNotFoundError(
+            f"missing or empty edge files: {', '.join(missing)} in "
+            f"{config.paths.sync_for('neuropixels')}; without both 1 Hz trains there "
+            "is no map from this run, and any earlier acceptance has been withdrawn. "
+            "Run extract_sync, and check the sync channels were recorded."
         )
-        return None
 
     # 1. Coarse map from the 14 s coded bursts, paired by code so drift cannot
     #    pick the wrong cycle -- and a line, so it holds at both ends of hours.
@@ -2040,8 +2090,8 @@ def time_remapping(
     if not spike_times_path.exists():
         log.info("no sorting at %s; wrote the time map only", results_dir)
         _save_map(aligned_dir, mapping, offset, config, obx_map, method="map_only",
-                  cycles_from=cycles_from, cycle_vote=vote, coarse_tried=tried)
-        _stamp_exports(config, mapping, obx_map)
+                  cycles_from=cycles_from, cycle_vote=vote, coarse_tried=tried,
+                  inputs=_edge_inputs(br_1hz, npx_1hz))
         return TimeMap(mapping, offset, "map_only", burst_match=match)
 
     from ._export.curated import parse_params_py
@@ -2056,11 +2106,13 @@ def time_remapping(
     # Kilosort writes sample indices; TPrime needs seconds. Skipping this is the
     # easiest way to produce a confidently wrong alignment.
     # Both per-spike arrays sit beside the sorting they came from.
-    spike_seconds = tprime_mod.spike_times_to_seconds(np.load(spike_times_path), fs)
+    spike_samples = np.load(spike_times_path)
+    spike_seconds = tprime_mod.spike_times_to_seconds(spike_samples, fs)
     seconds_path = results_dir / f"{system}_spike_seconds.npy"
     np.save(seconds_path, spike_seconds)
 
     out_path = _aligned_spike_path(config, system)
+    _aligned_identity_path(out_path).unlink(missing_ok=True)
     method, tprime_error = "linear_fit", None
     if config.machine.has_tprime:
         try:
@@ -2084,10 +2136,13 @@ def time_remapping(
                 config.machine.name, spike_seconds.size,
             )
 
+    _write_aligned_identity(out_path, spike_samples, method)
+
     _save_map(aligned_dir, mapping, offset, config, obx_map, method=method,
               cycles_from=cycles_from, tprime_error=tprime_error, cycle_vote=vote,
-              coarse_tried=tried)
-    _stamp_exports(config, mapping, obx_map)
+              coarse_tried=tried, inputs=_edge_inputs(br_1hz, npx_1hz))
+    log.info("the map and %s are provisional until validate_remapping accepts them",
+             out_path.name)
     return TimeMap(mapping, offset, method, aligned_path=out_path, burst_match=match)
 
 
@@ -2136,12 +2191,16 @@ def _run_tprime_shifted(
         work / "npx_1hz_trimmed_tprime.txt", slope * npx_trim)
     events_path = work / f"{seconds_path.stem}_tprime.npy"
     np.save(events_path, slope * np.load(seconds_path).astype(np.float64))
+    # TPrime writes to a fresh file, never to out_path: an exit that wrote
+    # nothing must not leave the previous run's times to be read back.
+    tprime_out = work / f"{seconds_path.stem}_tprime_out.npy"
+    tprime_out.unlink(missing_ok=True)
     log.info("TPrime edges brought together by the 1 Hz line: max gap %.3f ms",
              1e3 * float(np.abs((br_trim - intercept) - slope * npx_trim).max()))
     args = tprime_mod.build_tprime_args(
         to_stream=to_path,
         from_streams={1: from_path},
-        events=[tprime_mod.TPrimeEvent(1, events_path, out_path)],
+        events=[tprime_mod.TPrimeEvent(1, events_path, tprime_out)],
         sync_period_s=config.sync_period_s,
     )
     log.info("TPrime command (probe x %.9f, Blackrock - %.6f s): %s",
@@ -2149,10 +2208,147 @@ def _run_tprime_shifted(
     try:
         tprime_mod.run_tprime(config.machine.tprime_dir, args,
                               timeout_s=tprime_mod.tprime_timeout_s(n_events))
+        mapped = _checked_tprime_output(tprime_out, n_events)
     finally:
         events_path.unlink(missing_ok=True)       # a scaled copy of every spike
-    mapped = np.load(out_path).astype(np.float64)
+        tprime_out.unlink(missing_ok=True)
     np.save(out_path, mapped + intercept)
+
+
+def _checked_tprime_output(path: Path, n_events: int) -> np.ndarray:
+    """TPrime's output, or ``RuntimeError`` -- which the linear fallback catches.
+
+    It exited cleanly, but that is all the exit code says: the file must exist,
+    load, hold one finite time per event.
+    """
+    try:
+        mapped = np.load(path).astype(np.float64).ravel()
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"TPrime exited cleanly but its output is unreadable: {error}")
+    if mapped.size != n_events:
+        raise RuntimeError(f"TPrime wrote {mapped.size} times for {n_events} spikes")
+    if not np.isfinite(mapped).all():
+        raise RuntimeError(
+            f"TPrime wrote {int((~np.isfinite(mapped)).sum())} non-finite times")
+    return mapped
+
+
+def _edge_inputs(br_1hz: np.ndarray | None, npx_1hz: np.ndarray | None) -> dict[str, str]:
+    """SHA-256 of the two 1 Hz trains a map is fitted from, as loaded."""
+    import hashlib
+
+    def digest(edges):
+        flat = np.ascontiguousarray(
+            np.asarray(edges if edges is not None else [], dtype=np.float64).ravel())
+        return hashlib.sha256(flat.tobytes()).hexdigest()
+
+    return {extract.BR_1HZ: digest(br_1hz), extract.NPX_1HZ: digest(npx_1hz)}
+
+
+def _alignment_accepted(config: SessionConfig) -> bool:
+    """Whether ``validate_remapping`` accepted this probe's current map.
+
+    ``validation.json["accepted"]``: a burst PASS, or ``CONSISTENT (no burst)``.
+    ``time_remapping`` deletes the file whenever it fits a new map, so an
+    acceptance can never outlive the map it was given to.
+    """
+    try:
+        with open(config.paths.aligned / "validation.json", "r", encoding="utf-8") as h:
+            return bool(json.load(h).get("accepted"))
+    except (OSError, ValueError):
+        return False
+
+
+def _withdraw_acceptance(config: SessionConfig) -> None:
+    """Forget an earlier acceptance and take the exports back to their own clocks.
+
+    The sync report goes too: it describes the map being withdrawn, and a PASS
+    left in the bundle would read as this run's.
+    """
+    (config.paths.aligned / "validation.json").unlink(missing_ok=True)
+    export_dir = config.paths.export_for("neuropixels")
+    for name in ("sync_report.json", "sync_report.txt"):
+        (export_dir / name).unlink(missing_ok=True)
+    _unstamp_exports(config)
+
+
+def _stamp_accepted(config: SessionConfig, mapping: align.LinearMap) -> None:
+    """Put Blackrock time into the LFP and OneBox exports. Only on acceptance."""
+    stamp_lfp_timebase(config, mapping)
+    onebox = _fitted_onebox_map(config)
+    if onebox is not None:
+        stamp_analog_timebase(config, onebox)
+    elif list(config.paths.export_for("neuropixels").glob("*.analog.mat")):
+        log.warning(
+            "the OneBox analog export stays on the OneBox clock: no OneBox 1 Hz "
+            "edges to map it with (re-run extract_sync)"
+        )
+
+
+def _unstamp_exports(config: SessionConfig) -> None:
+    """Put the LFP and OneBox exports back on their own clocks, NaN for Blackrock's.
+
+    What they were written with. Only the small fields are rewritten.
+    """
+    from ._io.matlab import update_mat
+
+    export_dir = config.paths.export_for("neuropixels")
+    if not export_dir.exists():
+        return
+    nan = float("nan")
+    unset = {"fs_blackrock": nan, "t0_blackrock": nan,
+             "blackrock_slope": nan, "blackrock_intercept": nan}
+    for pattern, group, own in (("*.lfp.mat", "lfp", "stream"),
+                                ("*.analog.mat", "analog", "onebox")):
+        for path in sorted(export_dir.glob(pattern)):
+            update_mat(path, {group: {"timebase": own, **unset}})
+            log.info("%s back on the %s clock until the map is accepted", path.name, own)
+
+
+def _aligned_identity_path(aligned_path: Path) -> Path:
+    return aligned_path.with_suffix(".json")
+
+
+def _spike_fingerprint(samples: np.ndarray) -> str:
+    """SHA-256 of the spike samples as int64: which sorting a per-spike array is for."""
+    import hashlib
+
+    flat = np.ascontiguousarray(np.asarray(samples).ravel(), dtype=np.int64)
+    return hashlib.sha256(flat.tobytes()).hexdigest()
+
+
+def _write_aligned_identity(aligned_path: Path, samples: np.ndarray, method: str) -> None:
+    """Beside the aligned array: the sorting it was mapped from, by content."""
+    with open(_aligned_identity_path(aligned_path), "w", encoding="utf-8") as handle:
+        json.dump({"spike_times_sha256": _spike_fingerprint(samples),
+                   "n_spikes": int(np.asarray(samples).size), "method": method},
+                  handle, indent=2)
+
+
+def _checked_aligned_times(path: Path, n_spikes: int) -> tuple[np.ndarray | None, str | None]:
+    """``(times, None)``, or ``(None, why)``: it loads, one finite time per spike."""
+    try:
+        times = np.asarray(np.load(path), dtype=np.float64).ravel()
+    except (OSError, ValueError) as error:
+        return None, f"{path.name} cannot be read ({error})"
+    if times.size != n_spikes:
+        return None, f"{path.name} holds {times.size} times for {n_spikes} spikes"
+    if not np.isfinite(times).all():
+        return None, (f"{path.name} holds {int((~np.isfinite(times)).sum())} "
+                      "non-finite times")
+    return times, None
+
+
+def _aligned_mismatch(aligned_path: Path, samples: np.ndarray) -> str | None:
+    """Why the aligned array is not this sorting's, or None when it is."""
+    try:
+        with open(_aligned_identity_path(aligned_path), "r", encoding="utf-8") as handle:
+            recorded = json.load(handle).get("spike_times_sha256")
+    except (OSError, ValueError):
+        return f"{aligned_path.name} has no record of the sorting it was mapped from"
+    if recorded != _spike_fingerprint(samples):
+        return f"{aligned_path.name} was mapped from a different sorting"
+    return None
 
 
 def _fit_1hz(
@@ -2298,6 +2494,7 @@ def _save_map(
     tprime_error: str | None = None,
     cycle_vote: Any = None,
     coarse_tried: list[dict[str, str]] | None = None,
+    inputs: dict[str, str] | None = None,
 ) -> None:
     obx_to_br = None if obx_map is None else align.compose_linear_maps(mapping, obx_map)
     # Only a burst is held out of the fit; without one nothing validates the map
@@ -2306,6 +2503,9 @@ def _save_map(
     payload = {
         "session": config.session,
         "reference_timebase": "blackrock",
+        # The 1 Hz edges this map was fitted from, by content: validate_remapping
+        # refuses the map once the edge files no longer match.
+        "inputs": inputs,
         "coarse_offset_s": offset,
         # What picked which 1 Hz cycle pairs with which: "burst", "photodiode",
         # an eye channel's label, or "1hz_only" (ambiguous by whole seconds).
@@ -2379,7 +2579,7 @@ def _clock_definitions(config: SessionConfig) -> dict[str, Any]:
     """
     from ._io import spikeglx
 
-    def stream(path: Path | None, n_chan=None, fs=None) -> dict[str, Any] | None:
+    def stream(path: Path | None, n_chan=None, fs=None, has_sy=None) -> dict[str, Any] | None:
         if path is None:
             return None
         record: dict[str, Any] = {
@@ -2388,7 +2588,7 @@ def _clock_definitions(config: SessionConfig) -> dict[str, Any]:
             "sample_rate_hz": None,
         }
         try:
-            record["sample_rate_hz"] = spikeglx.stream_info(path, n_chan, fs).fs
+            record["sample_rate_hz"] = spikeglx.stream_info(path, n_chan, fs, has_sy).fs
         except (OSError, ValueError) as err:
             log.warning("time_map.json: no sample rate for %s (%s)", Path(path).name, err)
         return record
@@ -2400,7 +2600,8 @@ def _clock_definitions(config: SessionConfig) -> dict[str, Any]:
             "definition": "seconds on the NSP PTP clock -- the axis of the .nev "
             "markers and Blackrock's own analog channels (see nsp_time_map.json)",
         },
-        "spikeglx_time": stream(npx.bin_file, npx.n_chan_bin, npx.sample_rate),
+        "spikeglx_time": stream(npx.bin_file, npx.n_chan_bin, npx.sample_rate,
+                                npx.has_sy_word),
         "onebox_time": stream(layout.obx if layout is not None else None),
     }
 
@@ -2411,11 +2612,20 @@ class Unvalidated:
 
     ``verdict`` is the report's: ``CONSISTENT (no burst)`` when the channels
     recorded on both systems agree, ``NOT VALIDATED`` otherwise.
+
+    Only the first is accepted. Without a burst the 1 Hz fixes the drift and
+    the offset only modulo whole periods, so with nothing independent agreeing
+    the map may be whole seconds off however small its fit residuals are.
+    ``passed`` is what the runner gates on.
     """
 
     report_path: Path | None
     reason: str
     verdict: str = "NOT VALIDATED"
+
+    @property
+    def passed(self) -> bool:
+        return self.verdict.startswith("CONSISTENT")
 
     def summary(self) -> str:
         where = f"; sync report at {self.report_path}" if self.report_path else ""
@@ -2436,10 +2646,19 @@ def validate_remapping(
     whether that happened (``burst_clock``); when it did not, the residuals
     include the OneBox-to-probe drift as well as the alignment's error.
 
-    Returns ``None`` when only one system is declared or no map has been fitted.
-    With no burst on one side it still writes the sync report and returns an
+    Returns ``None`` when only one system is declared. With both, a missing map
+    -- or one not fitted from the 1 Hz edge files now on disk -- is
+    :class:`Unvalidated` and not accepted, so a run that could not fit cannot
+    publish an earlier run's map. With no burst on one side it still writes the sync report and returns an
     :class:`Unvalidated` saying so -- the 1 Hz fit residuals in ``time_map.json``
     are then the only quality measure, and they are not held-out.
+
+    **This is what publishes the map.** ``time_remapping``'s outputs are
+    provisional; only an accepted map -- a burst PASS, or ``CONSISTENT (no
+    burst)`` -- is written into ``validation.json`` as ``accepted``, stamped into
+    the LFP and OneBox exports, and lets ``export_results`` use the aligned
+    spike times. Anything else leaves them on their own clocks, and the sync
+    report says why.
     """
     from ._plots import summary as plots
 
@@ -2449,8 +2668,37 @@ def validate_remapping(
     aligned_dir = config.paths.aligned
     map_path = aligned_dir / "time_map.json"
     if not map_path.exists():
-        log.warning("no time map at %s; run time_remapping first", map_path)
-        return None
+        return _refuse(config, f"no time map at {map_path}: time_remapping fitted none")
+
+    with open(map_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    current = _edge_inputs(_load_edges(config, extract.BR_1HZ),
+                           _load_edges(config, extract.NPX_1HZ))
+    if payload.get("inputs") != current:
+        return _refuse(config, (
+            "time_map.json was not fitted from the 1 Hz edge files now on disk"
+            if payload.get("inputs") else
+            "time_map.json predates maps recording their 1 Hz edges")
+            + "; re-run time_remapping")
+    mapping = align.LinearMap(
+        slope=float(payload["slope"]),
+        intercept=float(payload["intercept"]),
+        n_points=int(payload["n_points"]),
+        residuals_s=np.empty(0),
+    )
+
+    # The spikes went through TPrime: whichever path judges the map, it must be
+    # able to reconstruct TPrime's, or it would accept one the spikes never got.
+    # Read and checked once; the same arrays rebuild TPrime's map below.
+    tprime_unchecked = None
+    pairs = None
+    if payload.get("method") == "tprime":
+        pairs = _tprime_pairs(aligned_dir)
+        if isinstance(pairs, str):
+            tprime_unchecked = (
+                f"the spikes went through TPrime, but its matched edge pairs are "
+                f"unusable ({pairs}), so that map cannot be checked; re-run "
+                "time_remapping")
 
     br_burst = _load_edges(config, extract.BR_BURST)
     npx_burst, obx_map = _burst_on_probe_clock(
@@ -2461,43 +2709,47 @@ def validate_remapping(
             "no 14 s burst edges on one or both systems, so nothing held out checks "
             "the map; comparing the channels recorded on both systems instead"
         )
-        path = _write_sync_report(config, None)
+        path = _write_sync_report(config, None, refused=tprime_unchecked)
         verdict = "NOT VALIDATED"
         if path is not None:
             with open(path, "r", encoding="utf-8") as handle:
                 verdict = json.load(handle)["verdict"]
-        return Unvalidated(path, "no 14 s burst on one or both systems", verdict)
-
-    with open(map_path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    mapping = align.LinearMap(
-        slope=float(payload["slope"]),
-        intercept=float(payload["intercept"]),
-        n_points=int(payload["n_points"]),
-        residuals_s=np.empty(0),
-    )
+        reason = "no 14 s burst on one or both systems"
+        if tprime_unchecked:
+            log.warning("%s", tprime_unchecked)
+            reason += "; " + tprime_unchecked
+        result = Unvalidated(path, reason, verdict)
+        settled = {"verdict": verdict, "n_checked": 0, "reason": result.reason}
+        if tprime_unchecked:
+            settled["map_checked"] = "tprime (could not be checked)"
+        _settle_acceptance(config, mapping, result.passed, settled)
+        return result
 
     br_onsets = burst.group_burst_onsets(br_burst, config.burst_interval_s / 2)
     npx_onsets = burst.group_burst_onsets(npx_burst, config.burst_interval_s / 2)
+    shared = _shared_interval(aligned_dir)
     line_report = align.validate_alignment(
-        mapping.apply(npx_onsets), br_onsets, tolerance_s=config.alignment_tolerance_s
+        mapping.apply(npx_onsets), br_onsets, tolerance_s=config.alignment_tolerance_s,
+        shared_interval_s=shared,
     )
     # Check the map the spikes actually went through: TPrime's per-interval
     # offsets when it ran, the line otherwise.
     checked_map = "linear_fit"
     report = line_report
     if payload.get("method") == "tprime":
-        tprime_mapped = _tprime_model(aligned_dir, mapping, npx_onsets)
-        if tprime_mapped is None:
-            log.warning(
-                "the spikes went through TPrime, but its edge pairs in %s are not "
-                "matched (written before they were), so only the line is checked; "
-                "re-run time_remapping", aligned_dir,
-            )
+        if tprime_unchecked:
+            # The spikes got TPrime's map; accepting the line instead would
+            # accept a map they never went through.
+            from dataclasses import replace as _replace
+
+            checked_map = "tprime (could not be checked)"
+            report = _replace(line_report, passed=False, fail_reason=tprime_unchecked)
         else:
+            tprime_mapped = _tprime_model(pairs, mapping, npx_onsets)
             checked_map = "tprime"
             report = align.validate_alignment(
-                tprime_mapped, br_onsets, tolerance_s=config.alignment_tolerance_s
+                tprime_mapped, br_onsets, tolerance_s=config.alignment_tolerance_s,
+                shared_interval_s=shared,
             )
             log.info("line: %s", line_report.summary())
     log.info("%s: %s", checked_map, report.summary())
@@ -2508,6 +2760,7 @@ def validate_remapping(
         "n_expected": report.n_expected,
         "coverage": report.coverage,
         "span_s": report.span_s,
+        "shared_s": report.shared_s,
         "max_residual_s": report.max_residual_s,
         "median_residual_s": report.median_residual_s,
         "tolerance_s": report.tolerance_s,
@@ -2522,8 +2775,8 @@ def validate_remapping(
             "median_residual_s": line_report.median_residual_s,
             "passed": line_report.passed,
         }
-    with open(aligned_dir / "validation.json", "w", encoding="utf-8") as handle:
-        json.dump(validation, handle, indent=2)
+    validation["verdict"] = "PASS" if report.passed else "FAIL"
+    _settle_acceptance(config, mapping, report.passed, validation)
     _write_sync_report(config, validation)
 
     if figures and report.n_checked:
@@ -2539,23 +2792,112 @@ def validate_remapping(
     return report
 
 
+def _refuse(config: SessionConfig, reason: str) -> "Unvalidated":
+    """No map from this run's edges to check: not accepted, and the runner stops."""
+    log.warning("%s", reason)
+    config.paths.aligned.mkdir(parents=True, exist_ok=True)
+    _settle_acceptance(config, None, False,
+                       {"verdict": "NOT VALIDATED", "n_checked": 0, "reason": reason})
+    return Unvalidated(_write_refusal_report(config, reason), reason, "NOT VALIDATED")
+
+
+def _write_refusal_report(config: SessionConfig, reason: str) -> Path:
+    """A sync report saying only that no map was validated, and why.
+
+    Replaces whatever the last run wrote: with no map from this run's edges,
+    nothing in ``time_map.json`` describes this run, so nothing is reported from it.
+    """
+    export_dir = config.paths.export_for("neuropixels")
+    export_dir.mkdir(parents=True, exist_ok=True)
+    path = export_dir / "sync_report.json"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"verdict": "NOT VALIDATED", "verdict_note": reason,
+                   "accepted": False}, handle, indent=2)
+    title = f"{config.session} | {stream_label('neuropixels')}"
+    if config.probe_tag is not None:
+        title += f" {config.probe_tag}"
+    (export_dir / "sync_report.txt").write_text(
+        f"{title}\n\nVerdict: NOT VALIDATED  ({reason})\n", encoding="utf-8")
+    return path
+
+
+def _settle_acceptance(
+    config: SessionConfig, mapping: align.LinearMap | None, accepted: bool,
+    validation: dict,
+) -> None:
+    """Write ``validation.json`` with the decision, and publish or withhold the map."""
+    validation = {**validation, "accepted": bool(accepted)}
+    with open(config.paths.aligned / "validation.json", "w", encoding="utf-8") as handle:
+        json.dump(validation, handle, indent=2)
+    if accepted:
+        _stamp_accepted(config, mapping)
+    else:
+        _unstamp_exports(config)
+        log.warning(
+            "map not accepted (%s): the LFP and OneBox exports stay on their own "
+            "clocks and export_results will not use the aligned spike times",
+            validation.get("verdict"),
+        )
+
+
+def _shared_interval(aligned_dir: Path) -> tuple[float, float] | None:
+    """The stretch both systems recorded, on Blackrock time: the matched 1 Hz pairs.
+
+    None when the Blackrock pair file is missing or unusable -- never a span
+    estimated from whatever values survive. Coverage is then not computed, and
+    nothing here raises ahead of the refusal being recorded.
+    """
+    br = _usable_edge_file(aligned_dir / "blackrock_1hz_trimmed.txt")
+    return None if isinstance(br, str) else (float(br[0]), float(br[-1]))
+
+
+def _usable_edge_file(path: Path) -> np.ndarray | str:
+    """One paired-edge file: at least two finite, strictly increasing times, or why not."""
+    try:
+        times = catgt.read_edge_file(path)
+    except FileNotFoundError:
+        return f"{path.name} is missing"
+    except (OSError, ValueError) as error:
+        return f"{path.name} cannot be read ({error})"
+    if times.size < 2:
+        return f"{path.name} holds {times.size} time(s), fewer than two"
+    if not np.all(np.isfinite(times)):
+        return f"{path.name} holds non-finite times"
+    if not np.all(np.diff(times) > 0):
+        return f"{path.name} is not strictly increasing"
+    return times
+
+
+def _tprime_pairs(aligned_dir: Path) -> tuple[np.ndarray, np.ndarray] | str:
+    """The matched 1 Hz pairs TPrime was handed, ``(blackrock, probe)``, or why not.
+
+    Both files must parse, hold at least two finite, strictly increasing times,
+    and pair one to one. The string names the file and the fault.
+    """
+    br = _usable_edge_file(aligned_dir / "blackrock_1hz_trimmed.txt")
+    if isinstance(br, str):
+        return br
+    npx = _usable_edge_file(aligned_dir / "npx_1hz_trimmed.txt")
+    if isinstance(npx, str):
+        return npx
+    if br.size != npx.size:
+        return (f"blackrock_1hz_trimmed.txt has {br.size} times and "
+                f"npx_1hz_trimmed.txt {npx.size}, so they do not pair")
+    return br, npx
+
+
 def _tprime_model(
-    aligned_dir: Path, mapping: align.LinearMap, npx_times: np.ndarray
-) -> np.ndarray | None:
-    """``npx_times`` through the map TPrime applied, or None without matched pairs.
+    pairs: tuple[np.ndarray, np.ndarray], mapping: align.LinearMap,
+    npx_times: np.ndarray,
+) -> np.ndarray:
+    """``npx_times`` through the map TPrime applied, from :func:`_tprime_pairs`.
 
     Exactly what :func:`_run_tprime_shifted` hands TPrime -- the probe edges and
     times scaled by the line's slope, Blackrock's with its intercept removed --
     put through TPrime's measured rule (:func:`align.interval_offset_map`), then
     the intercept added back.
     """
-    try:
-        br = catgt.read_edge_file(aligned_dir / "blackrock_1hz_trimmed.txt")
-        npx = catgt.read_edge_file(aligned_dir / "npx_1hz_trimmed.txt")
-    except OSError:
-        return None
-    if br.size != npx.size or not br.size:
-        return None
+    br, npx = pairs
     slope, intercept = float(mapping.slope), float(mapping.intercept)
     mapped = align.interval_offset_map(
         slope * np.asarray(npx_times, dtype=np.float64), slope * npx, br - intercept
@@ -2563,12 +2905,15 @@ def _tprime_model(
     return mapped + intercept
 
 
-def _write_sync_report(config: SessionConfig, validation: dict | None) -> Path | None:
+def _write_sync_report(
+    config: SessionConfig, validation: dict | None, refused: str | None = None,
+) -> Path | None:
     """``sync_report.json`` and ``.txt`` in the probe's ``export/``.
 
     Built from ``time_map.json`` and the burst check, so it says nothing the
     pipeline did not measure -- it puts it in one place, per signal and per
-    channel, beside the data it describes.
+    channel, beside the data it describes. ``refused`` overrides the verdict
+    with NOT VALIDATED and that reason, keeping the measurements beside it.
     """
     from ._io import analog
     from ._sync.report import build_sync_report, render_sync_report
@@ -2593,6 +2938,9 @@ def _write_sync_report(config: SessionConfig, validation: dict | None) -> Path |
         time_map, validation, names, stream_label("neuropixels"), checks=checks
     )
     report["time_map"] = str(map_path)
+    if refused:
+        report["verdict"] = "NOT VALIDATED"
+        report["verdict_note"] = refused
     for check in checks:
         if check.get("status") == "DRIFT":
             log.warning(
@@ -2621,7 +2969,7 @@ PHOTODIODE_PAIRING_S = 0.02
 def _independent_checks(config: SessionConfig) -> list[dict[str, Any]]:
     """Each behavioural channel recorded twice, compared after synchronization.
 
-    Needs the OneBox analog export on Blackrock time and ``blackrock.analog_file``
+    Needs the OneBox analog export, the fitted ``onebox_to_blackrock`` map and ``blackrock.analog_file``
     with its ``analog_inputs``. These channels play no part in alignment --
     not even in picking cycles, as the burst does -- so their agreement is the
     most independent evidence there is. The photodiode is compared edge by edge;
@@ -2642,12 +2990,22 @@ def _independent_checks(config: SessionConfig) -> list[dict[str, Any]]:
         return [{"channel": n, "status": "not measured", "note": note}
                 for n in brk.analog_inputs]
 
+    # The export is still on the OneBox clock -- it is stamped only once this
+    # check has helped accept the map -- so the fitted map is applied here.
+    onebox_map = _fitted_onebox_map(config)
+    if onebox_map is None:
+        return unmeasured("no onebox_to_blackrock map (no OneBox 1 Hz edges), so the "
+                          "OneBox copy cannot be put on Blackrock time")
     try:
         onebox = analog.load_onebox_analog(
-            analog.find_onebox_analog(config.paths.export_for("neuropixels"))
+            analog.find_onebox_analog(config.paths.export_for("neuropixels")),
+            require_blackrock=False,
         )
     except (OSError, ValueError) as error:
-        return unmeasured(f"no OneBox analog export on Blackrock time: {error}")
+        return unmeasured(f"no OneBox analog export: {error}")
+    from dataclasses import replace as _replace
+
+    onebox = _replace(onebox, slope=onebox_map.slope, intercept=onebox_map.intercept)
     try:
         br = analog.open_blackrock_analog(
             brk.analog_file, brk.analog_inputs, brk.nsp_frontend_channels,
@@ -2753,21 +3111,6 @@ def _sorted_window(
     return float(times[0]), float(times[1] - times[0]) + 1.0 / fs
 
 
-def _older_than_the_sorting(path: Path, results_dir: Path) -> bool:
-    """Whether ``path`` was written before the sorting in ``results_dir``.
-
-    A sorting copied in from elsewhere (the cluster) lands beside whatever the
-    last one left, and a per-spike file from that one can have the same length.
-    ``_publish`` keeps Kilosort's mtimes, so a file derived from *this* sort is
-    never older than its ``spike_times.npy``.
-    """
-    spikes = results_dir / "spike_times.npy"
-    try:
-        return path.stat().st_mtime < spikes.stat().st_mtime
-    except OSError:
-        return False
-
-
 def _resolve_spike_seconds(
     config: SessionConfig, system: str, phy
 ) -> tuple[np.ndarray | None, str, object | None]:
@@ -2789,17 +3132,15 @@ def _resolve_spike_seconds(
     results_dir = config.paths.sorted_for(system)
     aligned_path = _aligned_spike_path(config, system)
     if aligned_path.exists():
-        stale = _older_than_the_sorting(aligned_path, results_dir)
-        aligned = None if stale else np.load(aligned_path)
-        if aligned is not None and aligned.size == phy.spike_samples.size:
+        why = _aligned_mismatch(aligned_path, phy.spike_samples)
+        if why is None and not _alignment_accepted(config):
+            why = "its map has not been accepted by validate_remapping"
+        aligned = None
+        if why is None:
+            aligned, why = _checked_aligned_times(aligned_path, phy.spike_samples.size)
+        if why is None:
             return aligned, "blackrock", None
-        log.warning(
-            "%s; exporting in the sorter timebase instead -- run time_remapping",
-            f"{aligned_path.name} predates spike_times.npy, so it is from an earlier sort"
-            if stale else
-            f"aligned times ({aligned.size}) do not match spike count "
-            f"({phy.spike_samples.size})",
-        )
+        log.warning("%s; exporting in the sorter timebase instead", why)
     elif system == "blackrock":
         spike_file = config.blackrock.spike_file
         time_map = read_nsp_time_map(results_dir, spike_file)
