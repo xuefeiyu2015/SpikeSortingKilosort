@@ -65,8 +65,8 @@ Look at:
 Viewer help: SpikeGLX → Help, or <https://billkarsh.github.io/SpikeGLX/>.
 
 **Optional: the Kilosort4 GUI**, for what SpikeGLX cannot show — Kilosort's own
-whitened traces and its drift map, i.e. whether drift justifies `nblocks: 1`
-(Neuropixels) or none at all (`nblocks: 0`, the Utah array — see the note in
+whitened traces and its drift map, i.e. how much drift there is for `nblocks: 5`
+(Neuropixels) or a `preprocess.motion` preset to correct, or none at all (`nblocks: 0`, the Utah array — see the note in
 Step 1). It is also the way to look at a Blackrock `.ns6`, which SpikeGLX does
 not open.
 
@@ -88,7 +88,7 @@ keys it answers:
 | `bad_channels` | recording channel numbers to drop (rows of the binary, not array positions) |
 | `do_CAR` | subtract the median across channels each batch (default true) |
 | `highpass_cutoff` | Kilosort's own highpass, in Hz (default 300) |
-| `nblocks` | drift correction: `0` off, `1` rigid |
+| `nblocks` | Kilosort's drift correction: `0` off, `1` rigid, `5` (the template) five depth blocks. Ignored -- Kilosort sorts with `0` -- whenever `preprocess.motion` is set |
 | `artifact_threshold` | zero out batches above this amplitude |
 | `tmin` / `tmax` | sort only this window of the binary, in seconds |(haven't implemented yet)
 
@@ -161,6 +161,36 @@ Drift correction is off for the Utah array (`blackrock.kilosort.nblocks: 0`):
 Kilosort corrects drift by interpolating between neighbouring contacts, and at
 400 µm pitch there is no neighbour — a nonzero shift estimate *attenuates* the
 signal instead of moving it.
+
+**Neuropixels drift is corrected one of two ways — switched by one line.**
+
+| `preprocess.motion` | who corrects drift | figures beside the sorting |
+|---|---|---|
+| `null` | Kilosort, at `kilosort.nblocks` (5 in the template) | Kilosort's `drift_amount.png`, `drift_scatter.png` |
+| `dredge`, `dredge_fast`, `medicine`, … | SpikeInterface, before Kilosort; Kilosort runs with `nblocks: 0` automatically, whatever the YAML says | `motion_drift_scatter.png` (before vs after), `motion_drift_amount.png` |
+
+So leave `nblocks: 5` in the file: it is used again as soon as `motion` is back
+to `null`, and the log says when it was overridden. With CatGT, changing only
+`motion` re-runs only the motion step — CatGT's output in
+`preprocessed/catgt/` is reused.
+
+Each preset writes into its own folder, so trying one after another never
+overwrites the last:
+
+```
+<neuropixels_dir>/preprocessed/
+    preprocess.json          which binary Kilosort reads now
+    catgt/                   CatGT's output (motion: null sorts this one)
+    motion_dredge/           <run>.motion.bin (+ .json record), drift.npz, the two figures
+    motion_medicine/         the same, for MEDiCINe
+```
+
+Switching back to a preset whose folder is still there reuses it instantly.
+Each `.motion.bin` is the size of the recording, though, so the log lists the
+folders kept beside the one in use — delete one to free its space. The
+*sorting* folder is still one per probe: re-sorting with another preset
+replaces the previous sorting. `medicine` needs one extra package (see
+Installation, step 1).
 
 ### 1b. In your terminal dir to the SpikeSoritngKilosort dir, Run it
 
@@ -364,6 +394,25 @@ property of the box, and a pin here would go stale. It only *reports* which one
 you ended up with, in 4e.
 
 Kilosort4 install docs: <https://kilosort.readthedocs.io/en/latest/installation.html>
+
+**Optional: MEDiCINe**, for `preprocess.motion: medicine`. SpikeInterface
+ships the preset but not the method, which is its own package:
+
+```bash
+conda activate kilosort4
+pip install --dry-run medicine-neuro    # first: must not list torch
+pip install medicine-neuro
+python -c "import medicine; print('medicine ok')"
+```
+
+It needs `torch>=2.5`. If the dry run lists torch, your torch is older, and pip
+would replace the CUDA build with a CPU-only one — upgrade torch from the CUDA
+index first (the command above, with the cu128 URL), then install MEDiCINe, then
+re-run the GPU check. `dredge` and `dredge_fast` need nothing extra.
+`check_env.py --config <session>` reports a missing MEDiCINe as blocking for a
+session that asks for it.
+
+MEDiCINe docs: <https://jazlab.github.io/medicine/>
 
 ### 2. The curation environment — `phy`
 

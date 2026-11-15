@@ -331,7 +331,8 @@ class PreprocessSpec:
     #: SpikeInterface ``phase_shift``). Neuropixels only; needs the ``.meta``.
     phase_shift: bool = True
     #: A SpikeInterface ``correct_motion`` preset, or None. When set, Kilosort's
-    #: ``nblocks`` must be 0 so drift is not corrected twice.
+    #: ``nblocks`` is 0 whatever the session states, so drift is not corrected
+    #: twice (:meth:`SessionConfig.kilosort_for`).
     motion: str | None = None
 
     @classmethod
@@ -971,10 +972,38 @@ class SessionConfig:
 
         Empty means Kilosort's defaults. The tracked templates state every key
         anyway, so a sort is described by its session file alone.
+
+        **One override: ``preprocess.motion`` turns Kilosort's drift correction
+        off.** A preset corrects drift before Kilosort reads the binary, so
+        ``nblocks`` is 0 here whatever the block states -- correcting twice
+        would only add the second estimate's noise. The two are alternatives,
+        and the session switches between them with the one ``motion`` line;
+        ``nblocks`` keeps the value Kilosort uses when ``motion`` is null.
+        :meth:`nblocks_override` says when this happened.
         """
+        merged = self._stated_kilosort(system)
+        if self._motion_preset(system) is not None:
+            merged["nblocks"] = 0
+        return merged
+
+    def nblocks_override(self, system: str) -> str | None:
+        """Why ``nblocks`` is not what the session states, or None when it is."""
+        preset = self._motion_preset(system)
+        stated = self._stated_kilosort(system).get("nblocks", 1)
+        if preset is None or stated == 0:
+            return None
+        return (f"kilosort nblocks: {stated} is not used: preprocess.motion: {preset} "
+                "corrects drift before Kilosort, so Kilosort sorts with nblocks: 0")
+
+    def _stated_kilosort(self, system: str) -> dict[str, Any]:
         merged = dict(self.kilosort)
         merged.update(self.kilosort_by_system.get(system) or {})
         return merged
+
+    def _motion_preset(self, system: str) -> str | None:
+        if system not in ("blackrock", "neuropixels"):
+            return None
+        return self.preprocess_for(system).motion
 
     def waveforms_for(self, system: str) -> WaveformSpec:
         """How to cut and filter waveforms for one system.
@@ -1510,17 +1539,6 @@ def _reject_bad_preprocess(config: SessionConfig, path: Path) -> None:
                     "correct_motion preset: " + ", ".join(MOTION_PRESETS)
                     + ", or null"
                 )
-            if getattr(config, f"sorts_{system}"):
-                # Per probe: a by_probe: block may set nblocks for one of them.
-                for _, stream in config.per_probe():
-                    nblocks = stream.kilosort_for(system).get("nblocks", 1)
-                    if nblocks != 0:
-                        tag = f" ({stream.probe_tag})" if stream.probe_tag else ""
-                        raise ValueError(
-                            f"{where}.motion: {spec.motion} corrects drift before "
-                            f"Kilosort, but kilosort nblocks{tag} is {nblocks}, so "
-                            "it would be corrected twice. Set nblocks: 0."
-                        )
 
 
 def _reject_bad_analog_channels(config: SessionConfig, path: Path) -> None:

@@ -854,7 +854,7 @@ def _fake_preprocessing(monkeypatch) -> list[dict]:
     """
     made: list[dict] = []
 
-    def run(config, system, directory):
+    def run(config, system, directory, previous=None):
         directory.mkdir(parents=True, exist_ok=True)
         if system == "blackrock":
             recording = pipeline._read_blackrock(config)

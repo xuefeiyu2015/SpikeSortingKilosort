@@ -499,11 +499,24 @@ def _binary_for(config: SessionConfig, system: str) -> Binary:
     from datetime import datetime
 
     directory = config.paths.preprocessed_for(system)
+    expected = _preprocess_expected(config, system)
+    if recorded is not None:
+        _keep_binary_record(recorded)
+    kept = _kept_binary(directory, expected)
+    if kept is not None:
+        # Made earlier with exactly these settings (another motion preset was
+        # used since): its record comes back verbatim, so the sorting made
+        # from it still recognises its binary.
+        provenance.write(directory, kept)
+        log.info("reusing %s -- kept from an earlier run with these settings",
+                 kept["binary"])
+        return _binary_from_record(kept)
+
     log.info("preprocessing %s (%s)", system, "; ".join(reasons))
     provenance.discard(directory)
     started = time.perf_counter()
-    record = _run_preprocessing(config, system, directory)
-    record.update(_preprocess_expected(config, system))
+    record = _run_preprocessing(config, system, directory, previous=recorded)
+    record.update(expected)
     # How long it took and where, so a sort that reuses this binary -- on this
     # machine or after copying it to another -- can still report the cost.
     # Not one of provenance's deciding keys: it never makes a binary stale.
@@ -512,13 +525,106 @@ def _binary_for(config: SessionConfig, system: str) -> Binary:
         "machine": config.machine.name,
         "finished": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
+    _write_binary_record(record)
     provenance.write(directory, record)
     log.info("preprocessed -> %s", record["binary"])
+    _report_kept_binaries(directory, Path(record["binary"]))
     return _binary_from_record(record)
 
 
-def _run_preprocessing(config: SessionConfig, system: str, directory: Path) -> dict[str, Any]:
-    """Make the preprocessed binary. Returns what it made, for the record."""
+# ---------------------------------------------------------------------------
+# One binary per variant, each with its own record
+#
+# preprocessed/preprocess.json says which binary Kilosort reads *now*. Every
+# binary also has its record beside it, <binary>.json -- written after the
+# binary, removed before it is rewritten -- so a variant made earlier (DREDge,
+# then MEDiCINe, then DREDge again) is found and reused rather than remade.
+# A motion-corrected binary lives in motion_<preset>/, so two presets never
+# write to one place.
+# ---------------------------------------------------------------------------
+
+
+def _binary_record_path(binary: str | Path) -> Path:
+    binary = Path(binary)
+    return binary.with_name(binary.name + ".json")
+
+
+def motion_folder(directory: Path, preset: str) -> Path:
+    """Where a motion preset's binary, drift record and figures go."""
+    return directory / f"motion_{preset}"
+
+
+def _write_binary_record(record: dict[str, Any]) -> None:
+    path = _binary_record_path(record["binary"])
+    path.write_text(json.dumps(provenance.normalise(record), indent=2), encoding="utf-8")
+
+
+def _discard_binary_record(binary: Path) -> None:
+    """Before ``binary`` is (re)written: a torn write must not be found later."""
+    path = _binary_record_path(binary)
+    if path.exists():
+        path.unlink()
+
+
+def _read_record(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _kept_binary(directory: Path, expected: dict[str, Any]) -> dict | None:
+    """A binary already in ``preprocessed/`` made with exactly ``expected``."""
+    if not directory.is_dir():
+        return None
+    for path in sorted(directory.rglob("*.bin.json")):
+        record = _read_record(path)
+        if (record is not None
+                and _binary_record_path(record.get("binary", "")) == path
+                and not provenance.stale_reasons(record, expected)
+                and _binary_size_problem(record) is None):
+            return record
+    return None
+
+
+def _keep_binary_record(record: dict[str, Any]) -> None:
+    """Give the binary ``record`` describes its own record, if it has none.
+
+    For a binary made before records sat beside binaries -- the DREDge binary
+    a sort already read, say -- so switching preset and back reuses it in
+    place instead of making it again. ``record`` is ``preprocess.json``,
+    written only after that binary was finished.
+    """
+    if _binary_size_problem(record) is not None:
+        return
+    path = _binary_record_path(record["binary"])
+    if not path.exists():
+        _write_binary_record(record)
+
+
+def _report_kept_binaries(directory: Path, current: Path) -> None:
+    """Say which other variants are still on disk: each is recording-sized."""
+    others = []
+    for path in sorted(directory.rglob("*.bin.json")):
+        binary = path.with_name(path.name[: -len(".json")])
+        if binary != current and binary.exists():
+            others.append(f"{binary.relative_to(directory)} "
+                          f"({binary.stat().st_size / 1e9:.1f} GB)")
+    if others:
+        log.info("also kept in %s, for reuse: %s -- delete a folder to free its space",
+                 directory, ", ".join(others))
+
+
+def _run_preprocessing(
+    config: SessionConfig, system: str, directory: Path, previous: dict | None = None
+) -> dict[str, Any]:
+    """Make the preprocessed binary. Returns what it made, for the record.
+
+    ``record["stages"]`` is what each stage cost -- CatGT, each step of motion
+    correction, the write -- for the timing table.
+    """
+    import time
+
     from ._preprocess import si
 
     spec = config.preprocess_for(system)
@@ -528,25 +634,148 @@ def _run_preprocessing(config: SessionConfig, system: str, directory: Path) -> d
     # Only SpikeInterface takes reference rows; CatGT gets -chnexcl instead.
     rows = (_reference_rows(config, system)
             if spec.car_mode and spec.method != "catgt" else None)
+    if system == "neuropixels" and spec.method == "catgt":
+        return _run_catgt_preprocessing(config, directory, jobs, previous)
+
+    if spec.motion == "medicine":
+        si.check_medicine()
+    folder = directory
+    if spec.motion:
+        folder = motion_folder(directory, spec.motion)
+        if folder.exists():
+            shutil.rmtree(folder)              # this preset's, made with other settings
+    t0 = time.perf_counter()
     if system == "blackrock":
-        recording = si.build_chain(_read_blackrock(config), spec, jobs, rows)
-        path = si.write(recording, directory / f"{config.blackrock.spike_file.stem}.bin", jobs)
-        return _record_of(recording, path, steps=_si_steps(spec))
+        recording, motion_info = si.build_chain(_read_blackrock(config), spec, jobs, rows)
+        target = folder / f"{config.blackrock.spike_file.stem}.bin"
+    else:
+        info = _neuropixels_stream(config)
+        recording, motion_info = si.build_chain(
+            si.read_neuropixels(
+                info.path, info.n_chan, info.fs, info.sy_index, _has_spikeglx_meta(config)
+            ),
+            spec,
+            jobs,
+            rows,
+        )
+        target = folder / f"{info.path.stem}.bin"
+    t_built = time.perf_counter()
+    _discard_binary_record(target)
+    path = si.write(recording, target, jobs)
+    t_written = time.perf_counter()
 
-    if spec.method == "catgt":
-        return _run_catgt_preprocessing(config, directory, jobs)
+    stages = _motion_stages(spec.motion, motion_info, t_built - t0)
+    stages.append(_stage(
+        "spikeinterface: filter, reference"
+        + (", interpolate motion" if spec.motion else "") + " + write",
+        t_written - t_built,
+    ))
+    if motion_info is not None:
+        stages.append(_save_motion(config, system, folder, recording, motion_info,
+                                   spec.motion))
+    return _record_of(recording, path, steps=_si_steps(spec), stages=stages)
 
-    info = _neuropixels_stream(config)
-    recording = si.build_chain(
-        si.read_neuropixels(
-            info.path, info.n_chan, info.fs, info.sy_index, _has_spikeglx_meta(config)
-        ),
-        spec,
-        jobs,
-        rows,
+
+def _stage(step: str, seconds: float | None, note: str | None = None) -> dict[str, Any]:
+    """One row of ``record["stages"]``."""
+    row: dict[str, Any] = {"step": step,
+                           "seconds": None if seconds is None else round(float(seconds), 2)}
+    if note:
+        row["note"] = note
+    return row
+
+
+def _motion_stages(preset: str | None, motion_info: dict | None,
+                   construct_s: float) -> list[dict[str, Any]]:
+    """Motion estimation's rows, from SpikeInterface's own ``run_times``.
+
+    Those are measured inside ``correct_motion`` anyway. Whatever they do not
+    cover of building the chain -- noise levels, set-up -- is its own row, so
+    the rows add up to the time actually spent.
+    """
+    if motion_info is None:
+        return []
+    run_times = {k: float(v) for k, v in (motion_info.get("run_times") or {}).items()}
+    rows = [_stage(f"{preset}: {k.replace('_', ' ')}", v) for k, v in run_times.items()]
+    rest = construct_s - sum(run_times.values())
+    rows.append(_stage(f"{preset}: noise levels & set-up", max(rest, 0.0)))
+    return rows
+
+
+def _save_motion(
+    config: SessionConfig,
+    system: str,
+    folder: Path,
+    recording: Any,
+    motion_info: dict,
+    preset: str,
+) -> dict[str, Any]:
+    """Keep what motion correction measured, and draw it. Returns its stage row.
+
+    ``preprocessed/motion_<preset>/``, beside the binary: ``drift.npz`` (the motion, and a subsample of the
+    peaks before and after correction) and the two figures. A failure here is
+    a warning: the corrected binary is already written, and an hour of
+    preprocessing is not discarded over a figure.
+    """
+    import time
+
+    from ._preprocess import motion as motion_record
+    from ._preprocess import si
+
+    t0 = time.perf_counter()
+    try:
+        drift = si.peak_drift(recording, motion_info, motion_record.DRIFT_PEAKS)
+        if drift is None:
+            log.warning("%s estimated no motion; no drift figures", preset)
+            return _stage("drift record + figures", time.perf_counter() - t0, "no motion")
+        drift["preset"] = preset
+        motion_record.save_drift(folder, drift)
+        _draw_drift(config, system, folder, drift)
+    except Exception as error:  # the binary is written; the figures are extra
+        log.warning("could not save the drift record/figures in %s (%s: %s)",
+                    folder, type(error).__name__, error)
+        return _stage("drift record + figures", time.perf_counter() - t0, "failed")
+    log.info("drift record and figures -> %s", folder)
+    return _stage("drift record + figures", time.perf_counter() - t0)
+
+
+#: The figures :func:`_draw_drift` writes. Not Kilosort's names
+#: (``drift_scatter.png``/``drift_amount.png``), which it writes when *it*
+#: corrects drift: a re-sort merges into the folder, and the two must not be
+#: mistaken for each other.
+DRIFT_FIGURES = ("motion_drift_scatter.png", "motion_drift_amount.png")
+
+
+def _draw_drift(config: SessionConfig, system: str, folder: Path, drift: dict) -> None:
+    """Render ``drift`` into ``folder``: before/after rasters, and the motion."""
+    from ._plots import motion as motion_plots
+    from ._plots.summary import save_figure
+    from ._preprocess import motion as motion_record
+
+    t_edges, d_edges = motion_record.drift_raster_edges(
+        drift["times_s"], [drift["depth_raw_um"], drift["depth_corrected_um"]]
     )
-    path = si.write(recording, directory / f"{info.path.stem}.bin", jobs)
-    return _record_of(recording, path, steps=_si_steps(spec))
+    before = motion_record.compute_drift_raster(
+        drift["times_s"], drift["depth_raw_um"], drift["amplitude"], t_edges, d_edges)
+    after = motion_record.compute_drift_raster(
+        drift["times_s"], drift["depth_corrected_um"], drift["amplitude"], t_edges, d_edges)
+    label = f"{config.session} | {stream_label(system)} | {drift['preset']}"
+    shown = len(drift["times_s"])
+    save_figure(
+        motion_plots.plot_drift_rasters(
+            before, after, t_edges, d_edges,
+            title=f"{label} | peak amplitude across time and depth "
+                  f"({shown:,} of {drift['n_peaks']:,} peaks)",
+        ),
+        folder / DRIFT_FIGURES[0],
+    )
+    save_figure(
+        motion_plots.plot_motion_traces(
+            drift["temporal_bins_s"], drift["spatial_bins_um"], drift["displacement_um"],
+            title=f"{label} | estimated motion",
+        ),
+        folder / DRIFT_FIGURES[1],
+    )
 
 
 def _has_spikeglx_meta(config: SessionConfig) -> bool:
@@ -585,12 +814,198 @@ def _record_of(recording: Any, path: Path, steps: list[str], **extra: Any) -> di
 
 
 def _run_catgt_preprocessing(
-    config: SessionConfig, directory: Path, jobs: dict[str, Any]
+    config: SessionConfig,
+    directory: Path,
+    jobs: dict[str, Any],
+    previous: dict | None = None,
 ) -> dict[str, Any]:
-    """Filter the AP band with CatGT, extracting the sync edges in the same pass."""
+    """Filter the AP band with CatGT (extracting the sync edges in the same
+    pass), then correct motion when the session asks.
+
+    **Two stages, cached separately.** CatGT's output does not depend on
+    ``motion``, so ``preprocessed/catgt/`` has its own record
+    (:func:`_catgt_stage`), and switching motion correction on, off or to
+    another preset re-runs only that -- not a full CatGT pass over the raw
+    AP binary.
+    """
+    import time
+
+    from ._io import spikeglx
+    from ._preprocess import si
+
+    spec = config.neuropixels.preprocess
+    if spec.motion == "medicine":
+        si.check_medicine()
+    stage, note = _catgt_stage(config, directory / "catgt", previous)
+    record = {k: stage[k] for k in _CATGT_STAGE_FIELDS if k in stage}
+    made = stage.get("timing") or {}
+    stages = [_stage("CatGT: filter, reference, gfix, sync edges", made.get("seconds"), note)]
+    if spec.motion is None:
+        return {**record, "stages": stages}
+
+    # CatGT has no motion correction, so its output goes through SpikeInterface
+    # once more. The CatGT file stays: it is what the edges came from, and the
+    # record names both.
+    out = spikeglx.stream_info(Path(stage["binary"]))
+    folder = motion_folder(directory, spec.motion)
+    if folder.exists():
+        shutil.rmtree(folder)                  # this preset's, made with other settings
+    t0 = time.perf_counter()
+    corrected, motion_info = si.motion_chain(
+        si.read_neuropixels(out.path, out.n_chan, out.fs, out.sy_index, has_meta=True),
+        spec.motion,
+        jobs,
+    )
+    t_built = time.perf_counter()
+    path = si.write(corrected, folder / f"{out.path.stem}.motion.bin", jobs)
+    t_written = time.perf_counter()
+    stages += _motion_stages(spec.motion, motion_info, t_built - t0)
+    stages.append(_stage(f"{spec.motion}: interpolate motion + write", t_written - t_built))
+    stages.append(_save_motion(config, "neuropixels", folder, corrected, motion_info,
+                               spec.motion))
+    return {
+        **record,
+        **_record_of(corrected, path,
+                     steps=record["steps"] + [f"correct_motion preset={spec.motion}"]),
+        "catgt_binary": str(out.path),
+        "stages": stages,
+    }
+
+
+#: What the CatGT stage's record says about its output, carried into the
+#: binary's own ``preprocess.json`` (``extract_sync`` reads ``edge_dir`` and
+#: ``extractors`` there).
+_CATGT_STAGE_FIELDS = ("binary", "n_chan", "fs", "n_samples", "steps", "trimmed_s",
+                       "extractors", "edge_dir")
+
+
+def _catgt_stage_expected(config: SessionConfig) -> dict[str, Any]:
+    """What CatGT's output has to have been made from: everything the binary
+    depends on except ``motion``, which is applied after it."""
+    expected = _preprocess_expected(config, "neuropixels")
+    expected["settings"] = {k: v for k, v in expected["settings"].items() if k != "motion"}
+    return expected
+
+
+def _catgt_stage(
+    config: SessionConfig, dest: Path, previous: dict | None
+) -> tuple[dict[str, Any], str | None]:
+    """CatGT's output for this session -- reused when its record still matches,
+    else made. Returns its record and the timing note (None when made now:
+    the row then reads like the rest of this preprocessing).
+
+    The record (``catgt/preprocess.json``) is written only after CatGT
+    finished and its output was checked; :func:`.catgt.fresh_dest` empties
+    the folder, record included, before CatGT starts, so a run cut short is
+    never reused. ``previous`` is the binary's record from before this
+    change split the stages: CatGT output it vouches for is adopted once
+    rather than made again.
+    """
+    import time
+    from datetime import datetime
+
+    expected = _catgt_stage_expected(config)
+    stage = provenance.read(dest)
+    reason = _catgt_stage_problem(stage, expected)
+    if reason is None:
+        made = stage.get("timing") or {}
+        log.info("reusing CatGT's output %s (made %s on %s)", stage["binary"],
+                 made.get("finished", "?"), made.get("machine", "?"))
+        return stage, _reuse_note(made)
+
+    adopted = _adopt_catgt_stage(previous, expected)
+    if adopted is not None:
+        provenance.write(dest, adopted)
+        log.info("reusing CatGT's output %s, recorded by the previous preprocessing",
+                 adopted["binary"])
+        return adopted, _reuse_note(adopted.get("timing") or {})
+
+    log.info("running CatGT (%s)", reason)
+    started = time.perf_counter()
+    stage = _run_catgt(config, dest)
+    stage.update(expected)
+    stage["timing"] = {
+        "seconds": round(time.perf_counter() - started, 2),
+        "machine": config.machine.name,
+        "finished": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    provenance.write(dest, stage)
+    return stage, None
+
+
+def _reuse_note(made: dict[str, Any]) -> str:
+    if made.get("finished"):
+        return f"reused: made {made['finished']} on {made.get('machine', '?')}"
+    return "reused: made before per-stage times were recorded"
+
+
+def _catgt_stage_problem(stage: dict | None, expected: dict[str, Any]) -> str | None:
+    """Why CatGT's output on disk cannot be reused, or None if it can."""
+    reasons = provenance.stale_reasons(stage, expected)
+    if reasons:
+        return "; ".join(reasons)
+    return _binary_size_problem(stage)
+
+
+def _binary_size_problem(record: dict[str, Any]) -> str | None:
+    """A recorded binary that is gone, or not the size its shape says."""
+    try:
+        path = Path(record["binary"])
+        expected = int(record["n_chan"]) * int(record["n_samples"]) * 2
+    except (KeyError, TypeError, ValueError):
+        return "its record does not name a binary"
+    if not path.exists():
+        return f"{path} is gone"
+    if path.stat().st_size != expected:
+        return f"{path} is {path.stat().st_size} bytes, not {expected}"
+    return None
+
+
+def _adopt_catgt_stage(previous: dict | None, expected: dict[str, Any]) -> dict | None:
+    """The CatGT stage record a pre-split ``preprocess.json`` vouches for, or None.
+
+    That record was written only after CatGT *and* any motion correction
+    finished, so its CatGT output is complete. Adopted only when everything
+    but ``motion`` matches and the file is still the size of its shape. Its
+    time is kept only when there was no motion correction to share it with.
+    """
+    from ._io import spikeglx
+
+    if not previous or previous.get("engine") != "catgt" or not previous.get("edge_dir"):
+        return None
+    was = dict(previous)
+    was["settings"] = {k: v for k, v in (previous.get("settings") or {}).items()
+                       if k != "motion"}
+    if provenance.stale_reasons(was, expected):
+        return None
+    binary = previous.get("catgt_binary") or previous.get("binary")
+    try:
+        out = spikeglx.stream_info(Path(binary))
+    except (OSError, ValueError, TypeError):
+        return None
+    stage = {
+        "binary": str(out.path), "n_chan": out.n_chan, "fs": out.fs,
+        "n_samples": out.n_samples,
+        "steps": [s for s in previous.get("steps") or [] if s.startswith("CatGT")],
+        "trimmed_s": previous.get("trimmed_s"),
+        "extractors": previous.get("extractors"),
+        "edge_dir": previous["edge_dir"],
+        **expected,
+    }
+    if _binary_size_problem(stage) is not None:
+        return None
+    made = previous.get("timing") or {}
+    alone = not (previous.get("settings") or {}).get("motion")
+    stage["timing"] = {**made, "seconds": made.get("seconds") if alone else None}
+    if not alone or not made:
+        stage["timing"].pop("finished", None)
+    return stage
+
+
+def _run_catgt(config: SessionConfig, dest: Path) -> dict[str, Any]:
+    """Run CatGT into a fresh ``dest``. Returns what it made, for the record."""
     from ._io import spikeglx
     from ._preprocess import catgt as catgt_pre
-    from ._preprocess import si
 
     npx = config.neuropixels
     spec = npx.preprocess
@@ -607,7 +1022,6 @@ def _run_catgt_preprocessing(
         )
 
     extractors = extract.catgt_extractors(config, layout)
-    dest = directory / "catgt"
     excluded = _catgt_excluded(config)
     args = catgt_pre.build_preprocess_args(layout, spec, dest, extractors, excluded)
     launcher = catgt.catgt_script(config.machine.catgt_dir)
@@ -634,7 +1048,7 @@ def _run_catgt_preprocessing(
     trimmed = catgt_pre.trimmed_seconds(raw.n_samples, out.n_samples, raw.fs)
     if trimmed:
         log.info("CatGT trimmed %.4f s off the end of %s", trimmed, raw.path.name)
-    record: dict[str, Any] = {
+    return {
         "binary": str(out.path),
         "n_chan": out.n_chan,
         "fs": out.fs,
@@ -643,23 +1057,6 @@ def _run_catgt_preprocessing(
         "trimmed_s": trimmed,
         "extractors": [e.to_flag() for e in extractors],
         "edge_dir": str(dest),
-    }
-    if spec.motion is None:
-        return record
-
-    # CatGT has no motion correction, so its output goes through SpikeInterface
-    # once more. The CatGT file stays: it is what the edges came from, and the
-    # record names both.
-    corrected = si.motion_chain(
-        si.read_neuropixels(out.path, out.n_chan, out.fs, out.sy_index, has_meta=True),
-        spec.motion,
-        jobs,
-    )
-    path = si.write(corrected, directory / f"{out.path.stem}.motion.bin", jobs)
-    return {
-        **record,
-        **_record_of(corrected, path, steps=record["steps"] + [f"correct_motion preset={spec.motion}"]),
-        "catgt_binary": str(out.path),
     }
 
 
@@ -851,6 +1248,9 @@ def _kilosort_arguments(
     kwargs: dict[str, Any] = {"do_CAR": False}
     accepted = set(inspect.signature(run_kilosort).parameters)
 
+    overridden = config.nblocks_override(system)
+    if overridden:
+        log.info(overridden)
     for key, value in config.kilosort_for(system).items():
         if key in _RESERVED:
             raise ValueError(
@@ -950,6 +1350,7 @@ def sort_with_kilosort(
                 _clear_previous_curation(final_dir)
                 _publish(work_dir, final_dir)
                 _repoint_params(final_dir, binary)
+            _copy_drift_figures(binary.path.parent, final_dir)
         finally:
             if work_dir != final_dir:
                 shutil.rmtree(work_dir, ignore_errors=True)
@@ -1029,18 +1430,42 @@ def _sort_timing(
 
     record = provenance.read(config.paths.preprocessed_for(system)) or {}
     made = record.get("timing") or {}
-    label = f"{record.get('engine', 'preprocessing')} (band-pass, CAR, ...)"
-    if reused:
-        seconds = made.get("seconds")
-        note = (
-            f"made {made.get('finished')} on {made.get('machine')}"
-            if made else "made before preprocessing times were recorded"
-        )
-    else:
-        seconds, note = reuse_check_s, "made by this sort"
-
     steps: list[tm.Step] = [("loading", k, v) for k, v in loading.items()]
-    steps.append(("preprocessing", label, seconds))
+    notes: dict[str, str] = {}
+    stages = record.get("stages")
+    if stages:
+        # One row per stage, as preprocessing recorded it. A stage reused from
+        # an earlier run (CatGT, when only motion changed) keeps its own note.
+        whole = (
+            (f"made {made['finished']} on {made.get('machine', '?')}"
+             if made.get("finished") else "made before preprocessing times were recorded")
+            if reused else "made by this sort"
+        )
+        for row in stages:
+            steps.append(("preprocessing", row["step"], row.get("seconds")))
+            notes[row["step"]] = row.get("note") or whole
+        if not reused:
+            # What the stages do not cover of making the binary here: the
+            # reuse checks, reading the .meta, writing the record.
+            covered = sum(r.get("seconds") or 0.0 for r in stages
+                          if not (r.get("note") or "").startswith("reused"))
+            label = "preprocessing: checks & records"
+            steps.append(("preprocessing", label, max(reuse_check_s - covered, 0.0)))
+            notes[label] = "made by this sort"
+    else:
+        label = f"{record.get('engine', 'preprocessing')} (band-pass, CAR, ...)"
+        if reused:
+            seconds = made.get("seconds")
+            note = (
+                f"made {made.get('finished')} on {made.get('machine')}"
+                if made else "made before preprocessing times were recorded"
+            )
+            if made:
+                note += "; made before per-stage times were recorded"
+        else:
+            seconds, note = reuse_check_s, "made by this sort"
+        steps.append(("preprocessing", label, seconds))
+        notes[label] = note
     steps += tm.kilosort_steps(ops, kilosort_wall_s)
     steps += [("postprocessing", k, v) for k, v in postprocessing.items()]
 
@@ -1059,7 +1484,7 @@ def _sort_timing(
         "finished": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
     return tm.build_timing(
-        steps, run, notes={label: note}, extra={"input": source} if source else None
+        steps, run, notes=notes, extra={"input": source} if source else None
     )
 
 
@@ -1087,6 +1512,10 @@ def _work_dir(config: SessionConfig, system: str) -> Path | None:
 
 _PREVIOUS_CURATION = (
     ".phy", "phy.log", "cluster_*.tsv",
+    # drift figures of the old sort: Kilosort's own (nblocks > 0) and the ones
+    # copied from preprocessed/motion_<preset>/ (a SpikeInterface preset) -- a re-sort
+    # that makes neither must not leave the old ones describing it
+    "drift_amount.png", "drift_scatter.png", "motion_drift_*.png",
     # time_remapping's per-spike arrays, one per spike of the *old* sort
     "*_spike_seconds.npy", "*_spike_seconds_blackrock.npy",
     "*_spike_seconds_blackrock.json",
@@ -1115,6 +1544,24 @@ def _clear_previous_curation(final_dir: Path) -> None:
                 shutil.rmtree(path)
             else:
                 path.unlink()
+
+
+def _copy_drift_figures(binary_dir: Path, target: Path) -> None:
+    """Put the motion-correction figures beside the sorting made from them.
+
+    Where Kilosort's ``drift_*.png`` would be had it corrected the drift. They
+    sit beside the binary that was sorted (``preprocessed/motion_<preset>/``);
+    a binary without them (no motion correction, or made before they were
+    kept) leaves none here.
+    """
+    for name in DRIFT_FIGURES:
+        source = binary_dir / name
+        stale = target / name
+        if source.exists():
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, stale)
+        elif stale.exists():
+            stale.unlink()
 
 
 def _publish(work_dir: Path, final_dir: Path) -> None:
@@ -1233,6 +1680,14 @@ def _dry_run(
             "status": "will be made: " + "; ".join(reasons),
             "steps": _planned_steps(config, system),
         }
+        if system == "neuropixels" and config.preprocess_for(system).method == "catgt":
+            directory = config.paths.preprocessed_for(system)
+            problem = _catgt_stage_problem(provenance.read(directory / "catgt"),
+                                           _catgt_stage_expected(config))
+            preprocessing["catgt"] = (
+                "reused (only what follows it is remade)" if problem is None
+                else f"will run: {problem}"
+            )
     else:
         binary = _binary_from_record(recorded)
         preprocessing = {"status": "reused", "steps": recorded.get("steps")}
@@ -1240,6 +1695,8 @@ def _dry_run(
     report: dict[str, Any] = {
         "probe": probe_summary(probe),
         "preprocessing": preprocessing,
+        **({"drift correction": config.nblocks_override(system)}
+           if config.nblocks_override(system) else {}),
         "binary": binary.summary(),
         "results_dir": final_dir,
     }
@@ -1265,8 +1722,9 @@ def _planned_binary(config: SessionConfig, system: str) -> Binary:
     directory = config.paths.preprocessed_for(system)
     if system == "blackrock":
         recording = _read_blackrock(config)
+        folder = motion_folder(directory, spec.motion) if spec.motion else directory
         return Binary(
-            directory / f"{config.blackrock.spike_file.stem}.bin",
+            folder / f"{config.blackrock.spike_file.stem}.bin",
             int(recording.get_num_channels()),
             float(recording.get_sampling_frequency()),
             True,
@@ -1283,10 +1741,11 @@ def _planned_binary(config: SessionConfig, system: str) -> Binary:
         path = directory / "catgt" / name
         n_chan = info.n_chan
         if spec.motion:
-            path = path.with_suffix(".motion.bin")
+            path = motion_folder(directory, spec.motion) / Path(name).with_suffix(".motion.bin").name
             n_chan -= info.sy_index is not None
     else:
-        path = directory / f"{info.path.stem}.bin"
+        folder = motion_folder(directory, spec.motion) if spec.motion else directory
+        path = folder / f"{info.path.stem}.bin"
         n_chan = info.n_chan - (info.sy_index is not None)
     return Binary(path, int(n_chan), float(info.fs), True)
 
@@ -4024,6 +4483,17 @@ def export_results(
     paths.update(_copy_records(config, system, out_dir))
     lap("write .mat, units.csv, manifest")
 
+    if figures:
+        # The sorting's drift figures, as published with it (not re-read from
+        # preprocessed/, which a later rewrite may have changed).
+        sorted_dir = config.paths.sorted_for(system)
+        for name in DRIFT_FIGURES:
+            shown, kept = sorted_dir / name, config.paths.figures_for(system) / name
+            if shown.exists():
+                kept.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(shown, kept)
+            elif kept.exists():
+                kept.unlink()
     if figures and unit_ids.size:
         figure_dir = config.paths.figures_for(system)
         units = _unit_page_data(phy, unit_ids, spike_times_s, table, measured, window)

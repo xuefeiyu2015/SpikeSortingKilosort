@@ -1283,11 +1283,14 @@ def run_all(
     checks.extend(check_env_names(machine, env_overrides))
     torch_info: dict[str, Any] | None = None
 
+    sorting_report: EnvReport | None = None
     for spec in ENV_SPECS:
         report = inspect_env(spec, machine, envs, active, env_overrides)
         checks.extend(env_checks(report))
         if spec.probe_torch and report.torch_info is not None:
             torch_info = report.torch_info
+        if spec.role == "sorting":
+            sorting_report = report
 
     checks.extend(check_gpu(machine, torch_info))
     checks.extend(check_external_tools(machine))
@@ -1295,6 +1298,53 @@ def run_all(
     checks.extend(check_machine_paths(machine))
     if config is not None:
         checks.extend(check_session(config))
+        checks.extend(check_motion_package(config, sorting_report))
+    return checks
+
+
+#: Motion-correction presets that need a package SpikeInterface does not bring.
+#: SpikeInterface imports it only at the motion-estimation step -- after
+#: detecting and localising every peak -- so without this the run fails late.
+MOTION_PACKAGES: dict[str, PackageSpec] = {
+    "medicine": PackageSpec(
+        "medicine",
+        "spikeinterface correct_motion(preset='medicine')",
+        ("preprocess (motion: medicine)", "sort_neuropixels"),
+        distribution="medicine-neuro",
+        declared=False,
+        docs="https://github.com/jazlab/medicine",
+    ),
+}
+
+
+def check_motion_package(config: SessionConfig, report: EnvReport | None) -> list[Check]:
+    """The package a session's ``preprocess.motion`` preset needs, in the sorting env."""
+    presets = {
+        config.preprocess_for(system).motion
+        for system in ("neuropixels", "blackrock")
+        if getattr(config, f"sorts_{system}")
+    }
+    checks: list[Check] = []
+    for preset in sorted(p for p in presets if p in MOTION_PACKAGES):
+        package = MOTION_PACKAGES[preset]
+        name = f"session:{config.session}:motion"
+        if report is None or report.python is None:
+            continue                       # the env itself is already reported
+        found = probe_env(report.python, [package]).get("packages", {})
+        if found.get(package.module, {}).get("present"):
+            checks.append(Check(
+                name=name, status=OK, section=SECTION_SESSION,
+                detail=f"motion: {preset} -- {package.dist} "
+                       f"{found[package.module].get('version') or ''}".rstrip(),
+            ))
+        else:
+            checks.append(Check(
+                name=name, status=MISSING, section=SECTION_SESSION,
+                detail=f"motion: {preset} needs {package.dist}, not installed in "
+                       f"'{report.name}'",
+                disables=package.disables,
+                fix=f"in '{report.name}': pip install {package.dist}",
+            ))
     return checks
 
 

@@ -6,6 +6,7 @@ compute anything, read files, or modify their inputs -- the numbers come from
 """
 
 from .probe import plot_probe_channel_order, plot_probe_geometry  # noqa: F401
+from .motion import plot_drift_rasters, plot_motion_traces  # noqa: F401
 from .summary import (  # noqa: F401
     plot_alignment_residuals,
     plot_amplitudes,

@@ -246,7 +246,7 @@ def test_every_tracked_kilosort_block_states_the_same_parameters():
         k: v for k, v in by_system["neuropixels"].items() if k not in hardware
     }
     assert by_system["blackrock"]["nblocks"] == 0
-    assert by_system["neuropixels"]["nblocks"] == 1
+    assert by_system["neuropixels"]["nblocks"] == 5      # non-rigid: a 4 mm NHP shank does not move as one piece
 
 
 def test_no_tracked_kilosort_block_names_a_setting_the_pipeline_owns():
@@ -1408,7 +1408,7 @@ def test_drift_correction_is_off_for_the_utah_array():
     session = cfg.load_session_config(CONFIG_DIR / "session_template_utah_probe.yaml", "windows_rig", CONFIG_DIR)
 
     assert session.kilosort_for("blackrock")["nblocks"] == 0
-    assert session.kilosort_for("neuropixels")["nblocks"] == 1
+    assert session.kilosort_for("neuropixels")["nblocks"] == 5
 
 
 def _load_session(tmp_path: Path, body: str):

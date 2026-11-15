@@ -324,7 +324,18 @@ kilosort: {}
 # Drift correction
 #   nblocks is how many depth blocks Kilosort tracks: 1 is rigid (the whole shank
 #   moves together), 5 gives 5 non-overlapping blocks plus 4 straddling their
-#   boundaries, 0 disables it.
+#   boundaries, 0 disables it. The Neuropixels default here is 5: a 4 mm NHP
+#   probe does not move as one piece -- the tip and the top drift by different
+#   amounts -- and rigid correction fits one shift to both. Kilosort then writes
+#   drift_amount.png and drift_scatter.png beside the sorting.
+#
+#   Or correct it before Kilosort instead, with preprocess.motion: Kilosort
+#   then sorts with nblocks: 0 whatever is written here (the log says so), and
+#   the value here is used again once motion is null. Each preset writes to
+#   preprocessed/motion_<preset>/ -- its binary, what it measured, and
+#   motion_drift_scatter.png (peaks across time and depth, before and after
+#   correction) and motion_drift_amount.png (the estimated motion) go beside the
+#   sorting and into export/figures/.
 #
 #   It is off on the Utah array because the correction interpolates between
 #   neighbouring contacts with a Gaussian kernel of sig_interp = 20 um. At 400 um
@@ -373,9 +384,20 @@ kilosort: {}
 #                   a sample apart; this re-aligns them (CatGT tshift, which is
 #                   on unless -no_tshift). Needs the .meta.
 #     motion        null keeps drift correction inside Kilosort (nblocks). A
-#                   SpikeInterface correct_motion preset (dredge, ...) corrects it
-#                   here instead and writes a motion-corrected binary; nblocks
-#                   must then be 0, or drift is corrected twice -- refused at load.
+#                   SpikeInterface correct_motion preset corrects it here
+#                   instead and writes a motion-corrected binary; Kilosort's
+#                   nblocks is then 0 automatically, so drift is never
+#                   corrected twice. Every channel is kept (border_mode
+#                   force_extrapolate), whatever the preset's own default.
+#                   Presets: dredge, dredge_fast, medicine, nonrigid_accurate,
+#                   nonrigid_fast_and_accurate, rigid_fast, kilosort_like.
+#                   medicine needs one more package in the sorting env:
+#                   pip install medicine-neuro (check_env.py --config says so).
+#                   With CatGT, changing only this re-runs only the motion
+#                   step: CatGT's output in preprocessed/catgt/ is reused.
+#                   Each preset keeps its own folder, motion_<preset>/, so
+#                   switching back to one reuses it; each holds a binary the
+#                   size of the recording -- delete a folder to free it.
 #
 #   The result is written to <system>_dir/preprocessed/ -- a .bin the size of
 #   the recording, with preprocess.json beside it saying exactly what made it --

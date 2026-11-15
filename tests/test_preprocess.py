@@ -98,28 +98,40 @@ def test_a_block_that_cannot_be_done_as_written_is_refused_at_load(tmp_path, blo
         _load(tmp_path, block)
 
 
-def test_motion_correction_with_kilosort_drift_correction_still_on_is_refused(tmp_path):
-    # Drift corrected twice: once by DREDge, once by Kilosort's nblocks.
-    with pytest.raises(ValueError, match="corrected twice"):
-        _load(tmp_path, _NPX + "  preprocess:\n    motion: dredge\n")
-    # ...nblocks: 0 is what lets it through.
+def test_motion_correction_turns_kilosorts_drift_correction_off(tmp_path):
+    # The two are alternatives: a preset corrects drift before Kilosort, so
+    # Kilosort sorts with nblocks: 0 whatever the block states, and the stated
+    # value is the one used once motion is null again.
     session = _load(
-        tmp_path, _NPX + "  preprocess:\n    motion: dredge\n  kilosort:\n    nblocks: 0\n"
+        tmp_path, _NPX + "  preprocess:\n    motion: dredge\n  kilosort:\n    nblocks: 5\n")
+    assert session.kilosort_for("neuropixels")["nblocks"] == 0
+    assert "nblocks: 5 is not used" in session.nblocks_override("neuropixels")
+
+    plain = _load(tmp_path, _NPX + "  kilosort:\n    nblocks: 5\n")
+    assert plain.kilosort_for("neuropixels")["nblocks"] == 5
+    assert plain.nblocks_override("neuropixels") is None
+
+    # nblocks stated 0, or not stated with motion: nothing to report but still 0.
+    stated_zero = _load(
+        tmp_path, _NPX + "  preprocess:\n    motion: dredge\n  kilosort:\n    nblocks: 0\n")
+    assert stated_zero.nblocks_override("neuropixels") is None
+    unstated = _load(tmp_path, _NPX + "  preprocess:\n    motion: dredge\n")
+    assert unstated.kilosort_for("neuropixels")["nblocks"] == 0
+    assert unstated.nblocks_override("neuropixels") is not None   # Kilosort's default is 1
+
+
+def test_motion_turns_drift_correction_off_for_every_probe(tmp_path):
+    # A by_probe: nblocks is overridden too, so no probe is corrected twice.
+    session = _load(
+        tmp_path,
+        "neuropixels:\n"
+        "  bin_files:\n    - '/a/r_g0_t0.imec0.ap.bin'\n    - '/a/r_g0_t0.imec1.ap.bin'\n"
+        "  preprocess:\n    motion: dredge\n"
+        "  kilosort:\n    nblocks: 5\n"
+        "  by_probe:\n    1:\n      kilosort:\n        nblocks: 1\n",
     )
-    assert session.preprocess_for("neuropixels").motion == "dredge"
-
-
-def test_motion_is_checked_for_every_probe_not_just_the_shared_block(tmp_path):
-    # A by_probe: nblocks would otherwise turn drift correction back on for one.
-    with pytest.raises(ValueError, match=r"nblocks \(imec1\) is 1"):
-        _load(
-            tmp_path,
-            "neuropixels:\n"
-            "  bin_files:\n    - '/a/r_g0_t0.imec0.ap.bin'\n    - '/a/r_g0_t0.imec1.ap.bin'\n"
-            "  preprocess:\n    motion: dredge\n"
-            "  kilosort:\n    nblocks: 0\n"
-            "  by_probe:\n    1:\n      kilosort:\n        nblocks: 1\n",
-        )
+    assert [stream.kilosort_for("neuropixels")["nblocks"]
+            for _, stream in session.per_probe()] == [0, 0]
 
 
 def test_a_typo_inside_the_preprocess_block_names_the_real_key(tmp_path):
@@ -362,7 +374,9 @@ def test_the_spikeinterface_chain_keeps_length_scale_and_type():
     from spikesorting._preprocess import si
 
     raw = _recording()
-    out = si.build_chain(raw, cfg.replace(cfg.NEUROPIXELS_PREPROCESS, gfix=None))
+    out, motion_info = si.build_chain(raw, cfg.replace(cfg.NEUROPIXELS_PREPROCESS, gfix=None))
+
+    assert motion_info is None                              # no motion asked for
 
     assert out.get_dtype() == np.int16
     assert out.get_num_samples() == raw.get_num_samples()   # sample for sample
@@ -388,8 +402,8 @@ def test_the_median_is_taken_over_the_reference_rows_only():
     spec = cfg.replace(cfg.BLACKROCK_PREPROCESS, gfix=None)
     middle = slice(3000, 27000)                             # away from filter edges
 
-    every_row = si.build_chain(raw, spec).get_traces()[middle, 0].astype(float)
-    electrodes = si.build_chain(raw, spec, reference_rows=[0, 1]).get_traces()[middle, 0]
+    every_row = si.build_chain(raw, spec)[0].get_traces()[middle, 0].astype(float)
+    electrodes = si.build_chain(raw, spec, reference_rows=[0, 1])[0].get_traces()[middle, 0]
 
     assert np.abs(every_row).max() > 300                    # half the signal left in
     assert np.abs(electrodes).max() <= 1                    # the shared signal removed
@@ -688,3 +702,408 @@ def test_a_catgt_binary_made_before_exclusions_were_recorded_is_still_reused(tmp
     with_key = _catgt_session(tmp_path, extra="  kilosort:\n    bad_channels: [2]\n")
     assert provenance.stale_reasons(
         expected, pipeline._preprocess_expected(with_key, "neuropixels"))
+
+
+# ---------------------------------------------------------------------------
+# CatGT and motion correction are cached as two stages
+# ---------------------------------------------------------------------------
+
+
+_MOTION = ""                       # nblocks needs no change: motion turns it off
+
+
+class _FakeRecording:
+    """Just enough of a recording for the record (``_record_of``)."""
+
+    def __init__(self, n_chan, n_samples, fs=30000.0):
+        self.n_chan, self.n_samples, self.fs = n_chan, n_samples, fs
+
+    def get_num_segments(self):
+        return 1
+
+    def get_num_frames(self, segment_index=0):
+        return self.n_samples
+
+    def get_num_channels(self):
+        return self.n_chan
+
+    def get_sampling_frequency(self):
+        return self.fs
+
+
+def _synthetic_drift(n=4000, duration_s=5.0, shift_um=60.0):
+    """Peaks on three units whose depth ramps by ``shift_um`` over the session."""
+    rng = np.random.default_rng(0)
+    times = np.sort(rng.uniform(0, duration_s, n))
+    home = rng.choice([200.0, 800.0, 1500.0], n)
+    moved = shift_um * times / duration_s
+    bins = np.linspace(0, duration_s, 6)
+    return {
+        "times_s": times,
+        "depth_raw_um": home + moved,
+        "depth_corrected_um": home + rng.normal(0, 1, n),
+        "amplitude": -rng.uniform(50, 150, n),
+        "temporal_bins_s": bins,
+        "spatial_bins_um": np.array([400.0, 1200.0]),
+        "displacement_um": np.stack([shift_um * bins / duration_s] * 2, axis=1),
+        "n_peaks": 10 * n,
+    }
+
+
+def _fake_motion(monkeypatch):
+    """Replace SpikeInterface's motion step; record which presets ran."""
+    from spikesorting._preprocess import si
+
+    ran = []
+
+    def motion_chain(recording, preset, jobs=None):
+        ran.append(preset)
+        out = spikeglx.stream_info(recording)
+        info = {"run_times": {"detect_and_localize": 2.0, "estimate_motion": 1.0},
+                "peaks": [], "peak_locations": [], "motion": object()}
+        return _FakeRecording(out.n_chan - 1, out.n_samples, out.fs), info
+
+    def write(recording, path, jobs=None):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\0" * (recording.n_chan * recording.n_samples * 2))
+        return path
+
+    monkeypatch.setattr(si, "read_neuropixels", lambda path, *a, **k: Path(path))
+    monkeypatch.setattr(si, "motion_chain", motion_chain)
+    monkeypatch.setattr(si, "write", write)
+    monkeypatch.setattr(si, "peak_drift", lambda rec, info, n_max: _synthetic_drift())
+    monkeypatch.setattr(si, "check_medicine", lambda: None)
+    return ran
+
+
+def test_changing_only_the_motion_preset_does_not_run_catgt_again(tmp_path, monkeypatch):
+    # CatGT's output does not depend on motion: switching DREDge on, to
+    # another preset, or off must not cost a full CatGT pass over the raw file.
+    from spikesorting import pipeline
+
+    calls = _fake_catgt(monkeypatch, writes=True)
+    ran = _fake_motion(monkeypatch)
+    plain = pipeline._binary_for(_catgt_session(tmp_path), "neuropixels")
+    dredge = pipeline._binary_for(
+        _catgt_session(tmp_path, preprocess="    motion: dredge\n", extra=_MOTION), "neuropixels")
+    medicine = pipeline._binary_for(
+        _catgt_session(tmp_path, preprocess="    motion: medicine\n", extra=_MOTION), "neuropixels")
+    session = _catgt_session(tmp_path)
+    off = pipeline._binary_for(session, "neuropixels")
+
+    assert len(calls) == 1                                  # CatGT ran once
+    assert ran == ["dredge", "medicine"]
+    assert dredge.path.name.endswith(".motion.bin")
+    assert dredge.path.parent.name == "motion_dredge"
+    assert medicine.path.parent.name == "motion_medicine"
+    assert dredge.path.exists() and medicine.path.exists()  # neither overwrote the other
+    assert off.path == plain.path and off.path.exists()
+    directory = session.paths.preprocessed_for("neuropixels")
+    record = provenance.read(directory)
+    assert record["edge_dir"] and record["extractors"]     # extract_sync still finds them
+
+    # A setting CatGT does depend on still runs it.
+    pipeline._binary_for(_catgt_session(tmp_path, highpass=500), "neuropixels")
+    assert len(calls) == 2
+
+
+def test_catgt_output_a_pre_split_record_vouches_for_is_adopted(tmp_path, monkeypatch):
+    # A binary preprocessed before the stages were split has no catgt/ record;
+    # its preprocess.json was written only after CatGT finished, so the first
+    # motion change after the update does not run CatGT again either.
+    from spikesorting import pipeline
+
+    calls = _fake_catgt(monkeypatch, writes=True)
+    _fake_motion(monkeypatch)
+    session = _catgt_session(tmp_path, preprocess="    motion: dredge\n", extra=_MOTION)
+    pipeline._binary_for(session, "neuropixels")
+    directory = session.paths.preprocessed_for("neuropixels")
+    (directory / "catgt" / provenance.SIDECAR).unlink()    # as before this change
+
+    pipeline._binary_for(_catgt_session(tmp_path), "neuropixels")
+
+    assert len(calls) == 1
+    stage = provenance.read(directory / "catgt")
+    assert stage is not None
+    assert stage["timing"]["seconds"] is None              # shared with DREDge: unknown
+
+
+def test_catgt_output_is_not_adopted_from_a_record_with_other_filters(tmp_path, monkeypatch):
+    from spikesorting import pipeline
+
+    calls = _fake_catgt(monkeypatch, writes=True)
+    session = _catgt_session(tmp_path)
+    pipeline._binary_for(session, "neuropixels")
+    (session.paths.preprocessed_for("neuropixels") / "catgt" / provenance.SIDECAR).unlink()
+
+    pipeline._binary_for(_catgt_session(tmp_path, highpass=500), "neuropixels")
+    assert len(calls) == 2
+
+
+def test_the_drift_record_and_figures_are_kept_and_follow_the_sorting(tmp_path, monkeypatch):
+    from spikesorting import pipeline
+    from spikesorting._preprocess import motion as motion_record
+
+    _fake_catgt(monkeypatch, writes=True)
+    _fake_motion(monkeypatch)
+    session = _catgt_session(tmp_path, preprocess="    motion: dredge\n", extra=_MOTION)
+    binary = pipeline._binary_for(session, "neuropixels")
+    folder = binary.path.parent
+    assert folder.name == "motion_dredge"
+
+    drift = motion_record.load_drift(folder)
+    assert drift["preset"] == "dredge" and drift["n_peaks"] == 40000
+    for name in pipeline.DRIFT_FIGURES:
+        assert (folder / name).stat().st_size > 0
+
+    sorted_dir = tmp_path / "sorted"
+    pipeline._copy_drift_figures(binary.path.parent, sorted_dir)
+    assert all((sorted_dir / n).exists() for n in pipeline.DRIFT_FIGURES)
+
+    # Motion turned off: the binary has no figures, so the sorting keeps none.
+    plain = pipeline._binary_for(_catgt_session(tmp_path), "neuropixels")
+    pipeline._copy_drift_figures(plain.path.parent, sorted_dir)
+    assert not any((sorted_dir / n).exists() for n in pipeline.DRIFT_FIGURES)
+
+
+def test_a_failed_figure_does_not_fail_the_preprocessing(tmp_path, monkeypatch):
+    from spikesorting import pipeline
+    from spikesorting._preprocess import si
+
+    _fake_catgt(monkeypatch, writes=True)
+    _fake_motion(monkeypatch)
+
+    def broken(*a, **k):
+        raise RuntimeError("no display")
+
+    monkeypatch.setattr(si, "peak_drift", broken)
+    session = _catgt_session(tmp_path, preprocess="    motion: dredge\n", extra=_MOTION)
+    binary = pipeline._binary_for(session, "neuropixels")
+
+    assert binary.path.exists()
+    record = provenance.read(session.paths.preprocessed_for("neuropixels"))
+    assert record["stages"][-1] == {"step": "drift record + figures",
+                                    "seconds": record["stages"][-1]["seconds"],
+                                    "note": "failed"}
+
+
+def test_each_preprocessing_stage_is_its_own_row_in_the_timing(tmp_path, monkeypatch):
+    from datetime import datetime
+
+    from spikesorting import pipeline
+
+    _fake_catgt(monkeypatch, writes=True)
+    _fake_motion(monkeypatch)
+    pipeline._binary_for(_catgt_session(tmp_path), "neuropixels")
+    session = _catgt_session(tmp_path, preprocess="    motion: dredge\n", extra=_MOTION)
+    pipeline._binary_for(session, "neuropixels")
+
+    timing = pipeline._sort_timing(
+        session, "neuropixels", None, datetime.now().astimezone(),
+        loading={}, reused=True, reuse_check_s=0.0, ops={}, kilosort_wall_s=0.0,
+        postprocessing={},
+    )
+    rows = {r["step"]: r for r in timing["phases"]["preprocessing"]["steps"]}
+    catgt_row = rows["CatGT: filter, reference, gfix, sync edges"]
+    assert catgt_row["note"].startswith("reused: made ")   # from the first run
+    assert rows["dredge: detect and localize"]["seconds"] == 2.0
+    assert rows["dredge: estimate motion"]["seconds"] == 1.0
+    assert "dredge: noise levels & set-up" in rows
+    assert "dredge: interpolate motion + write" in rows
+    assert "drift record + figures" in rows
+    assert rows["dredge: estimate motion"]["note"].startswith("made ")
+
+
+def test_medicine_is_checked_before_any_work(monkeypatch):
+    import sys
+
+    from spikesorting._preprocess import si
+
+    monkeypatch.setitem(sys.modules, "medicine", None)      # import fails
+    with pytest.raises(ImportError, match="pip install medicine-neuro"):
+        si.check_medicine()
+
+
+# ---------------------------------------------------------------------------
+# The drift record itself (pure)
+# ---------------------------------------------------------------------------
+
+
+def test_the_peaks_kept_are_a_deterministic_stride_over_all_of_them():
+    from spikesorting._preprocess import motion as motion_record
+
+    assert np.array_equal(motion_record.subsample_indices(5, 10), np.arange(5))
+    kept = motion_record.subsample_indices(1_000_000, 1000)
+    assert kept.size == 1000 and kept[0] == 0 and kept[-1] == 999_999
+    assert np.ptp(np.diff(kept)) <= 1                       # evenly spread
+    assert np.array_equal(kept, motion_record.subsample_indices(1_000_000, 1000))
+
+
+def test_the_raster_shows_drift_before_and_none_after():
+    from spikesorting._preprocess import motion as motion_record
+
+    drift = _synthetic_drift(n=20000, shift_um=60.0)
+    t_edges, d_edges = motion_record.drift_raster_edges(
+        drift["times_s"], [drift["depth_raw_um"], drift["depth_corrected_um"]],
+        time_bin_s=1.0, depth_bin_um=5.0)
+    before = motion_record.compute_drift_raster(
+        drift["times_s"], drift["depth_raw_um"], drift["amplitude"], t_edges, d_edges)
+    after = motion_record.compute_drift_raster(
+        drift["times_s"], drift["depth_corrected_um"], drift["amplitude"], t_edges, d_edges)
+
+    centres = (d_edges[:-1] + d_edges[1:]) / 2
+    near = (centres > 150) & (centres < 300)                # the 200 um unit
+    first = centres[near][np.argmax(before[near, 0])]
+    last = centres[near][np.argmax(before[near, -1])]
+    assert last - first > 40                                # moved by ~60 um
+    first = centres[near][np.argmax(after[near, 0])]
+    last = centres[near][np.argmax(after[near, -1])]
+    assert abs(last - first) <= 5                           # held still
+    assert np.isclose(before.sum(), np.abs(drift["amplitude"]).sum())
+
+
+def test_the_drift_record_reads_back_and_a_missing_one_is_none(tmp_path):
+    from spikesorting._preprocess import motion as motion_record
+
+    drift = dict(_synthetic_drift(), preset="dredge")
+    motion_record.save_drift(tmp_path, drift)
+    back = motion_record.load_drift(tmp_path)
+    assert back["preset"] == "dredge" and back["n_peaks"] == drift["n_peaks"]
+    assert np.array_equal(back["depth_raw_um"], drift["depth_raw_um"])
+    assert motion_record.load_drift(tmp_path / "nowhere") is None
+
+
+def test_peak_drift_moves_the_same_peaks_by_the_estimated_motion():
+    # "After" is the peaks the motion was estimated from, shifted by it --
+    # nothing is detected twice.
+    pytest.importorskip("spikeinterface.sortingcomponents.motion")
+    import spikeinterface.core as sc
+    from spikeinterface.core.motion import Motion
+
+    from spikesorting._preprocess import si
+
+    fs, n = 30000.0, 300
+    recording = sc.NumpyRecording([np.zeros((int(10 * fs), 4), dtype=np.int16)],
+                                  sampling_frequency=fs)
+    recording.set_channel_locations(np.c_[np.zeros(4), np.linspace(440.0, 560.0, 4)])
+    peaks = np.zeros(n, dtype=[("sample_index", "int64"), ("channel_index", "int64"),
+                               ("amplitude", "float64"), ("segment_index", "int64")])
+    peaks["sample_index"] = np.linspace(0, 10 * fs - 1, n).astype(int)
+    peaks["amplitude"] = -100.0
+    locations = np.zeros(n, dtype=[("x", "float64"), ("y", "float64")])
+    locations["y"] = 500.0 + 3.0 * peaks["sample_index"] / fs      # 3 um/s drift
+    bins = np.arange(0.5, 10, 1.0)
+    motion = Motion(3.0 * bins[:, None], bins, np.array([500.0]))
+
+    drift = si.peak_drift(recording, {"motion": motion, "peaks": peaks,
+                                      "peak_locations": locations}, n_max=100)
+
+    assert len(drift["times_s"]) == 100 and drift["n_peaks"] == n
+    inside = (drift["times_s"] > 0.5) & (drift["times_s"] < 9.5)
+    assert np.allclose(drift["depth_corrected_um"][inside], 500.0, atol=1e-6)
+    assert np.ptp(drift["depth_raw_um"]) > 25
+    assert drift["displacement_um"].shape == (len(bins), 1)
+
+
+def test_motion_correction_keeps_every_channel_whatever_the_preset(monkeypatch):
+    # medicine's preset leaves interpolate_motion at "remove_channels", which
+    # drops sites drift carries off the probe; the channel map read from the
+    # .meta would then index the wrong rows.
+    pytest.importorskip("spikeinterface.preprocessing")
+    import spikeinterface.core as sc
+    import spikeinterface.preprocessing as spre
+
+    from spikesorting._preprocess import si
+
+    recording = sc.NumpyRecording([np.zeros((3000, 4), dtype=np.int16)],
+                                  sampling_frequency=30000.0)
+    probeinterface = pytest.importorskip("probeinterface")
+    probe = probeinterface.generate_linear_probe(num_elec=4, ypitch=20)
+    probe.set_device_channel_indices(np.arange(4))
+    recording = recording.set_probe(probe)
+    asked = {}
+
+    def correct_motion(rec, preset, output_motion_info, interpolate_motion_kwargs, **jobs):
+        asked.update(interpolate_motion_kwargs)
+        return rec, {"run_times": {}}
+
+    monkeypatch.setattr(spre, "correct_motion", correct_motion)
+    monkeypatch.setattr(si, "check_medicine", lambda: None)
+    out, _ = si.motion_chain(recording, "medicine")
+    assert asked == {"border_mode": "force_extrapolate"}
+    assert out.get_num_channels() == 4
+
+    monkeypatch.setattr(spre, "correct_motion", lambda rec, **k: (
+        rec.select_channels(rec.channel_ids[:3]), {"run_times": {}}))
+    with pytest.raises(RuntimeError, match="returned 3 channels from 4"):
+        si.motion_chain(recording, "medicine")
+
+
+def test_switching_back_to_a_preset_reuses_its_binary_and_record(tmp_path, monkeypatch):
+    # DREDge, then MEDiCINe, then DREDge again: the DREDge binary is still in
+    # motion_dredge/, so it is not made a third time -- and its record comes
+    # back verbatim, so a sorting made from it still recognises its binary.
+    from spikesorting import pipeline
+
+    _fake_catgt(monkeypatch, writes=True)
+    ran = _fake_motion(monkeypatch)
+    dredge = _catgt_session(tmp_path, preprocess="    motion: dredge\n")
+    medicine = _catgt_session(tmp_path, preprocess="    motion: medicine\n")
+    directory = dredge.paths.preprocessed_for("neuropixels")
+
+    first = pipeline._binary_for(dredge, "neuropixels")
+    at_sort = provenance.read(directory)                     # what run_info.json keeps
+    pipeline._binary_for(medicine, "neuropixels")
+    again = pipeline._binary_for(dredge, "neuropixels")
+
+    assert ran == ["dredge", "medicine"]
+    assert again.path == first.path
+    assert provenance.read(directory) == at_sort
+    run_info = {"preprocessing": at_sort}
+    assert pipeline._binary_changed_since_sort(dredge, "neuropixels", run_info,
+                                               again.path) is None
+
+
+def test_a_presets_binary_made_with_other_settings_is_remade_in_its_folder(tmp_path, monkeypatch):
+    from spikesorting import pipeline
+
+    _fake_catgt(monkeypatch, writes=True)
+    ran = _fake_motion(monkeypatch)
+    pipeline._binary_for(_catgt_session(tmp_path, preprocess="    motion: dredge\n"),
+                         "neuropixels")
+    remade = pipeline._binary_for(
+        _catgt_session(tmp_path, highpass=500, preprocess="    motion: dredge\n"), "neuropixels")
+
+    assert ran == ["dredge", "dredge"]
+    assert remade.path.parent.name == "motion_dredge"
+    folders = [p.name for p in remade.path.parents[1].iterdir() if p.name.startswith("motion_")]
+    assert folders == ["motion_dredge"]                      # one folder per preset
+
+
+def test_a_binary_made_before_records_sat_beside_it_is_kept_for_reuse(tmp_path, monkeypatch):
+    # The rig's DREDge binary was written beside preprocess.json, before
+    # motion_<preset>/ existed. Switching to MEDiCINe and back must not make
+    # it again: preprocess.json vouches for it, so it gets a record in place.
+    from spikesorting import pipeline
+
+    _fake_catgt(monkeypatch, writes=True)
+    ran = _fake_motion(monkeypatch)
+    dredge = _catgt_session(tmp_path, preprocess="    motion: dredge\n")
+    made = pipeline._binary_for(dredge, "neuropixels")
+    directory = dredge.paths.preprocessed_for("neuropixels")
+    legacy = directory / made.path.name                      # the old layout
+    made.path.rename(legacy)
+    for record in directory.rglob("*.bin.json"):
+        record.unlink()
+    shutil_rmtree = __import__("shutil").rmtree
+    shutil_rmtree(made.path.parent)
+    old = provenance.read(directory)
+    old["binary"] = str(legacy)
+    provenance.write(directory, old)
+
+    pipeline._binary_for(_catgt_session(tmp_path, preprocess="    motion: medicine\n"),
+                         "neuropixels")
+    back = pipeline._binary_for(dredge, "neuropixels")
+
+    assert ran == ["dredge", "medicine"]
+    assert back.path == legacy and legacy.exists()

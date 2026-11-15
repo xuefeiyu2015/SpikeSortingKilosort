@@ -54,7 +54,7 @@ neuropixels:
   kilosort:                    # every Kilosort parameter, stated -- see "Kilosort settings"
     # ---- this session ----
     bad_channels: []             # dead sites, as recording channel numbers -- see "Bad channels"
-    nblocks: 1                   # rigid drift correction -- see "Drift correction"
+    nblocks: 5                   # non-rigid drift correction, 5 depth blocks -- see "Drift correction"
     tmin: 0                      # sort from this second of the binary -- see "Sort window"
     tmax: .inf                   # ...to this one; .inf = the end of the file
     # ---- Kilosort's own values: change only if you know what they mean ----
