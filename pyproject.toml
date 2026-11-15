@@ -47,8 +47,14 @@ dependencies = [
     # They also cannot state a combination pip could not resolve: spikeinterface
     # 0.104.x itself requires neo>=0.14.4 and probeinterface>=0.3.2, which is the
     # same neo floor arrived at independently.
+    #
+    # probeinterface is raised past that: SpikeGLX 20260115 and CatGT 5.3 start
+    # ~imroTbl with the part number, "(NP1032,384)", not the type, and 0.3.x
+    # int()s it -- "invalid literal for int() with base 10: 'NP1032'" when
+    # motion correction reads CatGT's .meta. Fixed in 0.4.0 (probeinterface
+    # #432), the last line still on Python 3.10.
     "neo>=0.14.4",
-    "probeinterface>=0.3.2",
+    "probeinterface>=0.4.0",
     "spikeinterface>=0.104",
 ]
 
