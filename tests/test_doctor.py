@@ -985,3 +985,45 @@ def test_spikeinterface_preprocessing_needs_no_catgt(tmp_path):
     checks = doctor.check_session(session)
 
     assert not [c for c in checks if c.name.endswith(":preprocess")]
+
+
+def test_a_medicine_session_without_the_package_blocks_before_the_job(tmp_path, monkeypatch):
+    # SpikeInterface imports MEDiCINe only after detecting every peak, so a
+    # missing package would otherwise fail the run well into preprocessing.
+    import doctor
+
+    session = _npx_session(
+        tmp_path,
+        "  preprocess:\n    method: spikeinterface\n    gfix: null\n    motion: medicine\n"
+        "  kilosort:\n    nblocks: 0\n",
+    )
+    report = doctor.EnvReport(KS, python=Path("/env/bin/python"), prefix=Path("/env"))
+    asked = []
+
+    def probe(python, packages, probe_torch=False):
+        asked.extend(p.dist for p in packages)
+        return {"packages": {"medicine": {"present": False}}}
+
+    monkeypatch.setattr(doctor, "probe_env", probe)
+    checks = doctor.check_motion_package(session, report)
+
+    assert asked == ["medicine-neuro"]
+    assert [c.status for c in checks] == [doctor.MISSING]
+    assert "pip install medicine-neuro" in checks[0].fix
+
+    monkeypatch.setattr(doctor, "probe_env", lambda *a, **k: {
+        "packages": {"medicine": {"present": True, "version": "0.1"}}})
+    assert [c.status for c in doctor.check_motion_package(session, report)] == [doctor.OK]
+
+
+def test_a_dredge_session_needs_no_extra_package(tmp_path, monkeypatch):
+    import doctor
+
+    session = _npx_session(
+        tmp_path,
+        "  preprocess:\n    method: spikeinterface\n    gfix: null\n    motion: dredge\n"
+        "  kilosort:\n    nblocks: 0\n",
+    )
+    monkeypatch.setattr(doctor, "probe_env", lambda *a, **k: pytest.fail("probed"))
+    assert doctor.check_motion_package(
+        session, doctor.EnvReport(KS, python=Path("/p"), prefix=Path("/"))) == []

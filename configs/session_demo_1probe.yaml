@@ -3,9 +3,9 @@
 #
 # Nothing about it is special-cased in the code. It has the same keys, and the
 # same edit/defaults fences, as session_template_utah_probe.yaml, and differs only in where
-# the data is and in three settings a bare .bin needs (n_chan_bin, sample_rate,
-# probe_file) where a real SpikeGLX run reads all three from the .meta beside its
-# bin_file.
+# the data is and in the settings a bare .bin needs (n_chan_bin, sample_rate,
+# has_sy_word, probe_file) where a real SpikeGLX run reads all four from the
+# .meta beside its bin_file.
 #
 # There is no `blackrock:` block, and that is the whole statement: no Blackrock
 # data, so no Blackrock stage runs and there is nothing to align against.
@@ -37,6 +37,7 @@ neuropixels:
   bin_file: "{neuropixels_dir}/ZFM-02370_mini.imec0.ap.short.bin"
   n_chan_bin: 385        # 384 AP channels + the SY word
   sample_rate: 30000
+  has_sy_word: true      # its last row is the SY word (no .meta to say so)
   # With no .meta there is no geometry to derive, so the map is named here. Built
   # once by notebooks/setup_demo_data.ipynb; a real run leaves this null and lets
   # setup_probe read ~snsGeomMap from the .meta instead.
@@ -53,7 +54,7 @@ neuropixels:
   kilosort:                    # every Kilosort parameter, stated -- see "Kilosort settings"
     # ---- this session ----
     bad_channels: []             # dead sites, as recording channel numbers -- see "Bad channels"
-    nblocks: 1                   # rigid drift correction -- see "Drift correction"
+    nblocks: 5                   # non-rigid drift correction, 5 depth blocks -- see "Drift correction"
     tmin: 0                      # sort from this second of the binary -- see "Sort window"
     tmax: .inf                   # ...to this one; .inf = the end of the file
     # ---- Kilosort's own values: change only if you know what they mean ----

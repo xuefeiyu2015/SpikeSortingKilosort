@@ -28,39 +28,33 @@ CatGT, so on the cluster either preprocess on the rig first and copy
 ``<system>_dir/preprocessed/`` across, or use ``method: spikeinterface``; it does
 not switch by itself.
 
+Prints how long each stage and each Kilosort phase took, and saves everything
+it printed to ``<system>_dir/kilosort4/logs/sorting_<start>_<machine>.log``,
+one file per run, so runs on different machines or data paths sit side by side.
+
 Stops at the first stage that fails and exits non-zero. Stages that are
 skipped are reported and do not fail the run.
 """
 
 from __future__ import annotations
 
-import logging
 import sys
 from pathlib import Path
 
 # The shared CLI helpers live in tools/; _cli adds src/ itself.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 
-from _cli import Runner, build_parser, load, shell_arg  # noqa: E402
+from _cli import (  # noqa: E402
+    RunLog,
+    Runner,
+    build_parser,
+    load,
+    log_directories,
+    log_pipeline_messages,
+    shell_arg,
+)
 
 import spikesorting as ss  # noqa: E402
-
-
-def _log_pipeline_messages() -> None:
-    """Show this pipeline's own log lines, and only its own.
-
-    ``logging.basicConfig`` would configure the *root* logger, which turns on
-    INFO for every installed package too -- faiss announcing which build it
-    loaded, matplotlib announcing a backend -- all wearing this project's indent.
-    Everything here logs to one named logger (``pipeline.py``, ``_sync/``), so
-    that is the one to attach a handler to.
-    """
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("       %(message)s"))
-    log = logging.getLogger("spikesorting")
-    log.handlers[:] = [handler]
-    log.setLevel(logging.INFO)
-    log.propagate = False
 
 
 def main() -> int:
@@ -88,9 +82,30 @@ def main() -> int:
         "each stream; write and sort nothing",
     )
     args = parser.parse_args()
-    _log_pipeline_messages()
+    log_pipeline_messages()
 
-    config = load(args)
+    # Everything printed from here on is also kept, and saved as
+    # <system>_dir/kilosort4/logs/sorting_<start>_<machine>.log. A dry run
+    # changes nothing, so it leaves no log either.
+    run_log = None if args.dry_run else RunLog("sorting")
+    config = None
+    try:
+        config = load(args)
+        return _sort(args, config)
+    finally:
+        _save_log(run_log, config)
+
+
+def _save_log(run_log, config) -> None:
+    if run_log is None:
+        return
+    run_log.close()
+    if config is not None:
+        for path in run_log.save(log_directories(config), config.machine.name):
+            print(f"log: {path}")
+
+
+def _sort(args, config) -> int:
     run = Runner(config)
     print()
 
@@ -130,6 +145,20 @@ def main() -> int:
         dry_run=args.dry_run,
         system="blackrock",
     )
+
+    # How long each phase of each sort took, from the run_info.json it wrote:
+    # loading, preprocessing, Kilosort's own stages, the copy out of the cache.
+    # Only streams sorted by this run -- an older run_info.json is not this run.
+    if not args.dry_run:
+        streams = [("neuropixels" if tag is None else f"neuropixels {tag}", "neuropixels", c)
+                   for tag, c in config.per_probe()] + [("blackrock", "blackrock", config)]
+        for label, system, stream_config in streams:
+            sorted_now = any(s["stage"] == "sort_with_kilosort" and s["status"] == "ok"
+                             for s in run.stages_for(label))
+            table = ss.timing_table(stream_config, system) if sorted_now else None
+            if table:
+                print()
+                print(table, end="")
 
     code = run.finish("sorting pipeline")
     if code == 0 and not args.dry_run:

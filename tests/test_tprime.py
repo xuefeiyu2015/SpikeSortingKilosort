@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import sys
+import time
+
 import numpy as np
 import pytest
 
@@ -62,3 +65,41 @@ def test_conversion_rejects_a_bad_sample_rate():
 def test_tprime_executable_missing_raises(tmp_path):
     with pytest.raises(FileNotFoundError, match="TPrime"):
         tprime.tprime_executable(tmp_path)
+
+
+def _fake_tprime(tmp_path, body):
+    script = tmp_path / "TPrime"
+    script.write_text("#!/bin/sh\n" + body)
+    script.chmod(0o755)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fake TPrime needs a POSIX shell")
+def test_a_stuck_tprime_is_stopped_at_its_deadline(tmp_path):
+    _fake_tprime(tmp_path, "echo $$ > pid.txt\nsleep 60\n")
+    start = time.monotonic()
+    with pytest.raises(tprime.TPrimeTimeout, match="still running"):
+        tprime.run_tprime(tmp_path, [], timeout_s=1.0, poll_s=0.1)
+    assert time.monotonic() - start < 10
+    pid = int((tmp_path / "pid.txt").read_text())
+    import os
+    with pytest.raises(ProcessLookupError):      # killed, not left holding files
+        os.kill(pid, 0)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fake TPrime needs a POSIX shell")
+def test_tprime_never_waits_on_the_keyboard(tmp_path):
+    _fake_tprime(tmp_path, 'read answer\necho "got:$answer"\n')
+    result = tprime.run_tprime(tmp_path, [], timeout_s=10.0)
+    assert result.stdout.strip() == "got:"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fake TPrime needs a POSIX shell")
+def test_tprime_failure_quotes_its_log(tmp_path):
+    _fake_tprime(tmp_path, "echo 'bad edge file' > TPrime.log\nexit 3\n")
+    with pytest.raises(RuntimeError, match="bad edge file"):
+        tprime.run_tprime(tmp_path, ["-syncperiod=1.0"])
+
+
+def test_the_deadline_grows_with_the_events():
+    assert tprime.tprime_timeout_s(0) == 600.0
+    assert tprime.tprime_timeout_s(10_000_000) == pytest.approx(1200.0)

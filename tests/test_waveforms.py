@@ -221,6 +221,29 @@ def test_a_long_range_is_split_into_pieces_and_each_spike_counted_once():
     np.testing.assert_allclose(split.mean, whole.mean, rtol=1e-6)
 
 
+def test_nearby_snippets_are_read_together_and_cut_the_same():
+    # 95,000 one-snippet reads through Kilosort's reader took most of an hour on
+    # the rig: each read has a fixed cost. Spikes ~80 ms apart are read through
+    # in blocks up to a batch long; a long silence is still skipped.
+    n = 200_000
+    spikes = np.concatenate([np.arange(2_000, 60_000, 2_400),      # ~80 ms apart
+                             np.arange(150_000, 190_000, 2_400)])  # after a 3 s gap
+    data = _noisy(n, 3, spikes, _spike_shape(-400), channel=1)
+    pad = 300
+
+    plan = _plan_for(spikes, n, margin=pad)
+    one_by_one = snippet_regions(plan, pad, max_samples=20_000)
+    together = snippet_regions(plan, pad, max_samples=20_000, max_gap=7_500)
+
+    assert len(together) < len(one_by_one) / 5
+    assert max(b - a for a, b in together) <= 20_000
+    assert not any(a < 100_000 < b for a, b in together)           # the gap is skipped
+    whole = accumulate(plan, _one_block(data))
+    joined = accumulate(plan, ((a, data[a:b]) for a, b in together), pad=pad)
+    assert np.array_equal(joined.snippets, whole.snippets)
+    assert not joined.notes
+
+
 def test_a_piece_shorter_than_one_padded_snippet_is_refused():
     plan = _plan_for(np.array([1_000]), 5_000, margin=50)
     with pytest.raises(ValueError, match="padded snippet"):

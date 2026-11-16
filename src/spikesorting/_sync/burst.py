@@ -1,7 +1,7 @@
 """14 s coded burst: coarse alignment between the two systems (step 8.1).
 
 The burst is a dense, uniquely coded pattern that Blackrock DO1 emits every 14 s
-while it is recording, captured by SpikeGLX on OneBox XA1. Because the code does
+while it is recording, captured by SpikeGLX on OneBox XA0. Because the code does
 not repeat within an hour, matching bursts fixes *which* 1 Hz cycle corresponds to
 which -- the ambiguity a 1 Hz square wave cannot resolve on its own.
 

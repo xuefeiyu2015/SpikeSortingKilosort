@@ -1,0 +1,328 @@
+"""Read the OneBox analog export and the matching Blackrock channels, on one clock.
+
+The OneBox side is ``<run>.obx0.obx.analog.mat`` (``extract_analog``), already
+stamped with ``onebox_to_blackrock``. The Blackrock side is read straight from
+the ``.nsX`` with its own NSP time map, so both land on NSP seconds -- the axis
+the ``.nev`` markers use.
+
+Reading only; the comparisons are in ``_sync/compare.py``. ``h5py`` and ``neo`` are imported inside the functions, as
+everywhere else in this package.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterator
+
+import numpy as np
+
+from .._sync import compare
+
+__all__ = [
+    "OneBoxAnalog",
+    "BlackrockAnalog",
+    "find_onebox_analog",
+    "load_onebox_analog",
+    "read_onebox",
+    "iter_onebox",
+    "open_blackrock_analog",
+    "read_blackrock",
+    "iter_blackrock",
+    "read_edge_file",
+    "get_recording_overlap",
+    "detect_onebox_events",
+    "detect_blackrock_events",
+    "measure_lags",
+]
+
+
+@dataclass(frozen=True)
+class OneBoxAnalog:
+    """What the ``.analog.mat`` says about itself. Samples are read on demand."""
+
+    path: Path
+    names: tuple[str, ...]
+    #: label -> 0-based row of ``data``
+    index: dict[str, int]
+    fs: float
+    n_samples: int
+    v_per_digit: np.ndarray
+    timebase: str
+    #: ``onebox_to_blackrock``: blackrock = slope * (k / fs) + intercept
+    slope: float
+    intercept: float
+
+    def blackrock_time(self, k0: int, k1: int) -> np.ndarray:
+        return self.slope * (np.arange(k0, k1) / self.fs) + self.intercept
+
+
+@dataclass
+class BlackrockAnalog:
+    """An open ``.nsX`` plus the channels the caller named and its NSP clock."""
+
+    path: Path
+    reader: Any
+    #: label -> :class:`~spikesorting._io.blackrock.BlackrockStream`
+    streams: dict[str, Any]
+    time_map: Any
+
+    @property
+    def segments(self) -> list[tuple[int, int, float, float]]:
+        return [
+            (s.first_sample, s.n_samples, s.slope, s.intercept)
+            for s in self.time_map.segments
+        ]
+
+
+def find_onebox_analog(export_dir: str | Path) -> Path:
+    """The one ``*.analog.mat`` in an export folder."""
+    found = sorted(Path(export_dir).glob("*.analog.mat"))
+    if not found:
+        raise FileNotFoundError(
+            f"no *.analog.mat in {export_dir}; run run_exporting_pipeline.py with "
+            "export_analog: true in the session"
+        )
+    if len(found) > 1:
+        raise ValueError(f"several *.analog.mat in {export_dir}: {[p.name for p in found]}")
+    return found[0]
+
+
+def _scalar(group: Any, key: str) -> float:
+    return float(np.asarray(group[key][()]).ravel()[0])
+
+
+def _text(group: Any, key: str) -> str:
+    return "".join(chr(c) for c in np.asarray(group[key][()]).ravel())
+
+
+def load_onebox_analog(path: str | Path, require_blackrock: bool = True) -> OneBoxAnalog:
+    """The export's labels, rate and map. Raises if it is not on Blackrock time yet."""
+    import h5py
+
+    path = Path(path)
+    with h5py.File(path, "r") as handle:
+        a = handle["analog"]
+        names = tuple(_text(a, "names").split(","))
+        info = OneBoxAnalog(
+            path=path,
+            names=names,
+            index={name: int(_scalar(a["index"], name)) - 1 for name in names},
+            fs=_scalar(a, "fs"),
+            n_samples=int(_scalar(a, "n_samples")),
+            v_per_digit=np.asarray(a["v_per_digit"][()]).ravel(),
+            timebase=_text(a, "timebase"),
+            slope=_scalar(a, "blackrock_slope"),
+            intercept=_scalar(a, "blackrock_intercept"),
+        )
+    if require_blackrock and info.timebase != "blackrock":
+        raise ValueError(
+            f"{path.name} is still on the {info.timebase} clock: run time_remapping "
+            "(run_exporting_pipeline.py) so onebox_to_blackrock is stamped in"
+        )
+    return info
+
+
+def read_onebox(analog: OneBoxAnalog, name: str, k0: int, k1: int) -> np.ndarray:
+    """Volts of one channel, samples ``k0:k1``."""
+    import h5py
+
+    row = analog.index[name]
+    with h5py.File(analog.path, "r") as handle:
+        raw = handle["analog/data"][k0:k1, row]
+    return raw.astype(np.float64) * analog.v_per_digit[row]
+
+
+def iter_onebox(
+    analog: OneBoxAnalog, name: str, chunk_samples: int = 10_000_000
+) -> Iterator[tuple[int, np.ndarray]]:
+    """``(start_sample, volts)`` for one channel, a chunk at a time."""
+    for start in range(0, analog.n_samples, chunk_samples):
+        stop = min(start + chunk_samples, analog.n_samples)
+        yield start, read_onebox(analog, name, start, stop)
+
+
+def open_blackrock_analog(
+    path: str | Path,
+    inputs: dict[str, int],
+    frontend_channels: int,
+    gap_tolerance_ms: float | None = None,
+    tolerance_s: float | None = 1e-3,
+) -> BlackrockAnalog:
+    """Open a ``.nsX`` and resolve the named analog inputs (``{label: n}``).
+
+    Each is ``ainp<n>``, found by ID ``frontend_channels + n`` and checked
+    against its name -- the rule the sync inputs follow
+    (``blackrock.stream_for_analog_input``). What each resolved to is logged.
+
+    The NSP time map is measured from this file, as ``extract_sync`` does for the
+    sync file: each ``.nsX`` is its own crystal.
+    """
+    import logging
+
+    from . import blackrock
+
+    path = Path(path)
+    reader = blackrock.open_reader(path, gap_tolerance_ms=gap_tolerance_ms)
+    streams = {
+        name: blackrock.stream_for_analog_input(reader, n, frontend_channels)
+        for name, n in inputs.items()
+    }
+    for name, stream in streams.items():
+        logging.getLogger(__name__).info(
+            "%s: %s -> channel id %s (%s), %g Hz",
+            path.name, name, stream.channel_id, stream.channel_name, stream.fs,
+        )
+    stream_index = next(iter(streams.values())).stream_index if streams else 0
+    time_map = blackrock.nsp_time_map(
+        reader, blackrock.nsx_number(path), stream_index=stream_index, tolerance_s=tolerance_s
+    )
+    return BlackrockAnalog(path=path, reader=reader, streams=streams, time_map=time_map)
+
+
+def read_blackrock(br: BlackrockAnalog, name: str, s0: int, s1: int) -> np.ndarray:
+    """One channel, samples ``s0:s1``, in the file's physical units."""
+    from . import blackrock
+
+    return blackrock.read_channel(br.reader, br.streams[name], s0, s1)
+
+
+def iter_blackrock(
+    br: BlackrockAnalog, name: str, chunk_samples: int = 30_000_000
+) -> Iterator[tuple[int, np.ndarray]]:
+    from . import blackrock
+
+    return blackrock.iter_channel(br.reader, br.streams[name], chunk_samples)
+
+
+def read_edge_file(path: str | Path) -> np.ndarray:
+    """An edge file: seconds, one per line (empty array for an empty file)."""
+    return np.loadtxt(path, ndmin=1, dtype=np.float64)
+
+
+def get_recording_overlap(
+    onebox: OneBoxAnalog, blackrock: BlackrockAnalog | list[BlackrockAnalog] | None
+) -> tuple[float, float]:
+    """``(start, stop)`` of Blackrock time every given file was recording."""
+    start = onebox.intercept
+    stop = onebox.slope * (onebox.n_samples / onebox.fs) + onebox.intercept
+    sources = blackrock if isinstance(blackrock, list) else [blackrock]
+    for source in sources:
+        if source is None:
+            continue
+        _, _, _, intercept = source.segments[0]
+        _, n, slope, last_intercept = source.segments[-1]
+        start = max(start, intercept)
+        stop = min(stop, last_intercept + slope * n)
+    return start, stop
+
+
+#: Excerpts spread over the recording that set an event channel's levels.
+LEVEL_EXCERPTS = 100
+LEVEL_EXCERPT_S = 3.0
+
+
+def _level_samples(read, n_samples: int, fs: float) -> np.ndarray:
+    """Short excerpts spread evenly over the whole recording, concatenated.
+
+    Levels from the first minutes alone fail whenever the signal sits still
+    before the task starts; reading every sample twice costs a whole pass. A
+    hundred 3 s excerpts see the whole session for ~5 min of samples.
+    """
+    width = int(LEVEL_EXCERPT_S * fs)
+    if n_samples <= LEVEL_EXCERPTS * width:
+        return read(0, n_samples)
+    starts = np.linspace(0, n_samples - width, LEVEL_EXCERPTS).astype(np.int64)
+    return np.concatenate([read(int(k), int(k) + width) for k in starts])
+
+
+def detect_onebox_events(
+    onebox: OneBoxAnalog, name: str, levels: compare.EventLevels | None = None,
+    min_gap_s: float = 0.05,
+) -> tuple[np.ndarray, compare.EventLevels]:
+    """Event onsets of one OneBox channel in OneBox seconds, and the levels used.
+
+    An onset is the signal leaving its baseline, up or down (a photodiode may
+    rest high and dip for the target) -- see :func:`compare.stream_event_onsets`.
+    """
+    if levels is None:
+        levels = compare.event_levels(_level_samples(
+            lambda k0, k1: read_onebox(onebox, name, k0, k1), onebox.n_samples, onebox.fs))
+    onsets = compare.stream_event_onsets(iter_onebox(onebox, name), levels, onebox.fs,
+                                         min_gap_s=min_gap_s)
+    return onsets, levels
+
+
+def detect_blackrock_events(
+    br: BlackrockAnalog, name: str, levels: compare.EventLevels | None = None,
+    min_gap_s: float = 0.05,
+) -> tuple[np.ndarray, compare.EventLevels]:
+    """Event onsets of one Blackrock channel on the NSP clock, and the levels used.
+
+    Levels are this copy's own, so one recorded inverted still gives onsets.
+    """
+    stream = br.streams[name]
+    if levels is None:
+        levels = compare.event_levels(_level_samples(
+            lambda s0, s1: read_blackrock(br, name, s0, s1), stream.n_samples, stream.fs))
+    seconds = compare.stream_event_onsets(iter_blackrock(br, name), levels, stream.fs,
+                                          min_gap_s=min_gap_s)
+    # Detection counts at the nominal rate; the NSP map supplies the real one.
+    samples = np.rint(seconds * stream.fs).astype(np.int64)
+    return br.time_map.apply(samples), levels
+
+
+def measure_lags(
+    onebox: OneBoxAnalog,
+    blackrock: BlackrockAnalog,
+    name: str,
+    n_windows: int = 60,
+    window_s: float = 10.0,
+    max_lag_s: float = 0.02,
+    min_corr: float = 0.8,
+    differentiate: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(window centres, lags, peak correlations)`` of one continuous channel.
+
+    ``n_windows`` windows spread evenly over the overlap -- enough to see a
+    trend across the session without reading all of it. In each, the OneBox
+    trace (on Blackrock time, through the stamped map) is interpolated onto
+    Blackrock's own samples and cross-correlated with them. Windows whose peak
+    correlation is below ``min_corr`` -- no movement to lock onto -- are dropped.
+    A positive lag means the OneBox copy is later.
+
+    ``differentiate`` correlates the sample-to-sample change instead -- for a
+    search over seconds: an eye trace wanders slowly, so its own correlation
+    peak is broad, while its changes (saccades) peak sharply. Clipped,
+    so one blink cannot own the correlation.
+    """
+    start, stop = get_recording_overlap(onebox, blackrock)
+    stream = blackrock.streams[name]
+    span = stop - start - window_s - 2 * max_lag_s
+    if span <= 0:
+        raise ValueError(f"{name}: the overlap is shorter than one {window_s:g} s window")
+    centres = start + max_lag_s + window_s / 2 + np.linspace(0.0, span, n_windows)
+
+    kept_t, kept_lag, kept_corr = [], [], []
+    for centre in centres:
+        t0, t1 = centre - window_s / 2, centre + window_s / 2
+        s0, s1 = compare.blackrock_sample_range(t0, t1, blackrock.segments)
+        if s1 - s0 < 3:
+            continue
+        t_br = blackrock.time_map.apply(np.arange(s0, s1))
+        y_br = read_blackrock(blackrock, name, s0, s1)
+        k0, k1 = compare.onebox_sample_range(
+            t0 - 2 * max_lag_s, t1 + 2 * max_lag_s,
+            onebox.fs, onebox.slope, onebox.intercept, onebox.n_samples,
+        )
+        if k1 - k0 < 3:
+            continue
+        y_obx = np.interp(t_br, onebox.blackrock_time(k0, k1), read_onebox(onebox, name, k0, k1))
+        if differentiate:
+            y_br, y_obx = compare.clipped_diff(y_br), compare.clipped_diff(y_obx)
+        lag, corr = compare.xcorr_lag(y_br, y_obx, stream.fs, max_lag_s)
+        if np.isfinite(lag) and corr >= min_corr:
+            kept_t.append(centre)
+            kept_lag.append(lag)
+            kept_corr.append(corr)
+    return np.asarray(kept_t), np.asarray(kept_lag), np.asarray(kept_corr)

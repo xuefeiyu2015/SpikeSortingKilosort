@@ -1,12 +1,12 @@
 """Drive sync-edge extraction for a session (pipeline steps 2 and 4).
 
-Produces five canonical edge files, each in the folder beside the recording it
-came from -- the SpikeGLX pair under ``neuropixels_dir/kilosort4/``, the NSP pair
-under ``blackrock_dir/kilosort4/``:
+Produces five canonical edge files, all in ``neuropixels_dir/kilosort4/`` --
+the NSP pair too, since it exists only to align Neuropixels; the Blackrock share
+is read and never written to (``OutputPaths.sync_for``):
 
 ===================== ==============================================
 ``npx_1hz.txt``       SpikeGLX SY-word bit 6, the 1 Hz square wave
-``npx_burst.txt``     OneBox XA1, the 14 s coded burst
+``npx_burst.txt``     OneBox XA0, the 14 s coded burst
 ``npx_obx_1hz.txt``   OneBox SY-word bit 6, the same 1 Hz wave on the OneBox clock
 ``blackrock_1hz.txt`` NSP ns5 channel 1, the same 1 Hz square wave
 ``blackrock_burst.txt`` NSP ns5 channel 2, the same 14 s burst
@@ -35,6 +35,7 @@ the NumPy detector stands alone.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,6 +59,11 @@ __all__ = [
 
 NPX_1HZ = "npx_1hz"
 NPX_BURST = "npx_burst"
+#: The sync file's clock map, beside the edge files it put on the NSP clock.
+SYNC_NSP_MAP = "nsp_time_map_sync.json"
+#: The AP rate the Neuropixels edges were converted to seconds with. Spike
+#: samples must be converted with the same one, or the map shifts them.
+NPX_EDGE_RATE = "npx_edges_rate.json"
 NPX_OBX_1HZ = "npx_obx_1hz"
 BR_1HZ = "blackrock_1hz"
 BR_BURST = "blackrock_burst"
@@ -134,15 +140,19 @@ def _sy_bit_chunks(
 ) -> Iterator[tuple[int, np.ndarray]]:
     """Yield ``(start, bit_values)`` for the SY word, chunk by chunk.
 
-    Logs progress as it goes: the caller is reading the whole binary to get one
-    channel, which on a share is minutes, and a silent loop is indistinguishable
-    from a hang.
+    Reports progress in bytes of the file as it goes (``_progress``): the caller
+    is reading the whole binary to get one channel, which on a share is minutes,
+    and a silent loop is indistinguishable from a hang. The drivers draw it as a
+    bar; the log gets a line every 10%.
     """
-    total = info.n_samples
+    from .._progress import Progress
+
+    row_bytes = info.n_chan * 2
+    progress = Progress(log, f"read {info.path.name}", info.n_samples * row_bytes)
     for start, block in spikeglx.iter_channel(info, info.sy_index, chunk_bytes):
-        if total:
-            log.info("  read %5.1f%% of %s", 100.0 * (start + block.size) / total, info.path.name)
+        progress.update((start + block.size) * row_bytes)
         yield start, edges.digital_bit_signal(block.view(np.uint16), bit)
+    progress.finish()
 
 
 def _announce_read(info: spikeglx.StreamInfo, report: ExtractionReport) -> None:
@@ -172,7 +182,8 @@ def _resolve_ap_stream(config: SessionConfig) -> spikeglx.StreamInfo | None:
     npx = config.neuropixels
     if npx.bin_file is None:
         return None
-    return spikeglx.stream_info(npx.bin_file, npx.n_chan_bin, npx.sample_rate)
+    return spikeglx.stream_info(npx.bin_file, npx.n_chan_bin, npx.sample_rate,
+                                npx.has_sy_word)
 
 
 def _resolve_obx_stream(config: SessionConfig) -> spikeglx.StreamInfo | None:
@@ -267,7 +278,7 @@ def _run_catgt_extraction(
         dest=config.paths.sync_for("neuropixels") / "catgt",
         folders=layout.folders,
     )
-    report.catgt_commands.append("runit " + " ".join(args))
+    report.catgt_commands.append("CatGT " + " ".join(args))
 
     if not machine.has_catgt:
         report.note(
@@ -276,8 +287,9 @@ def _run_catgt_extraction(
         )
         return {}
 
+    dest = catgt.fresh_dest(config.paths.sync_for("neuropixels") / "catgt")
     catgt.run_catgt(machine.catgt_dir, args)
-    produced = catgt.find_edge_files(config.paths.sync_for("neuropixels") / "catgt")
+    produced = catgt.find_edge_files(dest)
     return _match_edge_files(produced, specs, report)
 
 
@@ -339,6 +351,18 @@ def _match_edge_files(
     return result
 
 
+def _clear_edges(directory: Path, names: tuple[str, ...]) -> None:
+    """Remove the edge files an extraction is about to (re)write.
+
+    Done before reading anything, so a stream that is skipped this time -- no
+    SY word, no OneBox, a read that fails partway -- leaves no file rather than
+    the previous run's, which ``time_remapping`` would otherwise fit from and
+    validation would check against as though this recording had produced it.
+    """
+    for name in names:
+        (directory / f"{name}.txt").unlink(missing_ok=True)
+
+
 def extract_neuropixels_edges(
     config: SessionConfig,
     chunk_bytes: int = spikeglx.DEFAULT_CHUNK_BYTES,
@@ -349,12 +373,19 @@ def extract_neuropixels_edges(
     and writes the canonical edge files.
     """
     report = ExtractionReport()
+    config.paths.require_dir("neuropixels")       # never create the recording's folder
     sync_dir = config.paths.sync_for("neuropixels")
     sync_dir.mkdir(parents=True, exist_ok=True)
+    _clear_edges(sync_dir, (NPX_1HZ, NPX_BURST, NPX_OBX_1HZ))
+    (sync_dir / NPX_EDGE_RATE).unlink(missing_ok=True)
 
     catgt_times = _run_catgt_extraction(config, report)
 
     ap_info = _resolve_ap_stream(config)
+    if ap_info is not None:
+        with open(sync_dir / NPX_EDGE_RATE, "w", encoding="utf-8") as handle:
+            json.dump({"ap_fs": float(ap_info.fs), "ap_file": str(ap_info.path)},
+                      handle, indent=2)
     if ap_info is None:
         report.note("Neuropixels 1 Hz extraction skipped: no AP binary found.")
     elif ap_info.sy_index is None:
@@ -449,18 +480,42 @@ def extract_blackrock_edges(
     CatGT cannot read Blackrock files, so this path is always the NumPy detector.
     It writes the same edge-file format, which is what lets TPrime align the two
     systems later.
+
+    The pulses exist only to align Neuropixels, so they are written into each
+    probe's sorting folder (``sync_for``), beside the time map fitted from them
+    -- never under ``blackrock_dir``. The ``.ns5`` is read once; a two-probe
+    session gets one small copy per probe, so each probe's folder holds
+    everything its map was built from.
     """
     from .._io import blackrock  # lazy: neo is not installed everywhere
 
     report = ExtractionReport()
     spec = config.blackrock
+    if config.has_data("neuropixels"):
+        # Before any guard: a session that stops naming a sync_file must not keep
+        # aligning on the pulses an earlier run extracted.
+        for _, probe_config in config.per_probe():
+            directory = probe_config.paths.sync_for("blackrock")
+            _clear_edges(directory, (BR_1HZ, BR_BURST))
+            (directory / SYNC_NSP_MAP).unlink(missing_ok=True)
     if spec.sync_file is None:
         report.note("Blackrock extraction skipped: no blackrock.sync_file configured.")
         return report
+    if not config.has_data("neuropixels"):
+        report.note(
+            "Blackrock extraction skipped: its pulses only align Neuropixels, "
+            "and this session has none."
+        )
+        return report
 
-    sync_dir = config.paths.sync_for("blackrock")
-    sync_dir.mkdir(parents=True, exist_ok=True)
+    config.paths.require_dir("blackrock")         # never create the recording's folder
+    sync_dirs = list(dict.fromkeys(
+        probe_config.paths.sync_for("blackrock") for _, probe_config in config.per_probe()
+    ))
+    sync_dir, copies = sync_dirs[0], sync_dirs[1:]
     reader = blackrock.open_reader(spec.sync_file, gap_tolerance_ms=spec.gap_tolerance_ms)
+    for directory in sync_dirs:
+        directory.mkdir(parents=True, exist_ok=True)
 
     # Edge times go out on the NSP clock, the same axis the .nev markers and the
     # eye traces use -- so the fitted Neuropixels map lands there too, with
@@ -470,15 +525,18 @@ def extract_blackrock_edges(
         reader, blackrock.nsx_number(spec.sync_file),
         tolerance_s=config.alignment_tolerance_s,
     )
-    _write_nsp_map(sync_dir, time_map, spec.sync_file)
+    for directory in sync_dirs:
+        _write_nsp_map(directory, time_map, spec.sync_file)
     report.note(f"Blackrock edge times are on the NSP clock: {time_map.summary()}")
 
     jobs = [
-        (BR_1HZ, spec.sync_1hz_channel, spec.sync_threshold, config.sync_period_s * 1000.0 / 2.0),
-        (BR_BURST, spec.burst_channel, spec.burst_threshold, 0.0),
+        (BR_1HZ, spec.sync_1hz_input, spec.sync_threshold, config.sync_period_s * 1000.0 / 2.0),
+        (BR_BURST, spec.burst_input, spec.burst_threshold, 0.0),
     ]
-    for name, channel, threshold, duration_ms in jobs:
-        stream = blackrock.stream_for_channel(reader, channel)
+    for name, analog_input, threshold, duration_ms in jobs:
+        stream = blackrock.stream_for_analog_input(
+            reader, analog_input, spec.nsp_frontend_channels
+        )
         if stream.n_segments > 1:
             report.note(
                 f"{spec.sync_file.name} has {stream.n_segments} segments (paused recording); "
@@ -500,14 +558,16 @@ def extract_blackrock_edges(
             None,
             sync_dir,
             report,
-            stream=f"{spec.sync_file.name} ch {stream.channel_id}",
+            stream=f"{spec.sync_file.name} ainp{analog_input} (ID {stream.channel_id})",
         )
         if times.size == 0:
             report.note(
-                f"No pulses on {spec.sync_file.name} channel {channel} at threshold "
+                f"No pulses on {spec.sync_file.name} ainp{analog_input} at threshold "
                 f"{threshold}. Check blackrock.{'sync' if name == BR_1HZ else 'burst'}_threshold "
                 "against the file's units."
             )
+        for directory in copies:              # the other probes: same file, no re-read
+            catgt.write_edge_file(directory / f"{name}.txt", times)
 
     return report
 
@@ -521,7 +581,10 @@ def _write_nsp_map(sync_dir: Path, time_map, source: Path) -> Path:
     """
     import json
 
-    path = Path(sync_dir) / "nsp_time_map.json"
+    # Not nsp_time_map.json: that name, in this same folder, is the *spike*
+    # file's map, which the Utah export reads. Sharing it let whichever ran last
+    # -- usually this -- convert .ns6 spikes on the .ns5's clock.
+    path = Path(sync_dir) / SYNC_NSP_MAP
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(dict(time_map.to_dict(), source=str(source)), handle, indent=2)
     return path

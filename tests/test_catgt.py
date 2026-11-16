@@ -146,8 +146,59 @@ def test_find_edge_files_keys_by_extractor(tmp_path):
 
 
 def test_catgt_script_missing_raises(tmp_path):
-    with pytest.raises(FileNotFoundError, match="runit"):
+    with pytest.raises(FileNotFoundError, match="CatGT.exe"):
         catgt.catgt_script(tmp_path)
+
+
+def test_the_executable_is_launched_rather_than_runit_bat(tmp_path):
+    # A Windows CatGT folder holds both. runit.bat goes through cmd.exe, whose
+    # "Terminate batch job (Y/N)?" after a Ctrl+C hung a run overnight.
+    (tmp_path / "runit.bat").write_text("")
+    (tmp_path / "CatGT.exe").write_text("")
+    assert catgt.catgt_script(tmp_path).name == "CatGT.exe"
+
+    (tmp_path / "CatGT.exe").unlink()
+    assert catgt.catgt_script(tmp_path).name == "runit.bat"   # only as a last resort
+
+
+def test_linux_keeps_runit_sh_for_its_library_path(tmp_path):
+    (tmp_path / "runit.sh").write_text("")
+    (tmp_path / "CatGT").write_text("")                       # the bare Linux binary
+    assert catgt.catgt_script(tmp_path).name == "runit.sh"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fake runit.sh needs a POSIX shell")
+def test_catgt_is_never_left_waiting_for_a_keypress(tmp_path):
+    # A launcher that stops to read the keyboard must get end-of-input at once,
+    # not wait for a reply nobody can see. pytest already hides the keyboard, so
+    # the call runs in a child whose input is a pipe held open -- a terminal, in
+    # effect. Before the fix this hung until the timeout.
+    import subprocess
+    import textwrap
+    from pathlib import Path
+
+    script = tmp_path / "runit.sh"
+    script.write_text('#!/bin/sh\nread answer\necho "got:$answer"\nexit 0\n')
+    script.chmod(0o755)
+    src = Path(catgt.__file__).resolve().parents[2]
+    child = textwrap.dedent(f"""
+        import sys; sys.path.insert(0, {str(src)!r})
+        from spikesorting._sync import catgt
+        print(catgt.run_catgt({str(tmp_path)!r}, [], timeout_s=3).stdout.strip())
+    """)
+
+    with subprocess.Popen([sys.executable, "-c", child], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          text=True) as proc:
+        # wait(), not communicate(): communicate closes stdin first, which would
+        # hand the launcher end-of-input whether or not run_catgt does.
+        try:
+            proc.wait(timeout=15)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        out = proc.stdout.read()
+    assert out.strip() == "got:"                   # without the fix: timed out, empty
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="fake runit.sh needs a POSIX shell")

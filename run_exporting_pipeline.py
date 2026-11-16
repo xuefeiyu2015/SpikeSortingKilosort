@@ -9,8 +9,12 @@
                          it, always the NumPy detector, and the two compared.
     lfp                  the LF band, when the session says export_lfp: true.
                          Extraction only -- it goes out on the probe's own clock,
-                         and time_remapping stamps the Blackrock axis into it
-                         afterwards without re-reading the samples.
+                         and validate_remapping stamps the Blackrock axis into it
+                         once the map is accepted, without re-reading the samples.
+    analog               every OneBox XA input (eye, pupil, photodiode, the
+                         burst), when export_analog: true. Same as the LFP: on
+                         the OneBox clock, stamped with onebox_to_blackrock
+                         once the map is accepted.
     time_remapping       coarse offset from the 14 s bursts, then a fine fit on
                          the 1 Hz train, onto Blackrock time. Blackrock is the
                          reference timebase; this maps onto it, never the reverse.
@@ -18,6 +22,8 @@
                          were held out of the fit. Non-zero past tolerance, so it
                          can gate a batch job.
     export_results       aligned spike times, metrics, waveforms, figures.
+    record_timing        how long each step took, sorting and exporting, as a
+                         table: run_info.json["timing"] and export/timing.txt.
 
 Every stage runs, in that order, on every stream the session names. A stage
 with nothing to do yet reports why and the run carries on -- so running this
@@ -28,6 +34,10 @@ sorting. Run it again once curation is done.
 The export reads the labels Phy writes: ``cluster_group.tsv`` overrides
 Kilosort's own ``cluster_KSLabel.tsv``, and every cluster not labelled noise is
 exported.
+
+Everything it prints -- each stage's outcome and time, the pipeline's messages,
+the timing tables -- is also saved to
+``<system>_dir/kilosort4/logs/exporting_<start>_<machine>.log``, one per run.
 
 Two flags, each overriding a session key for this run only:
 
@@ -43,33 +53,22 @@ even when sorting went to a cluster.
 
 from __future__ import annotations
 
-import logging
 import sys
 from pathlib import Path
 
 # The shared CLI helpers live in tools/; _cli adds src/ itself.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
 
-from _cli import Runner, build_parser, load  # noqa: E402
+from _cli import (  # noqa: E402
+    RunLog,
+    Runner,
+    build_parser,
+    load,
+    log_directories,
+    log_pipeline_messages,
+)
 
 import spikesorting as ss  # noqa: E402
-
-
-def _log_pipeline_messages() -> None:
-    """Show this pipeline's own log lines, and only its own.
-
-    ``logging.basicConfig`` would configure the *root* logger, which turns on
-    INFO for every installed package too -- faiss announcing which build it
-    loaded, matplotlib announcing a backend -- all wearing this project's indent.
-    Everything here logs to one named logger (``pipeline.py``, ``_sync/``), so
-    that is the one to attach a handler to.
-    """
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("       %(message)s"))
-    log = logging.getLogger("spikesorting")
-    log.handlers[:] = [handler]
-    log.setLevel(logging.INFO)
-    log.propagate = False
 
 
 def main() -> int:
@@ -87,9 +86,23 @@ def main() -> int:
         help="keep a snippet per spike this run, whatever the session says",
     )
     args = parser.parse_args()
-    _log_pipeline_messages()
+    log_pipeline_messages()
 
-    config = load(args, require_inputs=False)
+    # Everything printed from here on is also kept, and saved as
+    # <system>_dir/kilosort4/logs/exporting_<start>_<machine>.log.
+    run_log = RunLog("exporting")
+    config = None
+    try:
+        config = load(args, require_inputs=False)
+        return _export(config)
+    finally:
+        run_log.close()
+        if config is not None:
+            for path in run_log.save(log_directories(config), config.machine.name):
+                print(f"log: {path}")
+
+
+def _export(config) -> int:
     run = Runner(config)
     print()
 
@@ -119,12 +132,22 @@ def main() -> int:
     per_stream(ss.extract_sync)
     per_stream(ss.extract_lfp)
 
+    # The OneBox's analog inputs (eye, pupil, photodiode, ...). One OneBox per
+    # run, so once, with the first probe's config: its export/ holds the file
+    # and its time_map.json stamps Blackrock time into it.
+    first_label, first_config = next(per_probe_config())
+    run(ss.extract_analog, first_config, "neuropixels",
+        system="neuropixels", label=first_label, config=first_config)
+
     # Blackrock is the reference timebase, so it is what the other system is
     # mapped *onto* rather than a system to remap. Each probe gets its own fit:
-    # separate oscillators, separate SY words, separate time_map.json. This is
-    # also what stamps the Blackrock axis into the LFP extracted above.
+    # separate oscillators, separate SY words, separate time_map.json. The map
+    # and the aligned spike times are provisional until validated.
     per_stream(ss.time_remapping)
 
+    # Accepting a map (burst PASS, or CONSISTENT without a burst) is what stamps
+    # Blackrock time into the LFP and OneBox exports and lets export_results use
+    # the aligned spikes. Anything else is a failure: the run stops here.
     for label, probe_config in per_probe_config():
         run(ss.validate_remapping, probe_config, probe_config.export_figures,
             system="neuropixels", label=label, config=probe_config)
@@ -132,6 +155,21 @@ def main() -> int:
     # Measures the waveforms too (sorted_spikes.mat carries the mean), so there
     # is no separate waveform pass over the binary.
     per_stream(ss.export_results)
+
+    # Last: how long every stage took, on top of the sort's own times, into each
+    # stream's run_info.json and export/timing.txt -- the one table that
+    # compares a run from a local disk against one from the share.
+    tables = []
+    streams = [*per_probe_config(), ("blackrock", config)]
+    for label, stream_config in streams:
+        system = "blackrock" if label == "blackrock" else "neuropixels"
+        report = run(ss.record_timing, stream_config, system, run.stages_for(label),
+                     system=system, label=label, config=stream_config)
+        if report:
+            tables.append(report["_text"])
+    for table in tables:
+        print()
+        print(table, end="")
 
     return run.finish("exporting pipeline")
 

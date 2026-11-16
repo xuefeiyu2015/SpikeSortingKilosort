@@ -70,8 +70,32 @@ class ReadProbe:
         )
 
 
+#: Read sizes the probe starts and ends at. Small reads time latency, not
+#: throughput: over SMB each is a round trip, and 256 KB reads measured 69 MB/s
+#: on a 10 GbE share that streams 64 MB reads at 550 MB/s. So the reads double up
+#: to 8 MB (SMB3's largest single read), starting at 1 MB so that one read on a
+#: slow share cannot run into the reachability timeout.
+FIRST_READ_BYTES = 1 << 20
+LARGEST_READ_BYTES = 8 << 20
+
+
+def read_sizes(
+    want: int, first: int = FIRST_READ_BYTES, largest: int = LARGEST_READ_BYTES
+) -> list[int]:
+    """The read sizes that cover ``want`` bytes: doubling from ``first`` to ``largest``."""
+    if first < 1 or largest < first:
+        raise ValueError(f"need 1 <= first <= largest, got {first}, {largest}")
+    sizes: list[int] = []
+    size, left = first, max(0, int(want))
+    while left > 0:
+        sizes.append(min(size, left))
+        left -= sizes[-1]
+        size = min(size * 2, largest)
+    return sizes
+
+
 def probe_read(
-    path: str | Path, sample_bytes: int = 4 << 20, time_budget_s: float = 2.0
+    path: str | Path, sample_bytes: int = 64 << 20, time_budget_s: float = 2.0
 ) -> ReadProbe:
     """Time a small read of ``path``, to say up front what the whole one costs.
 
@@ -87,10 +111,11 @@ def probe_read(
     estimate is a hint: a warm cache makes it optimistic, and it assumes the rest
     of the file reads like this piece.
 
-    The sample is read in small blocks and stops at ``time_budget_s``, so the
-    check stays cheap on exactly the share it exists to warn about: a slow one
-    answers in about two seconds rather than taking a minute to measure how slow
-    it is.
+    The sample is read in growing blocks (:func:`read_sizes`) -- large enough by
+    the end to measure what the share streams, not its round-trip time -- and
+    stops at ``time_budget_s``, so the check stays cheap on exactly the share it
+    exists to warn about: a slow one answers in about two seconds rather than
+    taking a minute to measure how slow it is.
     """
     path = Path(path)
     opened = time.perf_counter()
@@ -116,13 +141,12 @@ def probe_read(
     handle = open(path, "rb")
     latency = time.perf_counter() - opened
 
-    block = 1 << 18
     read = 0
     start = time.perf_counter()
     try:
         handle.seek(max(0, total - want))
-        while read < want:
-            piece = handle.read(min(block, want - read))
+        for size in read_sizes(want):
+            piece = handle.read(size)
             if not piece:
                 break
             read += len(piece)

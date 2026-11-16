@@ -380,3 +380,24 @@ def test_the_overview_is_one_probe_axis_with_a_layer_per_unit():
     (ax,) = fig.axes
     assert len(ax.collections) == 1 + 3          # grey noise, then one per unit
     assert "3 units" in ax.get_title() and "8 of 100 spikes" in ax.get_title()
+
+
+def test_unit_table_shape_comes_from_the_measured_mean_not_the_template(kilosort_results):
+    results = curated.load_phy_results(kilosort_results)
+    wave = np.zeros(60)
+    wave[30] = -90.0
+    wave[46] = 20.0
+    table = final.build_unit_table(results, mean_waveforms={0: wave}, waveform_units="uV")
+    row = table.set_index("unit_id")
+    assert row.loc[0, "trough_amplitude"] == pytest.approx(-90.0)
+    assert row.loc[0, "peak_amplitude"] == pytest.approx(20.0)
+    assert row.loc[0, "peak_to_trough_ms"] == pytest.approx(16 / 30.0)
+    assert row.loc[0, "waveform_units"] == "uV"
+    # no measured mean: NaN, never the whitened template's numbers
+    assert np.isnan(row.loc[1, "trough_amplitude"]) and row.loc[1, "waveform_units"] == ""
+    assert table["channel"].tolist() == [2, 5, 7]
+
+
+def test_unit_table_without_measured_means_has_no_shape_numbers(kilosort_results):
+    table = final.build_unit_table(curated.load_phy_results(kilosort_results))
+    assert table["trough_amplitude"].isna().all()

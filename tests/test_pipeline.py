@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,6 +18,7 @@ import pytest
 import spikesorting as ss
 from spikesorting import _config as cfg
 from spikesorting import pipeline
+from conftest import record_edge_rate
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 
@@ -85,6 +87,24 @@ def raw_reader(monkeypatch):
 # ---------------------------------------------------------------------------
 # The surface
 # ---------------------------------------------------------------------------
+
+
+def _plant_acceptance(session):
+    """An acceptance as validate_remapping leaves one: bound to the map on disk
+    (writing a minimal one if there is none) and to the edge files on disk."""
+    from spikesorting._sync import extract as _extract
+
+    aligned = session.paths.aligned
+    aligned.mkdir(parents=True, exist_ok=True)
+    map_path = aligned / "time_map.json"
+    payload = (json.loads(map_path.read_text()) if map_path.exists()
+               else {"slope": 1.0, "intercept": 0.0, "n_points": 0})
+    record_edge_rate(session.paths.sync_for("neuropixels"))
+    payload["inputs"] = pipeline._sync_inputs(session)
+    map_path.write_text(json.dumps(payload), encoding="utf-8")
+    (aligned / "validation.json").write_text(json.dumps(
+        {"accepted": True, "exports_accepted": True,
+         "time_map_sha256": pipeline._map_digest(session)}))
 
 
 def test_the_package_exports_the_workflow_and_nothing_else():
@@ -494,9 +514,11 @@ def test_a_utah_export_lands_on_the_nsp_clock(tmp_path, kilosort_results):
     # ...and the sorter's own index survives beside it, so nothing is one-way.
     assert samples.size == exported.size
 
-    # Only what an analysis copies away: no .npy/.npz duplicates of Kilosort's.
+    # Only what an analysis copies away: no .npy/.npz duplicates of Kilosort's,
+    # plus the small records that explain them -- here the .ns6 clock map.
     names = {p.name for p in (sorted_dir / "export").iterdir() if p.is_file()}
-    assert names == {"HUB.sorted_spikes.mat", "units.csv", "sorting_summary_info.json"}
+    assert names == {"HUB.sorted_spikes.mat", "units.csv", "sorting_summary_info.json",
+                     "nsp_time_map.json"}
 
     info = json.loads((sorted_dir / "export" / "sorting_summary_info.json").read_text())
     assert info["timebase"] == "nsp"
@@ -777,6 +799,14 @@ def test_an_lfp_exported_after_alignment_picks_up_the_map_immediately(tmp_path):
         encoding="utf-8",
     )
 
+    def timebase_of(path):
+        with h5py.File(path, "r") as handle:
+            return bytes(handle["lfp/timebase"][()].ravel().astype(np.uint8)).decode()
+
+    # A map not yet accepted is not stamped in.
+    assert timebase_of(ss.extract_lfp(session, "neuropixels")) == "stream"
+
+    _plant_acceptance(session)
     path = ss.extract_lfp(session, "neuropixels")
 
     assert path is not None
@@ -824,7 +854,7 @@ def _fake_preprocessing(monkeypatch) -> list[dict]:
     """
     made: list[dict] = []
 
-    def run(config, system, directory):
+    def run(config, system, directory, previous=None):
         directory.mkdir(parents=True, exist_ok=True)
         if system == "blackrock":
             recording = pipeline._read_blackrock(config)
@@ -888,7 +918,13 @@ def _fake_kilosort(monkeypatch, seen: list[dict]):
         # The whitened copy of the recording: written beside the results, the size
         # of the input, and not a result. It must not be published.
         (results / "temp_wh.dat").write_bytes(b"\x00" * 64)
-        return {"ops": True}, spike_times, clusters, None, None, None, None, None, None
+        # Kilosort4 returns its spike array before duplicate removal, a row per
+        # spike and three columns: 13 x 3 here, for 12 spikes saved.
+        st = np.column_stack([np.arange(13), np.zeros(13), np.ones(13)])
+        clu = np.append(clusters, 3)
+        # Kilosort's own per-stage timers, as run_kilosort leaves them in ops.
+        ops = {"ops": True, "runtime_drift": 1.5, "runtime_postproc": 0.5}
+        return ops, st, clu, None, None, None, None, None, None
 
     module = types.ModuleType("kilosort.run_kilosort")
     module.DEFAULT_SETTINGS = {
@@ -928,6 +964,73 @@ def _npx_session(tmp_path, body_extra="", probe=0, npx_dir=None):
         f"neuropixels:\n  bin_file: '{binaries[probe]}'\n{body_extra}",
         npx_dir=npx_dir,
     )
+
+
+@pytest.mark.parametrize("how", ["re-sort failed", "rewrite interrupted",
+                                 "rewrite interrupted, binary gone"])
+def test_waveforms_are_not_cut_from_a_binary_the_sorting_did_not_read(
+        tmp_path, monkeypatch, caplog, how):
+    # Sorted; then the binary is preprocessed again (a changed filter) and the
+    # re-sort fails -- or the rewrite itself is cut short, which leaves no
+    # preprocess.json. The old sorting survives beside traces it was not made
+    # from: a warning says so, the waveform export skips it, and an old
+    # waveforms.mat is removed from the bundle rather than left looking current.
+    import logging
+
+    kilosort = _fake_kilosort(monkeypatch, [])
+    session = _npx_session(tmp_path)
+    ss.sort_with_kilosort(session, "neuropixels")
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    run_info = json.loads((sorted_dir / "run_info.json").read_text())
+    assert run_info["preprocessing"]
+    old_waveforms = (sorted_dir / "export"
+                     / f"{pipeline._export_stem(session, 'neuropixels')}.waveforms.mat")
+    old_waveforms.parent.mkdir(parents=True, exist_ok=True)
+    old_waveforms.write_bytes(b"cut from the old traces")
+
+    if how == "re-sort failed":
+        path = tmp_path / "s.yaml"
+        path.write_text(path.read_text() + "  preprocess:\n    highpass_hz: 400\n")
+        changed = cfg.load_session_config(path, "mac", CONFIG_DIR)
+
+        def fails(**_):
+            raise RuntimeError("CUDA out of memory")
+
+        monkeypatch.setattr(kilosort, "run_kilosort", fails)
+        with caplog.at_level(logging.WARNING, logger="spikesorting"):
+            with pytest.raises(RuntimeError):
+                ss.sort_with_kilosort(changed, "neuropixels")
+        assert "Phy now shows it the new traces" in caplog.text
+        assert (sorted_dir / "spike_times.npy").exists()
+    else:
+        preprocessed = session.paths.preprocessed_for("neuropixels")
+        (preprocessed / "preprocess.json").unlink()
+        if how.endswith("binary gone"):           # CatGT empties its -dest first
+            Path(run_info["binary"]).unlink()
+
+    with caplog.at_level(logging.WARNING, logger="spikesorting"):
+        assert ss.export_waveforms(session, "neuropixels") is None
+    assert "re-sort" in caplog.text
+    assert not old_waveforms.exists()
+
+
+def test_a_binary_on_a_share_that_is_away_keeps_the_old_waveforms(tmp_path, monkeypatch):
+    # The whole preprocessed/ folder is missing -- a share not answering looks
+    # just like that. Nothing shows a rewrite, so the old waveforms.mat stays.
+    import shutil
+
+    _fake_kilosort(monkeypatch, [])
+    session = _npx_session(tmp_path)
+    ss.sort_with_kilosort(session, "neuropixels")
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    old_waveforms = (sorted_dir / "export"
+                     / f"{pipeline._export_stem(session, 'neuropixels')}.waveforms.mat")
+    old_waveforms.parent.mkdir(parents=True, exist_ok=True)
+    old_waveforms.write_bytes(b"cut from the old traces")
+    shutil.rmtree(session.paths.preprocessed_for("neuropixels"))
+
+    assert ss.export_waveforms(session, "neuropixels") is None
+    assert old_waveforms.exists()
 
 
 def test_the_kilosort_block_is_split_into_settings_and_arguments(tmp_path, monkeypatch):
@@ -1364,8 +1467,405 @@ def test_a_dry_run_says_what_preprocessing_it_would_do(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_time_remapping_reports_missing_edges_rather_than_guessing(tmp_path):
-    assert ss.time_remapping(_session(tmp_path), "neuropixels") is None
+def test_missing_edges_in_a_fresh_two_system_session_are_a_failure(tmp_path):
+    # Both systems recorded and nothing to fit: not "nothing to do", which the
+    # runner would let through to a sorter-time export.
+    session = _session(tmp_path)
+    with pytest.raises(FileNotFoundError, match="blackrock_1hz, npx_1hz"):
+        ss.time_remapping(session, "neuropixels")
+    result = ss.validate_remapping(session, figures=False)
+    assert result is not None and not result.passed
+    assert "fitted none" in result.reason
+    assert json.loads((session.paths.aligned / "validation.json").read_text())[
+        "accepted"] is False
+
+
+def test_missing_edges_withdraw_an_earlier_acceptance(tmp_path):
+    # An accepted map, then a run whose Blackrock 1 Hz file is empty: the old
+    # map must not pass again, or be published, on this run's behalf.
+    session = _analog_session(tmp_path)
+    path = ss.extract_analog(session, "neuropixels")
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+    assert _analog_fields(path)["timebase"] == "blackrock"
+
+    (session.paths.sync_for("blackrock") / "blackrock_1hz.txt").write_text("")
+    with pytest.raises(FileNotFoundError, match="withdrawn"):
+        ss.time_remapping(session, "neuropixels")
+    assert not (session.paths.aligned / "validation.json").exists()
+    assert _analog_fields(path)["timebase"] == "onebox"
+
+    result = ss.validate_remapping(session, figures=False)
+    assert not result.passed
+    assert "not fitted from the sync edge files now on disk" in result.reason
+    assert not pipeline._alignment_accepted(session)
+
+
+def test_a_failed_rerun_leaves_no_old_pass_in_the_sync_report(tmp_path):
+    # The bundle's sync report is what an analysis reads. After the 1 Hz edges
+    # go missing, the PASS it held describes a withdrawn map; it must go, and
+    # the refusal that follows says why.
+    session = _analog_session(tmp_path)
+    ss.extract_analog(session, "neuropixels")
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+    export = session.paths.export_for("neuropixels")
+    assert json.loads((export / "sync_report.json").read_text())["verdict"] == "PASS"
+
+    (session.paths.sync_for("blackrock") / "blackrock_1hz.txt").write_text("")
+    with pytest.raises(FileNotFoundError, match="withdrawn"):
+        ss.time_remapping(session, "neuropixels")
+    assert not (export / "sync_report.json").exists()
+    assert not (export / "sync_report.txt").exists()
+
+    ss.validate_remapping(session, figures=False)
+    sync = json.loads((export / "sync_report.json").read_text())
+    assert sync["verdict"] == "NOT VALIDATED" and sync["accepted"] is False
+    assert "not fitted from the sync edge files now on disk" in sync["verdict_note"]
+    text = (export / "sync_report.txt").read_text()
+    assert "PASS" not in text and "not fitted from the sync edge files" in text
+
+
+def test_a_fit_that_raises_on_nonempty_edges_still_withdraws_the_old_pass(tmp_path):
+    # Not missing, not empty -- one edge, too few to fit. The fit raises; the
+    # acceptance and the PASS report from the run before must not survive it.
+    session = _analog_session(tmp_path)
+    path = ss.extract_analog(session, "neuropixels")
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+    export = session.paths.export_for("neuropixels")
+    assert json.loads((export / "sync_report.json").read_text())["verdict"] == "PASS"
+
+    edges = session.paths.sync_for("blackrock") / "blackrock_1hz.txt"
+    edges.write_text(edges.read_text().split()[0] + "\n")
+    with pytest.raises(Exception) as raised:
+        ss.time_remapping(session, "neuropixels")
+    assert not isinstance(raised.value, FileNotFoundError)     # the fit, not the guard
+
+    assert not (session.paths.aligned / "validation.json").exists()
+    assert not pipeline._alignment_accepted(session)
+    assert not (export / "sync_report.json").exists()
+    assert not (export / "sync_report.txt").exists()
+    assert _analog_fields(path)["timebase"] == "onebox"
+
+
+def test_an_export_after_the_edges_changed_does_not_use_the_old_acceptance(tmp_path):
+    # Accepted, then extract_sync re-run (here: the Blackrock 1 Hz file
+    # rewritten) and the exports called on their own, with no re-alignment.
+    # Nothing may come out labelled Blackrock time from the old map.
+    from types import SimpleNamespace
+
+    session = _analog_session(tmp_path)
+    ss.extract_analog(session, "neuropixels")
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+    assert pipeline._alignment_accepted(session)
+
+    session.paths.sorted_for("neuropixels").mkdir(parents=True, exist_ok=True)
+    samples = np.array([10, 20, 30])
+    aligned = pipeline._aligned_spike_path(session, "neuropixels")
+    np.save(aligned, np.array([1.0, 2.0, 3.0]))
+    pipeline._write_aligned_identity(aligned, samples, "linear_fit")
+    phy = SimpleNamespace(spike_samples=samples)
+    assert pipeline._resolve_spike_seconds(session, "neuropixels", phy)[1] == "blackrock"
+
+    edges = session.paths.sync_for("blackrock") / "blackrock_1hz.txt"
+    times = np.loadtxt(edges)
+    np.savetxt(edges, times + 0.5)
+
+    assert not pipeline._alignment_accepted(session)
+    assert "sync edge files changed" in pipeline._acceptance_problem(session)
+    assert pipeline._resolve_spike_seconds(session, "neuropixels", phy)[1] == "sorter"
+    path = ss.extract_analog(session, "neuropixels")        # re-export: not stamped
+    assert _analog_fields(path)["timebase"] == "onebox"
+
+
+def test_an_acceptance_belongs_to_the_map_it_judged(tmp_path):
+    # Same edges, but time_map.json is not the file that was validated.
+    session = _analog_session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+
+    map_path = session.paths.aligned / "time_map.json"
+    payload = json.loads(map_path.read_text())
+    payload["intercept"] += 1.0
+    map_path.write_text(json.dumps(payload))
+
+    assert "not the map validate_remapping accepted" in pipeline._acceptance_problem(session)
+
+
+def test_re_extracting_the_sync_takes_the_old_stamps_off_the_exports(tmp_path, monkeypatch):
+    # Accepted and stamped; then extract_sync alone is re-run -- the notebook
+    # path. The files already on disk must not keep claiming Blackrock time.
+    from spikesorting._sync import extract as _extract
+
+    session = _analog_session(tmp_path)
+    path = ss.extract_analog(session, "neuropixels")
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+    assert _analog_fields(path)["timebase"] == "blackrock"
+
+    for system in ("neuropixels", "blackrock"):
+        # Blackrock's .ns5 reader is not here; what matters is what comes first.
+        monkeypatch.setattr(_extract, "extract_blackrock_edges", lambda config: None)
+        # The .ns5 is a placeholder path here; it answers, as a real one would.
+        monkeypatch.setattr(pipeline.reachable, "check_reachable",
+                            lambda path: SimpleNamespace(summary=lambda: "stub"))
+        ss.extract_sync(session, system)
+        assert _analog_fields(path)["timebase"] == "onebox", system
+        assert not (session.paths.aligned / "validation.json").exists()
+        export = session.paths.export_for("neuropixels")
+        assert not (export / "sync_report.json").exists()
+        assert not pipeline._alignment_accepted(session)
+        # Accept again before the next system's re-extraction.
+        _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+        ss.time_remapping(session, "neuropixels")
+        assert ss.validate_remapping(session, figures=False).passed
+
+
+@pytest.mark.parametrize("name, system", [
+    ("npx_obx_1hz", "neuropixels"), ("npx_burst", "neuropixels"),
+    ("blackrock_burst", "blackrock"),
+])
+def test_every_sync_input_a_map_depends_on_is_fingerprinted(tmp_path, name, system):
+    # Not just the two 1 Hz trains: the OneBox 1 Hz sets onebox_to_blackrock,
+    # and the bursts are the evidence the acceptance rests on.
+    session = _analog_session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+
+    edges = session.paths.sync_for(system) / f"{name}.txt"
+    np.savetxt(edges, np.loadtxt(edges) + 0.3)
+
+    assert name in pipeline._acceptance_problem(session)
+    result = ss.validate_remapping(session, figures=False)
+    assert not result.passed and f"changed: {name}" in result.reason
+
+
+def test_a_tprime_pass_does_not_stamp_a_line_that_fails(tmp_path):
+    # The probe clock wanders 3 ms around its line. TPrime follows it edge to
+    # edge and passes the burst check; the line misses by up to 3 ms. Spike
+    # times may use TPrime's map, but the LFP and OneBox exports can only carry
+    # the line -- so they stay on their own clocks, and the report says why.
+    from spikesorting._sync import catgt
+
+    session = _analog_session(tmp_path)
+    path = ss.extract_analog(session, "neuropixels")
+
+    def to_probe(t):
+        return (t - 12.3456) + 0.003 * np.sin(2 * np.pi * (t - 100.0) / 3000.0)
+
+    from conftest import coded_burst_times
+    br_1hz = np.arange(0.0, 10800.0, 1.0) + 100.0
+    br_burst = coded_burst_times(770, interval_s=14.0, pulses_per_burst=8, start_s=105.0)
+    br_sync, npx_sync = (session.paths.sync_for(s) for s in ("blackrock", "neuropixels"))
+    for folder in (br_sync, npx_sync):
+        folder.mkdir(parents=True, exist_ok=True)
+    catgt.write_edge_file(br_sync / "blackrock_1hz.txt", br_1hz)
+    catgt.write_edge_file(br_sync / "blackrock_burst.txt", br_burst)
+    catgt.write_edge_file(npx_sync / "npx_1hz.txt", to_probe(br_1hz))
+    record_edge_rate(npx_sync)
+    catgt.write_edge_file(npx_sync / "npx_obx_1hz.txt", to_probe(br_1hz))  # OneBox = probe clock
+    catgt.write_edge_file(npx_sync / "npx_burst.txt", to_probe(br_burst))
+
+    ss.time_remapping(session, "neuropixels")
+    map_path = session.paths.aligned / "time_map.json"
+    payload = json.loads(map_path.read_text())
+    payload["method"] = "tprime"                 # the spikes went through TPrime
+    map_path.write_text(json.dumps(payload))
+
+    report = ss.validate_remapping(session, figures=False)
+
+    assert report.passed                         # TPrime's map: within 1 ms
+    validation = json.loads((session.paths.aligned / "validation.json").read_text())
+    assert validation["accepted"] is True and validation["exports_accepted"] is False
+    assert validation["line"]["passed"] is False
+    assert pipeline._alignment_accepted(session)
+    assert not pipeline._exports_accepted(session)
+    assert _analog_fields(path)["timebase"] == "onebox"
+    assert _analog_fields(ss.extract_analog(session, "neuropixels"))["timebase"] == "onebox"
+    sync = json.loads((session.paths.export_for("neuropixels") / "sync_report.json").read_text())
+    assert sync["verdict"] == "PASS"
+    assert "exports stay on their own clocks" in sync["verdict_note"]
+
+
+@pytest.mark.parametrize("timebase, removed", [("blackrock", True), ("sorter", False)])
+def test_withdrawing_a_map_removes_the_spike_exports_stamped_with_it(
+        tmp_path, monkeypatch, timebase, removed):
+    # Accepted, exported -- then extract_sync alone is re-run. The bundle must
+    # not keep a copy saying accepted, or spike times from the withdrawn map
+    # beside LFP/OneBox files back on their own clocks. Sorter-time exports
+    # never used a map and stay.
+    from spikesorting._sync import extract as _extract
+
+    session = _analog_session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+    export = session.paths.export_for("neuropixels")
+    pipeline._copy_records(session, "neuropixels", export)
+    products = [export / "run.sorted_spikes.mat", export / "run.waveforms.mat"]
+    for product in products:
+        product.write_bytes(b"spikes")
+    summary = export / "sorting_summary_info.json"
+    summary.write_text(json.dumps({"timebase": timebase}))
+    assert json.loads((export / "validation.json").read_text())["accepted"] is True
+
+    monkeypatch.setattr(_extract, "extract_neuropixels_edges", lambda config: None)
+    ss.extract_sync(session, "neuropixels")
+
+    assert not (export / "validation.json").exists()
+    assert not (export / "time_map.json").exists()
+    for path in (*products, summary):
+        assert path.exists() is not removed, path.name
+
+
+def test_a_standalone_refusal_leaves_no_stale_copy_or_aligned_spikes(tmp_path):
+    # Accepted and exported; then an edge file goes bad and validate_remapping
+    # is run on its own. Refused -- and the bundle must not keep a copy saying
+    # accepted, or spike times on the map it just refused.
+    session = _analog_session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+    export = session.paths.export_for("neuropixels")
+    pipeline._copy_records(session, "neuropixels", export)
+    products = [export / "run.sorted_spikes.mat", export / "run.waveforms.mat",
+                export / "sorting_summary_info.json"]
+    products[0].write_bytes(b"spikes")
+    products[1].write_bytes(b"spikes")
+    products[2].write_text(json.dumps({"timebase": "blackrock"}))
+
+    (session.paths.sync_for("neuropixels") / "npx_burst.txt").write_text("not a number\n")
+    assert not ss.validate_remapping(session, figures=False).passed
+
+    assert not (export / "validation.json").exists()
+    assert not (export / "time_map.json").exists()
+    for path in products:
+        assert not path.exists(), path.name
+
+
+def test_an_unreachable_recording_keeps_the_edges_already_written(tmp_path, monkeypatch):
+    # The notebook's fallback: the share is not answering, so extract_sync
+    # raises -- before withdrawing or deleting anything, so the same
+    # recording's edges and their acceptance are still there to use.
+    session = _analog_session(tmp_path)
+    path = ss.extract_analog(session, "neuropixels")
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+    edges = sorted(p.name for p in session.paths.sync_for("neuropixels").glob("*.txt"))
+
+    def silent(path, **_):
+        raise TimeoutError(f"{path} did not answer")
+
+    monkeypatch.setattr(pipeline.reachable, "check_reachable", silent)
+    for system in ("neuropixels", "blackrock"):
+        with pytest.raises(OSError):
+            ss.extract_sync(session, system)
+
+    assert sorted(p.name for p in session.paths.sync_for("neuropixels").glob("*.txt")) == edges
+    assert pipeline._alignment_accepted(session)
+    assert _analog_fields(path)["timebase"] == "blackrock"
+
+
+def test_an_unreadable_edge_file_voids_the_acceptance_without_raising(tmp_path):
+    # A standalone export must fall back to its own clock, not stop.
+    session = _analog_session(tmp_path)
+    path = ss.extract_analog(session, "neuropixels")
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+
+    (session.paths.sync_for("neuropixels") / "npx_burst.txt").write_text("not a number\n")
+
+    assert not pipeline._alignment_accepted(session)
+    assert "npx_burst" in pipeline._acceptance_problem(session)
+    assert _analog_fields(ss.extract_analog(session, "neuropixels"))["timebase"] == "onebox"
+    result = ss.validate_remapping(session, figures=False)
+    assert not result.passed and "changed: npx_burst" in result.reason
+
+
+def test_a_line_that_passes_is_stamped_when_the_tprime_map_is_not_accepted(tmp_path):
+    # The reverse of the case above: the spikes went through TPrime and its map
+    # cannot be checked, so the spike times are refused -- but the line passed
+    # its own burst check, and the line is all the exports carry.
+    session = _analog_session(tmp_path)
+    path = ss.extract_analog(session, "neuropixels")
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    map_path = session.paths.aligned / "time_map.json"
+    payload = json.loads(map_path.read_text())
+    payload["method"] = "tprime"
+    map_path.write_text(json.dumps(payload))
+    (session.paths.aligned / "npx_1hz_trimmed.txt").unlink(missing_ok=True)
+
+    report = ss.validate_remapping(session, figures=False)
+
+    assert not report.passed
+    validation = json.loads((session.paths.aligned / "validation.json").read_text())
+    assert validation["accepted"] is False and validation["exports_accepted"] is True
+    assert not pipeline._alignment_accepted(session)
+    assert _analog_fields(path)["timebase"] == "blackrock"
+    sync = json.loads((session.paths.export_for("neuropixels") / "sync_report.json").read_text())
+    assert "only the spike times' map failed" in sync["verdict_note"]
+
+
+def test_a_meta_rate_edited_after_extraction_voids_the_map(tmp_path):
+    # Edges were converted at 30000 Hz; then imSampRate is edited. Spikes
+    # converted at the new rate would sit on a different clock from the edges
+    # the map came from -- 333 ppm, seconds by the end -- and the burst check,
+    # which sees only edges, would still pass. So everything refuses, by name.
+    from spikesorting._io import spikeglx
+
+    session = _analog_session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert ss.validate_remapping(session, figures=False).passed
+
+    meta = spikeglx.meta_path_for(session.neuropixels.bin_file)
+    meta.write_text(meta.read_text().replace("imSampRate=30000", "imSampRate=29990"))
+
+    problem = pipeline._acceptance_problem(session)
+    assert "29990 Hz in the .meta now" in problem and "30000 Hz" in problem
+    assert "re-run extract_sync" in problem
+    result = ss.validate_remapping(session, figures=False)
+    assert not result.passed and "29990" in result.reason
+    with pytest.raises(ValueError, match="re-run extract_sync"):
+        ss.time_remapping(session, "neuropixels")
+
+
+def test_a_sorting_at_another_rate_than_the_edges_is_refused(tmp_path):
+    # The sorting's params.py says 29990 Hz, the edges were extracted at
+    # 30000: converting spikes with either would mix the two.
+    session = _analog_session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    sorted_dir.mkdir(parents=True, exist_ok=True)
+    np.save(sorted_dir / "spike_times.npy", np.arange(10, dtype=np.int64) * 3000)
+    (sorted_dir / "params.py").write_text("sample_rate = 29990.0\n")
+
+    with pytest.raises(ValueError, match=r"sorting used 29990 Hz.*re-sort"):
+        ss.time_remapping(session, "neuropixels")
+
+
+def test_single_system_sessions_still_have_nothing_to_map(tmp_path):
+    from spikesorting import _config as cfg
+
+    npx_only = tmp_path / "npx.yaml"
+    npx_only.write_text(
+        f"neuropixels_dir: '{tmp_path / 'np'}'\nneuropixels:\n  bin_file: '/a/x.bin'\n",
+        encoding="utf-8")
+    session = cfg.load_session_config(npx_only, "mac", CONFIG_DIR)
+    assert ss.time_remapping(session, "neuropixels") is None
+    assert ss.validate_remapping(session, figures=False) is None
 
 
 def test_time_remapping_recovers_a_planted_offset_and_drift(tmp_path):
@@ -1380,6 +1880,7 @@ def test_time_remapping_recovers_a_planted_offset_and_drift(tmp_path):
     npx = (br - offset) * (1 + ppm)
     catgt.write_edge_file(session.paths.sync_for("blackrock") / "blackrock_1hz.txt", br)
     catgt.write_edge_file(session.paths.sync_for("neuropixels") / "npx_1hz.txt", npx)
+    record_edge_rate(session.paths.sync_for("neuropixels"))
 
     result = ss.time_remapping(session, "neuropixels")
 
@@ -1390,6 +1891,223 @@ def test_time_remapping_recovers_a_planted_offset_and_drift(tmp_path):
     assert result.mapping.drift_ppm == pytest.approx(-20.0, abs=0.1)
     assert (session.paths.aligned / "time_map.json").exists()
     assert "ppm" in result.summary()
+
+
+def test_the_neuropixels_side_writes_nothing_into_the_blackrock_folder(tmp_path):
+    # blackrock_dir is often a share while the Neuropixels sorting is local. The
+    # map, the trimmed edges and the per-spike arrays all belong to the sorting,
+    # so time_remapping only *reads* Blackrock's edge files.
+    from spikesorting._sync import catgt
+
+    session = _session(tmp_path)
+    for system in ("blackrock", "neuropixels"):
+        session.paths.sync_for(system).mkdir(parents=True, exist_ok=True)
+    br = np.arange(0.0, 600.0, 1.0) + 100.0
+    catgt.write_edge_file(session.paths.sync_for("blackrock") / "blackrock_1hz.txt", br)
+    catgt.write_edge_file(session.paths.sync_for("neuropixels") / "npx_1hz.txt", br - 12.0)
+    record_edge_rate(session.paths.sync_for("neuropixels"))
+
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    sorted_dir.mkdir(parents=True, exist_ok=True)
+    np.save(sorted_dir / "spike_times.npy", np.array([30_000, 60_000, 90_000]))
+    (sorted_dir / "params.py").write_text("sample_rate = 30000.0\n", encoding="utf-8")
+
+    br_root = session.paths.dir_for("blackrock")
+    before = sorted(br_root.rglob("*")) if br_root.exists() else []
+    result = ss.time_remapping(session, "neuropixels")
+
+    assert result.aligned_path.parent == sorted_dir
+    assert np.allclose(np.load(result.aligned_path), [13.0, 14.0, 15.0])
+    assert (sorted_dir / "time_map.json").exists()
+    assert (sorted_dir / "npx_1hz_trimmed.txt").exists()
+    assert (sorted_dir / "blackrock_1hz.txt").exists()     # read from here
+    after = sorted(br_root.rglob("*")) if br_root.exists() else []
+    assert after == before
+
+def _ptp_session_with_a_sorting(tmp_path):
+    """Blackrock 1 Hz on a PTP clock (~1.8e9 s), SpikeGLX from zero, TPrime "installed"."""
+    import dataclasses
+
+    from spikesorting._sync import catgt
+
+    session = _session(tmp_path)
+    session = dataclasses.replace(
+        session, machine=dataclasses.replace(session.machine, tprime_dir=tmp_path / "tp")
+    )
+    for system in ("blackrock", "neuropixels"):
+        session.paths.sync_for(system).mkdir(parents=True, exist_ok=True)
+    origin = 1_792_273_300.0
+    npx = np.arange(0.0, 600.0, 1.0) + 5.0
+    catgt.write_edge_file(session.paths.sync_for("neuropixels") / "npx_1hz.txt", npx)
+    record_edge_rate(session.paths.sync_for("neuropixels"))
+    catgt.write_edge_file(session.paths.sync_for("blackrock") / "blackrock_1hz.txt",
+                          npx + origin)
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    sorted_dir.mkdir(parents=True, exist_ok=True)
+    np.save(sorted_dir / "spike_times.npy", np.array([300_000, 600_000, 900_000]))
+    (sorted_dir / "params.py").write_text("sample_rate = 30000.0\n", encoding="utf-8")
+    return session, origin
+
+
+def test_tprime_sees_the_blackrock_reference_beside_the_spikeglx_one(tmp_path, monkeypatch):
+    # TPrime spent hours on a PTP reference 1.8e9 s from SpikeGLX's. It must be
+    # handed streams that start together, and the shift must come back off.
+    from spikesorting._sync import catgt, tprime
+
+    session, origin = _ptp_session_with_a_sorting(tmp_path)
+    seen = {}
+
+    def fake_tprime(tprime_dir, args, timeout_s=None):
+        flags = dict(a.lstrip("-").split("=", 1) for a in args)
+        to = catgt.read_edge_file(flags["tostream"])
+        frm = catgt.read_edge_file(flags["fromstream"].split(",", 1)[1])
+        _, src, dst = flags["events"].split(",")
+        seen["gap"] = float(np.abs(to - frm).max())
+        seen["timeout_s"] = timeout_s
+        np.save(dst, np.interp(np.load(src), frm, to))   # TPrime's piecewise map
+
+    monkeypatch.setattr(tprime, "run_tprime", fake_tprime)
+    result = ss.time_remapping(session, "neuropixels")
+
+    assert seen["gap"] < 1e-3
+    assert seen["timeout_s"] is not None
+    assert result.method == "tprime"
+    assert np.allclose(np.load(result.aligned_path), origin + np.array([10.0, 20.0, 30.0]),
+                       rtol=0, atol=1e-6)
+
+
+def _tprime_rule(to, frm, t):
+    """TPrime as measured on a real session: the interval is chosen by the
+    *reference* edges, and each interval is one constant offset."""
+    k = np.clip(np.searchsorted(to, t, side="right") - 1, 0, to.size - 1)
+    return t + (to[k] - frm[k])
+
+
+def test_tprime_switches_interval_at_the_probe_edge_despite_drift(tmp_path, monkeypatch):
+    # 50 ppm over 10 min is 30 ms of drift, and every Blackrock edge carries a
+    # whole-sample jitter. With only the first difference subtracted, TPrime
+    # would pick the next interval for spikes up to 30 ms before a probe edge.
+    from spikesorting._sync import catgt, tprime
+
+    session, origin = _ptp_session_with_a_sorting(tmp_path)
+    npx = np.arange(0.0, 600.0, 1.0) + 5.0
+    jitter = np.random.default_rng(1).integers(-3, 4, npx.size) / 30000.0
+    br = origin + npx * (1 + 50e-6) + jitter
+    catgt.write_edge_file(session.paths.sync_for("blackrock") / "blackrock_1hz.txt", br)
+    # spikes 1 ms before each probe edge: inside the window the old shift got wrong
+    spikes_s = npx[10:500] - 1e-3
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    np.save(sorted_dir / "spike_times.npy", np.round(spikes_s * 30000).astype(np.int64))
+    seen = {}
+
+    def fake_tprime(tprime_dir, args, timeout_s=None):
+        flags = dict(a.lstrip("-").split("=", 1) for a in args)
+        to = catgt.read_edge_file(flags["tostream"])
+        frm = catgt.read_edge_file(flags["fromstream"].split(",", 1)[1])
+        _, src, dst = flags["events"].split(",")
+        seen["gap"] = float(np.abs(to - frm).max())
+        seen["events"] = Path(src)
+        np.save(dst, _tprime_rule(to, frm, np.load(src)))
+
+    monkeypatch.setattr(tprime, "run_tprime", fake_tprime)
+    result = ss.time_remapping(session, "neuropixels")
+
+    assert result.method == "tprime"
+    assert seen["gap"] < 2e-4                         # residual only, no drift
+    assert not seen["events"].exists()                # the scaled copy is removed
+    t = np.round(spikes_s * 30000) / 30000.0
+    m = result.mapping
+    k = np.searchsorted(npx, t, side="right") - 1     # the probe's own interval
+    expected = m.slope * t + m.intercept + (br[k] - (m.slope * npx[k] + m.intercept))
+    # 2 us: edge files carry 6 decimals and float64 at 1.8e9 s; the wrong
+    # interval would be off by the jitter step, 33-200 us.
+    assert np.allclose(np.load(result.aligned_path), expected, rtol=0, atol=2e-6)
+
+
+def test_a_dropped_1hz_pulse_reaches_tprime_as_matched_pairs(tmp_path, monkeypatch):
+    # One interior Blackrock pulse missing: the line is fitted on the pairs, and
+    # TPrime must get those same pairs. The trimmed trains (600 vs 599 edges)
+    # used to reach it, crash its log line with a ValueError the TPrime
+    # fallback does not catch, and -- had they got through -- shift every
+    # interval after the gap by one cycle.
+    from spikesorting._sync import catgt, tprime
+
+    session, origin = _ptp_session_with_a_sorting(tmp_path)
+    npx = np.arange(0.0, 600.0, 1.0) + 5.0
+    br = np.delete(npx + origin, 250)
+    catgt.write_edge_file(session.paths.sync_for("blackrock") / "blackrock_1hz.txt", br)
+    seen = {}
+
+    def fake_tprime(tprime_dir, args, timeout_s=None):
+        flags = dict(a.lstrip("-").split("=", 1) for a in args)
+        to = catgt.read_edge_file(flags["tostream"])
+        frm = catgt.read_edge_file(flags["fromstream"].split(",", 1)[1])
+        _, src, dst = flags["events"].split(",")
+        seen["sizes"] = (to.size, frm.size)
+        seen["gap"] = float(np.abs(to - frm).max())
+        np.save(dst, _tprime_rule(to, frm, np.load(src)))
+
+    monkeypatch.setattr(tprime, "run_tprime", fake_tprime)
+    result = ss.time_remapping(session, "neuropixels")
+
+    assert result.method == "tprime"
+    assert seen["sizes"][0] == seen["sizes"][1]
+    assert seen["gap"] < 1e-5
+    assert np.allclose(np.load(result.aligned_path), origin + np.array([10.0, 20.0, 30.0]),
+                       rtol=0, atol=1e-5)
+    aligned = session.paths.aligned
+    assert (catgt.read_edge_file(aligned / "blackrock_1hz_trimmed.txt").size
+            == catgt.read_edge_file(aligned / "npx_1hz_trimmed.txt").size)
+
+
+def test_a_stuck_tprime_falls_back_to_the_fitted_line(tmp_path, monkeypatch):
+    from spikesorting._sync import tprime
+
+    session, origin = _ptp_session_with_a_sorting(tmp_path)
+
+    def stuck(tprime_dir, args, timeout_s=None):
+        raise tprime.TPrimeTimeout("TPrime still running after 600 s; stopped it")
+
+    monkeypatch.setattr(tprime, "run_tprime", stuck)
+    result = ss.time_remapping(session, "neuropixels")
+
+    assert result.method == "linear_fit"
+    assert np.allclose(np.load(result.aligned_path), origin + np.array([10.0, 20.0, 30.0]),
+                       rtol=0, atol=1e-6)
+    saved = json.loads((session.paths.aligned / "time_map.json").read_text())
+    assert saved["method"] == "linear_fit"
+    assert "still running" in saved["tprime_error"]
+
+
+@pytest.mark.parametrize("tprime_writes", ["nothing", "too few", "nan"])
+def test_tprime_output_that_is_not_one_finite_time_per_spike_falls_back(
+        tmp_path, monkeypatch, tprime_writes):
+    # TPrime exiting cleanly is not proof it wrote anything. A previous run's
+    # aligned file sits where the output used to go; it must never be read back.
+    from spikesorting._sync import tprime
+
+    session, origin = _ptp_session_with_a_sorting(tmp_path)
+    previous = pipeline._aligned_spike_path(session, "neuropixels")
+    np.save(previous, np.array([7.0, 8.0, 9.0]))
+
+    def fake_tprime(tprime_dir, args, timeout_s=None):
+        flags = dict(a.lstrip("-").split("=", 1) for a in args)
+        _, src, dst = flags["events"].split(",")
+        assert Path(dst) != previous
+        if tprime_writes == "too few":
+            np.save(dst, np.load(src)[:-1])
+        elif tprime_writes == "nan":
+            np.save(dst, np.full(np.load(src).size, np.nan))
+
+    monkeypatch.setattr(tprime, "run_tprime", fake_tprime)
+    result = ss.time_remapping(session, "neuropixels")
+
+    assert result.method == "linear_fit"
+    assert np.allclose(np.load(result.aligned_path), origin + np.array([10.0, 20.0, 30.0]),
+                       rtol=0, atol=1e-6)
+    saved = json.loads((session.paths.aligned / "time_map.json").read_text())
+    assert "TPrime" in saved["tprime_error"]
+    assert not list(session.paths.aligned.glob("*_tprime_out.npy"))
 
 
 def _plant_burst_on_the_onebox_clock(session, with_onebox_1hz):
@@ -1418,6 +2136,7 @@ def _plant_burst_on_the_onebox_clock(session, with_onebox_1hz):
     catgt.write_edge_file(br_sync / "blackrock_1hz.txt", br_1hz)
     catgt.write_edge_file(br_sync / "blackrock_burst.txt", br_burst)
     catgt.write_edge_file(npx_sync / "npx_1hz.txt", to_probe(br_1hz))
+    record_edge_rate(npx_sync)
     catgt.write_edge_file(npx_sync / "npx_burst.txt", to_onebox(to_probe(br_burst)))
     if with_onebox_1hz:
         catgt.write_edge_file(npx_sync / "npx_obx_1hz.txt", to_onebox(to_probe(br_1hz)))
@@ -1435,9 +2154,104 @@ def test_the_burst_is_mapped_off_the_onebox_clock_before_validation(tmp_path):
     assert report.max_residual_s < 1e-5
     time_map = json.loads((session.paths.aligned / "time_map.json").read_text())
     assert time_map["burst_clock"] == "probe"
+    assert time_map["onebox_to_blackrock"]["validated_by"] == "validation.json"
     assert time_map["onebox_to_probe"]["drift_ppm"] == pytest.approx(30.0, abs=0.01)
     validation = json.loads((session.paths.aligned / "validation.json").read_text())
     assert validation["burst_clock"] == "probe"
+
+    # The report lands in the probe's export, beside the data it describes.
+    export = session.paths.export_for("neuropixels")
+    sync = json.loads((export / "sync_report.json").read_text())
+    assert sync["verdict"] == "PASS"
+    assert sync["channels"][-1]["max_ms"] == pytest.approx(report.max_residual_s * 1e3)
+    assert "Verdict: PASS" in (export / "sync_report.txt").read_text()
+
+    # The composed map takes a OneBox time -- an eye or photodiode sample --
+    # straight onto Blackrock time: here the planted burst, recorded on the OneBox.
+    composed = time_map["onebox_to_blackrock"]
+    assert composed["formula"] == "blackrock_time = slope * onebox_time + intercept"
+    obx_burst = np.loadtxt(session.paths.sync_for("neuropixels") / "npx_burst.txt")
+    br_burst = np.loadtxt(session.paths.sync_for("blackrock") / "blackrock_burst.txt")
+    mapped = composed["slope"] * obx_burst + composed["intercept"]
+    assert np.abs(mapped - br_burst).max() < 1e-5
+
+
+def test_validation_checks_the_map_the_spikes_went_through(tmp_path):
+    # Spikes mapped by TPrime follow its per-interval offsets, not the line. Here
+    # those offsets are 3 ms off for the second half: the line still passes, the
+    # check of what the spikes got must not.
+    from spikesorting._sync import catgt
+
+    session = _session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    aligned = session.paths.aligned
+    time_map = json.loads((aligned / "time_map.json").read_text())
+    time_map["method"] = "tprime"
+    (aligned / "time_map.json").write_text(json.dumps(time_map))
+    br = catgt.read_edge_file(aligned / "blackrock_1hz_trimmed.txt")
+    br[br.size // 2:] += 3e-3
+    catgt.write_edge_file(aligned / "blackrock_1hz_trimmed.txt", br)
+
+    report = ss.validate_remapping(session, figures=False)
+
+    validation = json.loads((aligned / "validation.json").read_text())
+    assert validation["map_checked"] == "tprime"
+    assert validation["line"]["passed"]
+    assert not report.passed and report.max_residual_s > 2e-3
+    sync = json.loads((session.paths.export_for("neuropixels") / "sync_report.json").read_text())
+    assert sync["verdict"] == "FAIL"
+
+
+def test_a_tprime_map_that_cannot_be_checked_is_not_accepted(tmp_path):
+    # The spikes went through TPrime; its pairs are gone. Checking the line
+    # instead would accept a map the spikes never got.
+    session = _session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    aligned = session.paths.aligned
+    time_map = json.loads((aligned / "time_map.json").read_text())
+    time_map["method"] = "tprime"
+    (aligned / "time_map.json").write_text(json.dumps(time_map))
+    (aligned / "npx_1hz_trimmed.txt").unlink()
+
+    report = ss.validate_remapping(session, figures=False)
+
+    assert not report.passed and "cannot be checked" in report.fail_reason
+    validation = json.loads((aligned / "validation.json").read_text())
+    assert validation["accepted"] is False
+    assert validation["map_checked"] == "tprime (could not be checked)"
+    assert validation["line"]["passed"]           # the line alone would have passed
+
+
+def test_a_corrupt_blackrock_pair_file_fails_a_burst_check_that_had_passed(tmp_path):
+    # The TPrime map passed against the burst; then its Blackrock pair file is
+    # not numbers. The coverage diagnostic reads that file too, and must give
+    # up quietly so the refusal is recorded rather than a ValueError raised.
+    session = _session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    aligned = session.paths.aligned
+    time_map = json.loads((aligned / "time_map.json").read_text())
+    time_map["method"] = "tprime"
+    (aligned / "time_map.json").write_text(json.dumps(time_map))
+    assert ss.validate_remapping(session, figures=False).passed      # valid TPrime map
+    assert json.loads((aligned / "validation.json").read_text())["accepted"] is True
+
+    (aligned / "blackrock_1hz_trimmed.txt").write_text("not a number\n")
+    report = ss.validate_remapping(session, figures=False)
+
+    assert not report.passed
+    assert "blackrock_1hz_trimmed.txt cannot be read" in report.fail_reason
+    validation = json.loads((aligned / "validation.json").read_text())
+    assert validation["accepted"] is False and validation["verdict"] == "FAIL"
+    assert validation["map_checked"] == "tprime (could not be checked)"
+    assert validation["shared_s"] is None
+    export = session.paths.export_for("neuropixels")
+    sync = json.loads((export / "sync_report.json").read_text())
+    assert sync["verdict"] == "FAIL"
+    assert "blackrock_1hz_trimmed.txt cannot be read" in sync["verdict_note"]
+    assert "blackrock_1hz_trimmed.txt cannot be read" in (export / "sync_report.txt").read_text()
 
 
 def test_without_the_onebox_1hz_wave_the_onebox_drift_fails_validation(tmp_path):
@@ -1455,8 +2269,155 @@ def test_without_the_onebox_1hz_wave_the_onebox_drift_fails_validation(tmp_path)
     time_map = json.loads((session.paths.aligned / "time_map.json").read_text())
     assert time_map["burst_clock"] == "onebox"
     assert time_map["onebox_to_probe"] is None
+    assert time_map["onebox_to_blackrock"] is None   # no OneBox fit, nothing to compose
     validation = json.loads((session.paths.aligned / "validation.json").read_text())
     assert validation["burst_clock"] == "onebox"
+
+
+def test_time_map_states_the_sample_rate_each_clock_counts_seconds_at(tmp_path):
+    # A OneBox time is sample / obSampRate. Writing the measured rate out is what
+    # stops an analog channel being converted at the nominal 30 kHz by hand.
+    from conftest import spikeglx_run
+
+    binary = spikeglx_run(tmp_path / "npx", obx_phase=0.3)[0]
+    for path, key, rate in (
+        (binary.with_suffix(".meta"), "imSampRate", "30000.1234"),
+        (next(binary.parents[1].glob("*.obx.meta")), "obSampRate", "29999.8765"),
+    ):
+        path.write_text(
+            path.read_text().replace(f"{key}=30000", f"{key}={rate}"), encoding="utf-8"
+        )
+    session = _session(tmp_path, f"neuropixels:\n  bin_file: '{binary}'\n")
+
+    clocks = pipeline._clock_definitions(session)
+
+    assert clocks["spikeglx_time"]["sample_rate_hz"] == pytest.approx(30000.1234)
+    assert clocks["onebox_time"]["sample_rate_hz"] == pytest.approx(29999.8765)
+    assert clocks["onebox_time"]["file"].endswith(".obx0.obx.bin")
+    assert "NSP" in clocks["blackrock_time"]["definition"]
+
+
+def test_a_missing_binary_leaves_the_rate_null_rather_than_losing_the_map(tmp_path):
+    session = _session(tmp_path)                 # bin_file '/a/x.bin' does not exist
+
+    clocks = pipeline._clock_definitions(session)
+
+    assert clocks["spikeglx_time"]["sample_rate_hz"] is None
+    assert clocks["onebox_time"] is None         # no run layout, so no OneBox
+
+
+def _analog_session(tmp_path):
+    """A session over a real SpikeGLX run folder whose OneBox has XA0, XA1, SY."""
+    from conftest import spikeglx_run
+
+    binary = spikeglx_run(tmp_path / "npx", obx_phase=0.3)[0]
+    return _session(
+        tmp_path,
+        "export_analog: true\n"
+        f"neuropixels:\n  bin_file: '{binary}'\n  analog_channels: {{eye_x: 1}}\n",
+    )
+
+
+def _analog_fields(path):
+    import h5py
+
+    with h5py.File(path, "r") as handle:
+        a = handle["analog"]
+        return {
+            "timebase": bytes(a["timebase"][()].ravel().astype(np.uint8)).decode(),
+            "names": bytes(a["names"][()].ravel().astype(np.uint8)).decode(),
+            "fs": float(a["fs"][()].ravel()[0]),
+            "t0_blackrock": float(a["t0_blackrock"][()].ravel()[0]),
+            "fs_blackrock": float(a["fs_blackrock"][()].ravel()[0]),
+        }
+
+
+def test_the_onebox_analog_export_is_stamped_with_onebox_to_blackrock(tmp_path):
+    # Exported straight after the recording, before any map: OneBox clock.
+    session = _analog_session(tmp_path)
+    path = ss.extract_analog(session, "neuropixels")
+
+    assert path.parent == session.paths.export_for("neuropixels")
+    before = _analog_fields(path)
+    assert before["timebase"] == "onebox"
+    assert before["names"] == "sync_burst,eye_x"
+    assert np.isnan(before["t0_blackrock"])
+
+    # time_remapping fits the map, but it is provisional: still the OneBox clock.
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    ss.time_remapping(session, "neuropixels")
+    assert _analog_fields(path)["timebase"] == "onebox"
+
+    # validate_remapping accepts it (burst PASS) and stamps it in, samples untouched.
+    assert ss.validate_remapping(session, figures=False).passed
+    composed = json.loads(
+        (session.paths.aligned / "time_map.json").read_text()
+    )["onebox_to_blackrock"]
+    after = _analog_fields(path)
+    assert after["timebase"] == "blackrock"
+    assert after["t0_blackrock"] == pytest.approx(composed["intercept"])
+    assert after["fs_blackrock"] == pytest.approx(after["fs"] / composed["slope"])
+
+    # A re-export after acceptance is stamped at once rather than left on the
+    # OneBox clock until validation runs again.
+    path.unlink()
+    assert _analog_fields(ss.extract_analog(session, "neuropixels"))["timebase"] == "blackrock"
+
+    # A new map withdraws the acceptance: back on the OneBox clock until checked.
+    ss.time_remapping(session, "neuropixels")
+    assert _analog_fields(path)["timebase"] == "onebox"
+    assert np.isnan(_analog_fields(path)["t0_blackrock"])
+    assert not (session.paths.aligned / "validation.json").exists()
+
+
+def test_a_map_that_fails_its_check_is_never_stamped_or_exported(tmp_path):
+    # Burst check FAIL (the OneBox drift left in): validation.json says not
+    # accepted, the exports stay on their own clocks, and the aligned spike
+    # times are not used even though time_remapping wrote them.
+    from types import SimpleNamespace
+
+    session = _analog_session(tmp_path)
+    path = ss.extract_analog(session, "neuropixels")
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=False)
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    sorted_dir.mkdir(parents=True, exist_ok=True)
+    samples = np.array([3_000_000, 6_000_000, 9_000_000])
+    np.save(sorted_dir / "spike_times.npy", samples)
+    (sorted_dir / "params.py").write_text("sample_rate = 30000.0\n", encoding="utf-8")
+
+    result = ss.time_remapping(session, "neuropixels")
+    assert result.aligned_path.exists()
+    report = ss.validate_remapping(session, figures=False)
+
+    assert not report.passed
+    assert json.loads((session.paths.aligned / "validation.json").read_text())[
+        "accepted"] is False
+    assert _analog_fields(path)["timebase"] == "onebox"
+    _, timebase, _ = pipeline._resolve_spike_seconds(
+        session, "neuropixels", SimpleNamespace(spike_samples=samples))
+    assert timebase == "sorter"
+
+
+def test_without_a_onebox_1hz_fit_the_analog_export_stays_on_the_onebox_clock(tmp_path):
+    session = _analog_session(tmp_path)
+    path = ss.extract_analog(session, "neuropixels")
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=False)
+
+    ss.time_remapping(session, "neuropixels")
+
+    # Stamping it with the probe's map would be off by the OneBox's own drift.
+    assert _analog_fields(path)["timebase"] == "onebox"
+
+
+def test_the_analog_export_says_why_it_did_not_run(tmp_path):
+    session = _session(tmp_path)                      # export_analog unstated
+    assert ss.extract_analog(session, "neuropixels") is None
+    assert ss.skip_reason(session, ss.extract_analog, "neuropixels") == "export_analog is false"
+    assert "Blackrock" in ss.skip_reason(session, ss.extract_analog, "blackrock")
+
+    asked = _session(tmp_path, "export_analog: true\n")   # '/a/x.bin': no run, no OneBox
+    assert ss.extract_analog(asked, "neuropixels") is None
+    assert "OneBox" in ss.skip_reason(asked, ss.extract_analog, "neuropixels")
 
 
 def test_two_probes_are_each_fitted_onto_blackrock_time_on_their_own(tmp_path):
@@ -1484,6 +2445,7 @@ def test_two_probes_are_each_fitted_onto_blackrock_time_on_their_own(tmp_path):
         sync_dir = session.paths.sync_for("neuropixels")
         sync_dir.mkdir(parents=True, exist_ok=True)
         catgt.write_edge_file(sync_dir / "npx_1hz.txt", (br - offset) * (1 + ppm))
+        record_edge_rate(sync_dir)
 
         result = ss.time_remapping(session, "neuropixels")
         assert result.mapping.intercept == pytest.approx(offset, abs=1e-6)
@@ -1610,7 +2572,8 @@ def test_a_resort_clears_phys_state_from_the_previous_one(tmp_path):
     final, work = tmp_path / "kilosort4", tmp_path / "cache"
     (final / ".phy").mkdir(parents=True)
     (final / ".phy" / "spikes_per_cluster.pkl").write_bytes(b"old")
-    for name in ("phy.log", "cluster_info.tsv", "cluster_group.tsv", "cluster_mylabel.tsv"):
+    for name in ("phy.log", "cluster_info.tsv", "cluster_group.tsv", "cluster_mylabel.tsv",
+                 "neuropixels_spike_seconds.npy", "neuropixels_spike_seconds_blackrock.npy"):
         (final / name).write_text("old")
     for name in ("nsp_time_map.json", "sync_edges.txt"):  # not the sorting's
         (final / name).write_text("keep")
@@ -1627,6 +2590,117 @@ def test_a_resort_clears_phys_state_from_the_previous_one(tmp_path):
         "spike_times.npy", "sync_edges.txt",
     ]
     assert (final / "cluster_group.tsv").read_text() == "new"
+
+
+def test_aligned_times_are_bound_to_the_sorting_they_were_mapped_from(tmp_path):
+    # A sorting copied in from the cluster, file times preserved and older than
+    # the last alignment: same spike count, different spikes. Only the content
+    # tells them apart, so the aligned times must be refused.
+    import os
+    import shutil
+    from types import SimpleNamespace
+
+    session = _session(tmp_path)
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    sorted_dir.mkdir(parents=True, exist_ok=True)
+    _plant_acceptance(session)
+    aligned = pipeline._aligned_spike_path(session, "neuropixels")
+    old = np.array([10, 20, 30])
+    np.save(aligned, np.array([1.0, 2.0, 3.0]))
+    pipeline._write_aligned_identity(aligned, old, "tprime")
+
+    def resolve(samples):
+        phy = SimpleNamespace(spike_samples=samples)
+        return pipeline._resolve_spike_seconds(session, "neuropixels", phy)[:2]
+
+    seconds, timebase = resolve(old)
+    assert timebase == "blackrock" and np.array_equal(seconds, [1.0, 2.0, 3.0])
+
+    hpc = tmp_path / "hpc_spike_times.npy"
+    np.save(hpc, np.array([11, 21, 31]))
+    os.utime(hpc, (1_000_000, 1_000_000))                     # an old sort
+    shutil.copy2(hpc, sorted_dir / "spike_times.npy")         # times preserved
+    assert resolve(np.load(sorted_dir / "spike_times.npy")) == (None, "sorter")
+
+    # No record at all (written before there was one): refused too.
+    pipeline._aligned_identity_path(aligned).unlink()
+    assert resolve(old) == (None, "sorter")
+
+
+@pytest.mark.parametrize("payload, why", [
+    (b"not a numpy file", "cannot be read"),
+    (np.array([1.0]), "holds 1 times for 2 spikes"),
+    (np.array([np.nan, 2.0]), "non-finite"),
+    (np.array([1.0, np.inf]), "non-finite"),
+])
+def test_an_aligned_array_is_checked_before_it_is_exported(tmp_path, caplog, payload, why):
+    # The hash says which sorting the array was made for, not that the array
+    # itself is sound: it must load, hold one finite time per spike.
+    from types import SimpleNamespace
+
+    session = _session(tmp_path)
+    session.paths.sorted_for("neuropixels").mkdir(parents=True, exist_ok=True)
+    _plant_acceptance(session)
+    aligned = pipeline._aligned_spike_path(session, "neuropixels")
+    samples = np.array([10, 20])
+    pipeline._write_aligned_identity(aligned, samples, "tprime")
+    if isinstance(payload, bytes):
+        aligned.write_bytes(payload)
+    else:
+        np.save(aligned, payload)
+
+    phy = SimpleNamespace(spike_samples=samples)
+    seconds, timebase, _ = pipeline._resolve_spike_seconds(session, "neuropixels", phy)
+
+    assert seconds is None and timebase == "sorter"
+    assert why in caplog.text
+
+
+def test_time_remapping_records_which_sorting_it_mapped(tmp_path):
+    session, origin = _ptp_session_with_a_sorting(tmp_path)
+    import dataclasses
+    session = dataclasses.replace(
+        session, machine=dataclasses.replace(session.machine, tprime_dir=None))
+    result = ss.time_remapping(session, "neuropixels")
+    samples = np.load(session.paths.sorted_for("neuropixels") / "spike_times.npy")
+    assert pipeline._aligned_mismatch(result.aligned_path, samples) is None
+    assert pipeline._aligned_mismatch(result.aligned_path, samples + 1) is not None
+
+
+def test_firing_rates_are_taken_over_the_samples_sorted_not_the_spikes(tmp_path):
+    # 600 s of binary, Kilosort told tmin=100, tmax=400: the window is those
+    # 300 s on whichever axis the spike times are, wherever the spikes fall.
+    from types import SimpleNamespace
+
+    session = _session(tmp_path)
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    sorted_dir.mkdir(parents=True, exist_ok=True)
+    phy = SimpleNamespace(fs=30000.0)
+
+    assert pipeline._sorted_window(session, "neuropixels", phy, "sorter") is None
+
+    (sorted_dir / "run_info.json").write_text(json.dumps({
+        "settings": {"tmin": 100.0, "tmax": 400.0, "n_chan_bin": 385},
+        "preprocessing": {"n_samples": 600 * 30000},
+    }))
+    start, duration = pipeline._sorted_window(session, "neuropixels", phy, "sorter")
+    assert start == pytest.approx(100.0) and duration == pytest.approx(300.0)
+
+    (sorted_dir / "time_map.json").write_text(json.dumps({"slope": 1.00002, "intercept": 1.8e9}))
+    start, duration = pipeline._sorted_window(session, "neuropixels", phy, "blackrock")
+    assert start == pytest.approx(1.8e9 + 100.002, abs=1e-6)
+    assert duration == pytest.approx(300.006, abs=1e-4)
+
+    nsp = SimpleNamespace(apply=lambda samples: 5.0 + np.asarray(samples) / 29999.0)
+    start, duration = pipeline._sorted_window(session, "neuropixels", phy, "nsp", nsp)
+    assert start == pytest.approx(5.0 + 100 * 30000 / 29999.0)
+
+    # No tmax and a binary shorter than tmax: the binary's end.
+    (sorted_dir / "run_info.json").write_text(json.dumps({
+        "settings": {"tmin": 0, "tmax": None}, "preprocessing": {"n_samples": 60 * 30000},
+    }))
+    assert pipeline._sorted_window(session, "neuropixels", phy, "sorter") == pytest.approx(
+        (0.0, 60.0))
 
 
 def test_the_figure_draws_exactly_the_mean_the_mat_holds(tmp_path, kilosort_results, raw_reader):
@@ -1769,3 +2843,252 @@ def test_the_waveform_export_without_kilosort_says_how_to_get_it(tmp_path, monke
 
     with pytest.raises(ImportError, match="kilosort4"):
         pipeline._kilosort_preprocessing(tmp_path)
+
+
+def test_a_session_without_blackrock_says_synchronization_is_skipped(tmp_path):
+    # The [--] line is the only place a run says its times are not on Blackrock
+    # time, so it names the consequence, not just the skip.
+    npx_only = tmp_path / "npx_only.yaml"
+    npx_only.write_text(
+        f"neuropixels_dir: '{tmp_path / 'np'}'\nneuropixels:\n  bin_file: '/a/x.bin'\n",
+        encoding="utf-8",
+    )
+    session = cfg.load_session_config(npx_only, "mac", CONFIG_DIR)
+
+    for verb in (ss.time_remapping, ss.validate_remapping):
+        why = ss.skip_reason(session, verb, "neuropixels")
+        assert "no Blackrock in this session" in why
+        assert "synchronization skipped" in why and "probe clock" in why
+    assert ss.time_remapping(session, "neuropixels") is None
+
+    br_only = tmp_path / "br_only.yaml"
+    br_only.write_text(
+        f"blackrock_dir: '{tmp_path / 'br'}'\nblackrock:\n  sync_file: '/b/y.ns5'\n",
+        encoding="utf-8",
+    )
+    why = ss.skip_reason(cfg.load_session_config(br_only, "mac", CONFIG_DIR),
+                         ss.time_remapping, "neuropixels")
+    assert "no Neuropixels in this session" in why
+
+
+def test_the_sync_report_says_not_validated_without_bursts(tmp_path):
+    session = _session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    (session.paths.sync_for("neuropixels") / "npx_burst.txt").write_text("")
+    ss.time_remapping(session, "neuropixels")
+
+    result = ss.validate_remapping(session, figures=False)
+    # It ran and wrote the report: the runner must not call that "nothing to do".
+    assert result is not None and "NOT VALIDATED" in result.summary()
+    assert result.report_path.name == "sync_report.json"
+    # Nothing independent confirms the cycle: not accepted, so the runner stops.
+    assert result.passed is False
+    validation = json.loads((session.paths.aligned / "validation.json").read_text())
+    assert validation.pop("time_map_sha256") == pipeline._map_digest(session)
+    assert validation.pop("exports_accepted") is False
+    assert validation == {"verdict": "NOT VALIDATED", "n_checked": 0,
+                          "reason": result.reason, "accepted": False}
+    sync = json.loads(
+        (session.paths.export_for("neuropixels") / "sync_report.json").read_text()
+    )
+    assert sync["verdict"] == "NOT VALIDATED"
+
+
+def test_without_a_burst_the_time_map_claims_no_burst_and_no_validation(tmp_path):
+    session = _session(tmp_path)
+    _plant_burst_on_the_onebox_clock(session, with_onebox_1hz=True)
+    for name in ("npx_burst.txt", "blackrock_burst.txt"):
+        for system in ("neuropixels", "blackrock"):
+            path = session.paths.sync_for(system) / name
+            if path.exists():
+                path.write_text("")
+    ss.time_remapping(session, "neuropixels")
+
+    time_map = json.loads((session.paths.aligned / "time_map.json").read_text())
+    assert time_map["cycles_from"] != "burst"
+    assert time_map["burst_clock"] is None
+    assert time_map["onebox_to_blackrock"]["validated_by"] is None
+    assert time_map["onebox_to_probe"]["formula"].startswith("spikeglx_time =")
+
+
+def test_a_clock_map_from_another_file_is_never_applied_to_spikes(tmp_path):
+    # The .ns5 sync map and the .ns6 spike map used to share one filename in one
+    # folder; the export then converted .ns6 spikes on the .ns5's crystal.
+    from spikesorting._io.blackrock import NspSegment, NspTimeMap
+    from spikesorting._sync import extract
+
+    time_map = NspTimeMap((NspSegment(0, 1000, 1 / 30000, 5.0, 0.0),), 30000.0, "3.0", True)
+    extract._write_nsp_map(tmp_path, time_map, Path("/b/NSP_001.ns5"))
+    assert (tmp_path / extract.SYNC_NSP_MAP).exists()
+    assert not (tmp_path / "nsp_time_map.json").exists()
+
+    (tmp_path / "nsp_time_map.json").write_text(
+        json.dumps(dict(time_map.to_dict(), source="/b/NSP_001.ns5")), encoding="utf-8"
+    )
+    assert pipeline.read_nsp_time_map(tmp_path, Path("/b/HUB_001.ns6")) is None
+    assert pipeline.read_nsp_time_map(tmp_path, Path("/b/NSP_001.ns5")) is not None
+    assert pipeline.read_nsp_time_map(tmp_path) is not None   # no source to check
+
+
+def test_the_export_carries_copies_of_the_run_records(tmp_path):
+    session = _session(tmp_path)
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    prep = session.paths.preprocessed_for("neuropixels")
+    aligned = session.paths.aligned
+    for folder, name in ((sorted_dir, "run_info.json"), (sorted_dir, "kilosort4.log"),
+                         (prep, "preprocess.json"), (aligned, "time_map.json"),
+                         (aligned, "validation.json")):
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / name).write_text(name, encoding="utf-8")
+    out = session.paths.export_for("neuropixels")
+    out.mkdir(parents=True)
+
+    copied = pipeline._copy_records(session, "neuropixels", out)
+
+    assert sorted(p.name for p in copied.values()) == [
+        "kilosort4.log", "preprocess.json", "run_info.json", "time_map.json",
+        "validation.json",
+    ]
+    assert (out / "run_info.json").read_text() == "run_info.json"
+    assert (sorted_dir / "run_info.json").exists()            # copied, not moved
+
+
+def test_run_info_records_the_source_and_how_long_the_sort_took(tmp_path):
+    session = _session(tmp_path)
+    result = pipeline.SortSummary(
+        results_dir=tmp_path, n_units=3, n_spikes=10, fs=30000.0,
+        binary=Path("/p/x.bin"), settings={},
+    )
+    timing = {"preprocessing": "reused", "kilosort_s": 12.5, "total_s": 13.0}
+    pipeline._write_run_info(session, "neuropixels", result, {}, timing)
+
+    info = json.loads((tmp_path / "run_info.json").read_text())
+    assert info["timing"]["kilosort_s"] == 12.5
+    assert info["source_recording"].endswith("x.bin")
+
+
+def test_a_sort_records_its_time_by_phase(tmp_path, monkeypatch):
+    # Loading, preprocessing, sorting, postprocessing: the table the user
+    # compares a local-disk run against a share run with.
+    _fake_kilosort(monkeypatch, [])
+    session = _npx_session(tmp_path)
+
+    result = ss.sort_with_kilosort(session, "neuropixels")
+
+    timing = json.loads((result.results_dir / "run_info.json").read_text())["timing"]
+    assert list(timing["phases"]) == ["loading", "preprocessing", "sorting", "postprocessing"]
+    sorting = {r["step"]: r["seconds"] for r in timing["phases"]["sorting"]["steps"]}
+    assert sorting["kilosort: drift correction"] == 1.5
+    post = [r["step"] for r in timing["phases"]["postprocessing"]["steps"]]
+    assert post[0] == "kilosort: saving results"
+    assert timing["sorting_run"]["machine"] == session.machine.name
+    assert timing["total_s"] == pytest.approx(
+        sum(p["seconds"] for p in timing["phases"].values()), abs=0.05)
+
+
+def test_record_timing_adds_the_export_phase_and_writes_the_table(tmp_path):
+    session = _session(tmp_path)
+    sorted_dir = session.paths.sorted_for("neuropixels")
+    sorted_dir.mkdir(parents=True)
+    sort_timing = {
+        "sorting_run": {"machine": "hpc", "device": "cuda"},
+        "phases": {"sorting": {"seconds": 100.0,
+                               "steps": [{"step": "kilosort", "seconds": 100.0}]}},
+        "total_s": 100.0,
+    }
+    (sorted_dir / "run_info.json").write_text(json.dumps({"timing": sort_timing}))
+    stages = [
+        {"stage": "extract_sync", "seconds": 20.0, "started": "2026-11-12T10:00:00+00:00"},
+        {"stage": "export_results", "seconds": 30.0, "started": "2026-11-12T10:01:00+00:00",
+         "steps": {"load sorting & spike times": 5.0, "figures": 25.0}},
+    ]
+
+    report = ss.record_timing(session, "neuropixels", stages)
+
+    timing = json.loads((sorted_dir / "run_info.json").read_text())["timing"]
+    export = timing["phases"]["exporting"]
+    assert export["seconds"] == 50.0
+    assert [r["step"] for r in export["steps"]] == [
+        "extract_sync", "export_results: load sorting & spike times", "export_results: figures"]
+    assert timing["total_s"] == 150.0
+    assert timing["exporting_run"]["started"] == "2026-11-12T10:00:00+00:00"
+    out = session.paths.export_for("neuropixels")
+    assert json.loads((out / "run_info.json").read_text())["timing"] == timing
+    assert "exporting" in (out / "timing.txt").read_text()
+    assert report["path"] == out / "timing.txt"
+
+
+def test_record_timing_without_a_sorting_does_nothing(tmp_path):
+    assert ss.record_timing(_session(tmp_path), "neuropixels", []) is None
+
+
+def test_a_long_read_reports_its_progress(caplog):
+    import logging
+
+    from spikesorting import pipeline
+
+    with caplog.at_level(logging.INFO, logger=pipeline.log.name):
+        assert list(pipeline._with_progress(list(range(100)), "waveforms")) == list(range(100))
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("waveforms:")]
+    assert len(lines) == 10                      # 10% .. 90%, then done
+    assert "50% (50/100 reads" in lines[4] and "left" in lines[4]
+    assert lines[-1].startswith("waveforms: done, 100 reads in")
+
+
+def test_an_old_run_info_spike_count_is_corrected_from_the_sorting(tmp_path):
+    from spikesorting import pipeline
+
+    np.save(tmp_path / "spike_times.npy", np.arange(10))
+    (tmp_path / "run_info.json").write_text(json.dumps({"n_spikes": 30}), encoding="utf-8")
+    info = pipeline._corrected_run_info(tmp_path)
+    assert info["n_spikes"] == 10 and info["n_spikes_recorded"] == 30
+    assert json.loads((tmp_path / "run_info.json").read_text())["n_spikes"] == 10
+
+
+def test_the_waveform_record_names_catgt_then_kilosort(tmp_path):
+    from spikesorting import pipeline
+
+    ks = {"highpass_cutoff": 300.0, "do_CAR": False, "invert_sign": False}
+    chain = pipeline._waveform_chain(
+        {"preprocessing": {"engine": "catgt", "steps": ["CatGT -gblcar"]}}, tmp_path / "x.bin", ks)
+    assert chain["input_preprocessed_by"] == "catgt"
+    assert chain["summary"].startswith("catgt, then kilosort reader: 300 Hz")
+    raw = pipeline._waveform_chain({}, tmp_path / "x.bin", ks)
+    assert raw["input_preprocessed_by"].startswith("none")
+
+
+def test_units_csv_shape_columns_come_from_the_measured_waveforms(
+        tmp_path, kilosort_results, raw_reader):
+    # The trough planted in the recording, not Kilosort's whitened template.
+    import shutil
+
+    import pandas as pd
+
+    session = _session(
+        tmp_path,
+        "blackrock:\n  sync_file: '/b/y.ns5'\n  spike_file: '/b/HUB.ns6'\n"
+        "  waveforms:\n    window_ms: 2.0\n",
+    )
+    sorted_dir = session.paths.sorted_for("blackrock")
+    sorted_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(kilosort_results, sorted_dir, dirs_exist_ok=True)
+    n_chan = 8
+    spikes = np.load(sorted_dir / "spike_times.npy")
+    clusters = np.load(sorted_dir / "spike_clusters.npy")
+    peak_channel = {0: 2, 1: 5, 2: 7}
+    binary = tmp_path / "br" / "HUB.bin"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    samples = np.zeros((int(spikes.max()) + 5000, n_chan), dtype=np.int16)
+    for s, c in zip(spikes, clusters):
+        samples[int(s), peak_channel[int(c)]] = -400
+    binary.write_bytes(samples.tobytes())
+    (sorted_dir / "run_info.json").write_text(
+        json.dumps({"binary": str(binary), "settings": {"n_chan_bin": n_chan, "fs": 30000.0}}),
+        encoding="utf-8",
+    )
+
+    out = ss.export_results(session, "blackrock")
+
+    table = pd.read_csv(out["paths"]["units"])
+    assert (table["trough_amplitude"] <= -400).all()     # the planted trough, at least
+    assert set(table["waveform_units"]) == {"ADC"}       # no .ns6 header to give a gain

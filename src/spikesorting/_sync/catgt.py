@@ -21,6 +21,7 @@ Reference: https://billkarsh.github.io/SpikeGLX/More_help/CatGT_ReadMe.html
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +39,7 @@ __all__ = [
     "onebox_selection",
     "run_catgt",
     "find_edge_files",
+    "fresh_dest",
 ]
 
 #: CatGT stream-type selector (js) -> the command-line flag that enables it.
@@ -112,7 +114,7 @@ def analog_spec(
     millisec: float = 0,
     label: str = "",
 ) -> ExtractorSpec:
-    """Analog extractor, e.g. the 14 s coded burst on OneBox XA1."""
+    """Analog extractor, e.g. the 14 s coded burst on OneBox XA0."""
     return ExtractorSpec(
         "xa", js, ip, word, thresh1_v=thresh1_v, thresh2_v=thresh2_v, millisec=millisec, label=label
     )
@@ -146,14 +148,23 @@ def read_edge_file(path: str | Path) -> np.ndarray:
     return np.asarray([float(token) for token in text], dtype=np.float64)
 
 
+#: What to launch, in order. ``CatGT.exe`` first: on Windows ``runit.bat`` only
+#: forwards its arguments to it, and going through ``cmd.exe`` costs a run its
+#: Ctrl+C -- cmd answers one with "Terminate batch job (Y/N)?", asked into the
+#: output this wrapper captures, so the run waits forever for a reply nobody can
+#: see. ``runit.sh`` is kept on Linux, where it sets the library path CatGT
+#: needs; ``runit.bat`` only if the executable itself is missing.
+_LAUNCHERS = ("CatGT.exe", "runit.sh", "runit.bat")
+
+
 def catgt_script(catgt_dir: str | Path) -> Path:
-    """Locate ``runit.bat`` (Windows) or ``runit.sh`` (Linux) inside ``catgt_dir``."""
+    """What to run inside ``catgt_dir``: ``CatGT.exe``, else ``runit.sh``/``.bat``."""
     catgt_dir = Path(catgt_dir)
-    for name in ("runit.bat", "runit.sh"):
+    for name in _LAUNCHERS:
         candidate = catgt_dir / name
         if candidate.exists():
             return candidate
-    raise FileNotFoundError(f"no runit.bat or runit.sh in {catgt_dir}")
+    raise FileNotFoundError(f"no CatGT.exe, runit.sh or runit.bat in {catgt_dir}")
 
 
 #: RunLayout.folders -> the CatGT flag that tells it where the files are.
@@ -242,6 +253,9 @@ def run_catgt(
     result = subprocess.run(
         command,
         cwd=str(Path(catgt_dir)),
+        # Nothing to read from: whatever is launched can never sit waiting on a
+        # keyboard whose prompt went into the captured output, unseen.
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         timeout=timeout_s,
@@ -266,6 +280,22 @@ def _log_tail(path: Path, lines: int = 20) -> str:
     except OSError:
         return f"{path.name}: not found at {path}"
     return f"{path} (last {lines} lines):\n" + "\n".join(text[-lines:])
+
+
+def fresh_dest(dest: str | Path) -> Path:
+    """Empty ``dest`` for a CatGT run about to write into it, and return it.
+
+    Whatever is found there afterwards is then this run's output. CatGT reports
+    its errors in ``CatGT.log`` and can exit 0 having written nothing, so a
+    previous run's files left in place would be read back as new -- a binary
+    filtered with the old settings, or edges the NumPy detector disagrees with.
+    Only for a run that is actually starting: reuse never comes through here.
+    """
+    dest = Path(dest)
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)          # CatGT refuses a -dest that does not exist
+    return dest
 
 
 def find_edge_files(dest: str | Path) -> dict[str, Path]:

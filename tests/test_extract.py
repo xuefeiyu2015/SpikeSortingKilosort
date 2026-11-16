@@ -7,6 +7,8 @@ without CatGT, TPrime, Kilosort or a GPU, which is exactly the HPC configuration
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 from conftest import coded_burst_times, square_wave
@@ -50,6 +52,7 @@ def make_session(tmp_path, bin_file, _name="synthetic", n_chan=385, fs=30000, **
         f"  bin_file: '{bin_file}'",
         f"  n_chan_bin: {n_chan if n_chan is not None else 'null'}",
         f"  sample_rate: {fs if fs is not None else 'null'}",
+        "  has_sy_word: true",                 # read only when there is no .meta
         "  sync_bit: 6",
         "  sync_pulse_ms: 500",
     ]
@@ -58,6 +61,10 @@ def make_session(tmp_path, bin_file, _name="synthetic", n_chan=385, fs=30000, **
     session_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     session = cfg.load_session_config(session_path, "test", tmp_path / "configs")
+    for system in ("neuropixels", "blackrock"):
+        directory = session.paths.dir_for(system)
+        if directory is not None:
+            directory.mkdir(parents=True, exist_ok=True)   # the recordings' folders
     session.paths.mkdirs()
     return session
 
@@ -201,6 +208,51 @@ def test_a_run_without_a_onebox_has_no_onebox_edges(tmp_path):
     assert "-xd=1," not in report.catgt_commands[0]
 
 
+def test_a_stream_skipped_on_a_rerun_leaves_no_edge_file_behind(tmp_path):
+    # Same output folder, binary now declared as carrying no SY word: the 1 Hz
+    # file from the earlier run must go, or time_remapping fits a map from a
+    # train this recording never produced. Missing, it raises instead.
+    bin_file = write_ap_with_sync(tmp_path / "synthetic.imec0.ap.bin", duration_s=10.0)
+    session = make_session(tmp_path, bin_file)
+    extract.extract_neuropixels_edges(session)
+    edge = session.paths.sync_for("neuropixels") / "npx_1hz.txt"
+    assert edge.exists()
+
+    yaml = tmp_path / "configs" / "synthetic.yaml"
+    yaml.write_text(yaml.read_text().replace("has_sy_word: true", "has_sy_word: false"))
+    rerun = cfg.load_session_config(yaml, "test", tmp_path / "configs")
+    report = extract.extract_neuropixels_edges(rerun)
+
+    assert extract.NPX_1HZ not in report.edge_sets
+    assert not edge.exists()
+
+
+def test_a_onebox_gone_on_a_rerun_takes_its_burst_with_it(tmp_path):
+    # A leftover npx_burst.txt is the worst case: validation would check the map
+    # against another recording's held-out bursts and could PASS.
+    from conftest import spikeglx_run
+
+    ap = spikeglx_run(tmp_path / "npx", obx_phase=0.4)[0]
+    session = make_session(tmp_path, ap, n_chan=None, fs=None)
+    extract.extract_neuropixels_edges(session)
+    sync_dir = session.paths.sync_for("neuropixels")
+    assert (sync_dir / "npx_burst.txt").exists()
+    assert (sync_dir / "npx_obx_1hz.txt").exists()
+
+    obx = spikeglx.run_layout(ap).obx
+    obx.unlink()
+    obx.with_suffix(".meta").unlink(missing_ok=True)
+    report = extract.extract_neuropixels_edges(session)
+
+    assert extract.NPX_BURST not in report.edge_sets
+    assert not (sync_dir / "npx_burst.txt").exists()
+    assert not (sync_dir / "npx_obx_1hz.txt").exists()
+    assert (sync_dir / "npx_1hz.txt").exists()          # the AP stream still ran
+    # ...at the rate the edges were converted with, for the spikes to use too.
+    rate = json.loads((sync_dir / extract.NPX_EDGE_RATE).read_text())
+    assert rate["ap_fs"] == spikeglx.stream_info(ap).fs
+
+
 def test_catgt_edge_files_are_told_apart_by_stream_not_by_kind(tmp_path):
     # Both SY words are -xd extractions; only the stream in the filename says
     # which is the probe's and which the OneBox's.
@@ -290,3 +342,111 @@ def test_ignoring_clock_drift_fails_validation(tmp_path):
     )
     assert not report.passed
     assert report.max_residual_s > 1e-3
+
+
+def _fake_blackrock(monkeypatch, pulses):
+    """Stand in for neo: one reader, an identity NSP map, fixed pulse times."""
+    from types import SimpleNamespace
+
+    from spikesorting._io import blackrock
+
+    opened = []
+    identity = SimpleNamespace(
+        apply=lambda samples: np.asarray(samples, dtype=float) / FS,
+        summary=lambda: "identity",
+        to_dict=lambda: {"segments": []},
+    )
+    monkeypatch.setattr(blackrock, "open_reader", lambda path, **_: opened.append(path) or object())
+    monkeypatch.setattr(blackrock, "nsp_time_map", lambda *a, **k: identity)
+    monkeypatch.setattr(blackrock, "nsx_number", lambda path: 5)
+    monkeypatch.setattr(
+        blackrock, "stream_for_analog_input",
+        lambda reader, analog_input, frontend: SimpleNamespace(
+            n_segments=1, fs=FS, channel_id=str(frontend + analog_input)
+        ),
+    )
+    monkeypatch.setattr(blackrock, "iter_channel", lambda *a, **k: iter(()))
+    monkeypatch.setattr(extract.edges, "stream_pulse_times", lambda *a, **k: pulses)
+    return opened
+
+
+def _sync_only_session(tmp_path, neuropixels_block):
+    br = tmp_path / "share" / "2026-11-10"
+    br.mkdir(parents=True)
+    path = tmp_path / "s.yaml"
+    path.write_text(
+        f"blackrock_dir: '{br}'\nblackrock:\n  sync_file: '{br}/NSP-x.ns5'\n"
+        + neuropixels_block,
+        encoding="utf-8",
+    )
+    session = cfg.load_session_config(path, "mac", None)
+    session.blackrock.sync_file.write_bytes(b"")   # there to be reached; neo is faked
+    for _, probe_config in session.per_probe():
+        probe_config.paths.dir_for("neuropixels").mkdir(parents=True, exist_ok=True)
+        probe_config.paths.mkdirs()
+    return session, br
+
+
+def test_blackrock_pulses_land_in_the_neuropixels_folder_not_on_the_share(tmp_path, monkeypatch):
+    # The Blackrock share is read for its pulses and never written to: they
+    # exist only to align Neuropixels, so they go beside its time map.
+    _fake_blackrock(monkeypatch, np.arange(5.0))
+    session, br = _sync_only_session(
+        tmp_path,
+        f"neuropixels_dir: '{tmp_path / 'local' / 'run_g0_imec0'}'\n"
+        f"neuropixels:\n  bin_file: '{tmp_path}/local/run_g0_imec0/run_g0_t0.imec0.ap.bin'\n",
+    )
+
+    extract_sync(session, "blackrock")
+
+    folder = session.paths.sorted_for("neuropixels")
+    for name in ("blackrock_1hz.txt", "blackrock_burst.txt", extract.SYNC_NSP_MAP):
+        assert (folder / name).exists(), name
+    assert [p.name for p in br.iterdir()] == ["NSP-x.ns5"]                 # not even a kilosort4/
+
+
+def test_two_probes_each_get_the_blackrock_pulses_from_one_read(tmp_path, monkeypatch):
+    opened = _fake_blackrock(monkeypatch, np.arange(5.0))
+    run = tmp_path / "local" / "run_g0"
+    session, br = _sync_only_session(
+        tmp_path,
+        f"neuropixels_dir: '{run}'\nneuropixels:\n  bin_files:\n"
+        f"    - '{run}/run_g0_imec0/run_g0_t0.imec0.ap.bin'\n"
+        f"    - '{run}/run_g0_imec1/run_g0_t0.imec1.ap.bin'\n",
+    )
+
+    extract_sync(session, "blackrock")
+
+    assert len(opened) == 1
+    for _, probe_config in session.per_probe():
+        folder = probe_config.paths.sorted_for("neuropixels")
+        assert np.allclose(np.loadtxt(folder / "blackrock_1hz.txt"), np.arange(5.0))
+        assert (folder / extract.SYNC_NSP_MAP).exists()
+    assert not (run / cfg.SORTER_NAME).exists()     # nothing above the probe folders
+    assert [p.name for p in br.iterdir()] == ["NSP-x.ns5"]
+
+
+def test_a_blackrock_read_that_fails_leaves_no_old_pulses(tmp_path, monkeypatch):
+    # The previous run's pulses are removed before the .ns5 is opened, so a
+    # read that fails cannot leave them to be aligned against.
+    _fake_blackrock(monkeypatch, np.arange(5.0))
+    session, _ = _sync_only_session(
+        tmp_path,
+        f"neuropixels_dir: '{tmp_path / 'local' / 'run_g0_imec0'}'\n"
+        f"neuropixels:\n  bin_file: '{tmp_path}/local/run_g0_imec0/run_g0_t0.imec0.ap.bin'\n",
+    )
+    extract_sync(session, "blackrock")
+    folder = session.paths.sorted_for("neuropixels")
+    assert (folder / "blackrock_1hz.txt").exists()
+
+    from spikesorting._io import blackrock
+
+    def unreadable(path, **_):
+        raise OSError("share went away")
+
+    monkeypatch.setattr(blackrock, "open_reader", unreadable)
+    with pytest.raises(OSError):
+        extract_sync(session, "blackrock")
+
+    for name in ("blackrock_1hz.txt", "blackrock_burst.txt", extract.SYNC_NSP_MAP):
+        assert not (folder / name).exists(), name

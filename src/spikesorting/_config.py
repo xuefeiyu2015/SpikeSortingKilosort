@@ -331,7 +331,8 @@ class PreprocessSpec:
     #: SpikeInterface ``phase_shift``). Neuropixels only; needs the ``.meta``.
     phase_shift: bool = True
     #: A SpikeInterface ``correct_motion`` preset, or None. When set, Kilosort's
-    #: ``nblocks`` must be 0 so drift is not corrected twice.
+    #: ``nblocks`` is 0 whatever the session states, so drift is not corrected
+    #: twice (:meth:`SessionConfig.kilosort_for`).
     motion: str | None = None
 
     @classmethod
@@ -387,8 +388,30 @@ class BlackrockSpec:
     sync_file: Path | None = None
     #: HUB-*.ns6 -- holds the Utah array spike data.
     spike_file: Path | None = None
-    sync_1hz_channel: int = 1
-    burst_channel: int = 2
+    #: NSP-*.ns2 -- the 1 kHz behavioural channels: Blackrock's copy of what the
+    #: OneBox records on XA1-XA4. Read only to *check* synchronization; nothing
+    #: is aligned by it.
+    analog_file: Path | None = None
+    #: ``{OneBox label: analog input}`` -- the n of ``ainp<n>`` each copy is
+    #: wired into, as labelled on the NSP, the same numbering as
+    #: ``sync_1hz_input``/``burst_input`` (and as ``neuropixels.analog_channels``
+    #: gives XA numbers). Found by ID ``nsp_frontend_channels + n`` and checked
+    #: against the ``ainp<n>`` name, never by place in the file, so an input
+    #: switched off in Central cannot shift the others. Labels match the
+    #: OneBox's, which is what pairs the two copies.
+    analog_inputs: dict[str, int] = field(default_factory=dict)
+    #: How many front-end (electrode) channels the NSP writing ``sync_file`` has.
+    #: It numbers its analog inputs after them -- ``ainp<n>`` is channel ID
+    #: ``nsp_frontend_channels + n`` -- so 32 puts ainp7 at ID 39, and a
+    #: 128-channel NSP puts it at 135. A property of the rig, not the session.
+    nsp_frontend_channels: int = 32
+    #: Which analog input (the n of ``ainp<n>``, as labelled on the NSP) carries
+    #: the 1 Hz wave, and which the 14 s burst. :meth:`channel_id` turns one into
+    #: the ID the ``.ns5`` header lists, and the reader checks that channel is
+    #: named ``ainp<n>``, so a wrong front-end count stops rather than reading
+    #: another channel.
+    sync_1hz_input: int = 7
+    burst_input: int = 8
     #: Rising-edge thresholds, in the units returned by the reader (see io.blackrock).
     sync_threshold: float = 2.5
     burst_threshold: float = 2.5
@@ -415,13 +438,29 @@ class BlackrockSpec:
     #: What is done to the signal before Kilosort reads it.
     preprocess: PreprocessSpec = field(default_factory=lambda: BLACKROCK_PREPROCESS)
 
+    def channel_id(self, analog_input: int) -> int:
+        """The NSP channel ID of analog input ``ainp<analog_input>``."""
+        return self.nsp_frontend_channels + int(analog_input)
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "BlackrockSpec":
+        for key in ("sync_1hz_input", "burst_input"):
+            if key in data and int(data[key]) < 1:
+                raise ValueError(
+                    f"blackrock.{key} is the analog input number, ainp<n> with n >= 1 "
+                    f"(got {data[key]})"
+                )
         return cls(
             sync_file=_as_path(data.get("sync_file")),
             spike_file=_as_path(data.get("spike_file")),
-            sync_1hz_channel=int(data.get("sync_1hz_channel", 1)),
-            burst_channel=int(data.get("burst_channel", 2)),
+            analog_file=_as_path(data.get("analog_file")),
+            analog_inputs={
+                str(name): int(number)
+                for name, number in (data.get("analog_inputs") or {}).items()
+            },
+            nsp_frontend_channels=int(data.get("nsp_frontend_channels", 32)),
+            sync_1hz_input=int(data.get("sync_1hz_input", 7)),
+            burst_input=int(data.get("burst_input", 8)),
             sync_threshold=float(data.get("sync_threshold", 2.5)),
             burst_threshold=float(data.get("burst_threshold", 2.5)),
             stream_id=data.get("stream_id"),
@@ -466,17 +505,28 @@ class NeuropixelsSpec:
     #: Sampling rate. Only needed for a bare binary with no .meta beside it
     #: (the Kilosort demo file); otherwise read from the meta.
     sample_rate: float | None = None
+    #: Whether the binary's last row is the SY word. Required for a bare binary
+    #: with no .meta (the demo file: true); with a .meta, the meta decides.
+    has_sy_word: bool | None = None
     #: SY-word bit carrying the SMA1 1 Hz square wave. 6 is the SpikeGLX default.
     sync_bit: int = 6
     #: High duration of the 1 Hz square wave, in ms (1 s period, 50% duty).
     #: A CatGT ``-xd`` argument.
     sync_pulse_ms: int = 500
-    #: Word index of the XA1 analog input in the obx stream (14 s coded burst).
-    burst_word: int = 1
+    #: Word index of the XA0 analog input in the obx stream (14 s coded burst) --
+    #: the OneBox's first input. A row in the .obx.bin, so it equals the XA number
+    #: only while the OneBox saves every XA channel.
+    burst_word: int = 0
     #: CatGT -xa thresholds in volts: (primary, secondary). Secondary 0 disables it.
     burst_threshold_v: tuple[float, float] = (1.0, 0.0)
     #: Expected burst pulse width in ms; 0 accepts any width.
     burst_pulse_ms: int = 0
+    #: What is wired into the OneBox's other XA inputs, as ``{label: XA number}``
+    #: -- ``{eye_x: 1, eye_y: 2, pupil: 3, photodiode: 4}``. Only names them:
+    #: ``extract_analog`` exports *every* XA input the file saved, labelling an
+    #: unnamed one ``XA<n>`` and the burst's ``sync_burst``. Labels become MATLAB
+    #: field names, so they must be identifiers.
+    analog_channels: dict[str, int] = field(default_factory=dict)
     #: Probe JSON from make_probe.py, used when the binary has no ``.meta`` to
     #: build the map from. The .meta wins where it exists: it records which sites
     #: were actually active, which a file built from another run cannot know.
@@ -530,16 +580,24 @@ class NeuropixelsSpec:
             thresh = (float(thresh), 0.0)
         n_chan = data.get("n_chan_bin")
         rate = data.get("sample_rate")
+        has_sy = data.get("has_sy_word")
+        if has_sy is not None and not isinstance(has_sy, bool):
+            raise ValueError(f"neuropixels.has_sy_word must be true or false, got {has_sy!r}")
         return cls(
             bin_file=_as_path(data.get("bin_file")),
             lf_file=_as_path(data.get("lf_file")),
             n_chan_bin=int(n_chan) if n_chan is not None else None,
             sample_rate=float(rate) if rate is not None else None,
+            has_sy_word=has_sy,
             sync_bit=int(data.get("sync_bit", 6)),
             sync_pulse_ms=int(data.get("sync_pulse_ms", 500)),
-            burst_word=int(data.get("burst_word", 1)),
+            burst_word=int(data.get("burst_word", 0)),
             burst_threshold_v=(float(thresh[0]), float(thresh[1])),
             burst_pulse_ms=int(data.get("burst_pulse_ms", 0)),
+            analog_channels={
+                str(name): int(number)
+                for name, number in (data.get("analog_channels") or {}).items()
+            },
             probe_file=_as_config_path(data.get("probe_file")),
             bin_files=_as_binaries(data.get("bin_files")),
             # YAML gives `1:` as an int and `"1":` as a string; both mean probe 1.
@@ -557,12 +615,16 @@ class OutputPaths:
     """Where one session's outputs go: one folder per system, beside its data.
 
     Everything derived from a system lands in ``<system>_dir/<sorter>/`` -- the
-    sorting, that system's sync edges, and the export bundle inside it. Handing
-    an analysis a recording means handing it one directory, and there is no
-    system or probe level above it: the directory the session names already says
-    which recording it is. Cross-system results (the time map) go under the
-    Blackrock one, because Blackrock is the reference timebase everything is
-    mapped onto.
+    sorting and the export bundle inside it. Handing an analysis a recording
+    means handing it one directory, and there is no system or probe level above
+    it: the directory the session names already says which recording it is.
+
+    Synchronization belongs to the Neuropixels recording: the time map, and the
+    Blackrock pulse files it was fitted from, go in the Neuropixels folder,
+    since they exist only to put Neuropixels on Blackrock time. So
+    ``<blackrock_dir>/<sorter>/`` exists only when the Utah array is sorted
+    (``sorts_blackrock``); a session whose Blackrock only carries the pulses
+    writes nothing beside the ``.ns5``.
 
     ``sorted_np`` and ``sorted_br`` both name a directory holding the sorter's
     own results -- ``spike_times.npy``, ``params.py``, ``cluster_KSLabel.tsv``.
@@ -575,10 +637,13 @@ class OutputPaths:
     blackrock_dir: Path | None = None
     neuropixels_dir: Path | None = None
     sorter: str = SORTER_NAME
-    #: ``imec<n>`` when the session states a ``probes:`` list, else None. It
-    #: separates the *cross-system* outputs only -- see :attr:`aligned`. Each
-    #: probe's own sorting is already apart, in its own ``neuropixels_dir``.
+    #: ``imec<n>`` when the session states a ``probes:`` list, else None. A
+    #: label only: each probe's outputs are already apart, in its own
+    #: ``neuropixels_dir``.
     probe_tag: str | None = None
+    #: Whether the Utah array is sorted. Without that, nothing is written
+    #: under ``blackrock_dir`` -- its folder is never even created.
+    sorts_blackrock: bool = True
 
     def dir_for(self, system: str) -> Path | None:
         """That system's directory, or None when it never recorded."""
@@ -615,11 +680,19 @@ class OutputPaths:
         return self._require(system) / "preprocessed"
 
     def sync_for(self, system: str) -> Path:
-        """Edge files, in the same folder as the sorting they are aligned with.
+        """Edge files: both systems' go in the Neuropixels sorting's folder.
+
+        Blackrock's pulses exist only to align Neuropixels, so they sit beside
+        the time map fitted from them, not beside the ``.ns5`` -- a local
+        Neuropixels sorting then never writes to the share Blackrock is on. Only
+        a session with no Neuropixels (nothing to align) falls back to
+        Blackrock's own folder, so the path is still defined.
 
         Computable before anything is sorted, which is what lets ``extract_sync``
         run on the rig straight after the session.
         """
+        if self.neuropixels_dir is not None:
+            return self.sorted_for("neuropixels")
         return self.sorted_for(system)
 
     @property
@@ -632,20 +705,22 @@ class OutputPaths:
 
     @property
     def aligned(self) -> Path:
-        """The time map's home: the reference system's folder, or the only one.
+        """The time map's home: the folder of the sorting it maps.
 
-        One level deeper when the session states a probe list. Every probe of a
-        run is mapped onto the *same* Blackrock recording, so all of them would
-        otherwise write ``time_map.json`` -- and the trimmed edge files, and
-        ``neuropixels_spike_seconds_blackrock.npy`` -- to one directory, each on
-        top of the last. Each probe has its own oscillator and its own SY word, so
-        those are genuinely different maps and the last one written would win.
+        The map turns Neuropixels times into Blackrock time, so it belongs to the
+        Neuropixels recording -- Blackrock's own spikes are already on its clock
+        and never read it. It sits beside that sorting, with the trimmed edges,
+        ``validation.json`` and the mapped spike times, wherever that folder is:
+        a local sorting stays local, and the Blackrock edges it was fitted from
+        sit beside it too (``sync_for``). Each probe already has its own ``neuropixels_dir``,
+        so two probes' maps cannot collide.
 
-        A single-probe session has ``probe_tag`` None and no such level: there is
-        one map, and a directory holding one thing needs no subdivision.
+        A session with no Neuropixels has nothing to map; the Blackrock folder
+        is named so the path is still defined.
         """
-        base = self.primary / self.sorter
-        return base if self.probe_tag is None else base / self.probe_tag
+        if self.neuropixels_dir is not None:
+            return self.sorted_for("neuropixels")
+        return self.sorted_for("blackrock")
 
     def export_for(self, system: str) -> Path:
         """The copy-paste bundle for one system: everything derived from it.
@@ -661,17 +736,55 @@ class OutputPaths:
         """Per-unit and overview plots, inside that system's bundle."""
         return self.export_for(system) / "figures"
 
+    def writes_to(self, system: str) -> bool:
+        """Whether anything is written under that system's directory.
+
+        Neuropixels whenever it recorded; Blackrock only when its array is
+        sorted -- a sync-only Blackrock's outputs live with Neuropixels.
+        """
+        if self.dir_for(system) is None:
+            return False
+        return system == "neuropixels" or self.sorts_blackrock
+
     def all(self) -> tuple[Path, ...]:
         """Every directory this session can actually write to."""
         paths: list[Path] = []
         for system in ("neuropixels", "blackrock"):
-            if self.dir_for(system) is not None:
+            if self.writes_to(system):
                 paths += [self.sorted_for(system), self.export_for(system)]
         return tuple(dict.fromkeys(paths))
 
+    def require_dir(self, system: str) -> Path:
+        """That system's directory, which must already exist.
+
+        It holds the raw recording, so a directory that is not there is a wrong
+        path -- a typo, an unmounted share -- never a folder to create. Creating
+        it (``mkdir(parents=True)`` makes every missing level) used to build the
+        mistyped path on disk with an empty ``kilosort4/`` inside and carry on.
+        Everything the pipeline writes goes *inside* this directory, so checking
+        it here, before the first write, is enough.
+        """
+        directory = self._require(system)
+        if not directory.is_dir():
+            raise FileNotFoundError(
+                f"{system}_dir does not exist: {directory}\n"
+                "  It holds the recording, so it is never created -- check the path "
+                "in the session file (and that the share is mounted)."
+            )
+        return directory
+
     def mkdirs(self) -> None:
-        for path in self.all():
-            path.mkdir(parents=True, exist_ok=True)
+        """Create each system's output folders, inside its existing directory.
+
+        Only for a system that is written to (``writes_to``): a Blackrock that
+        is not sorted gets no ``kilosort4/`` beside its recording.
+        """
+        for system in ("neuropixels", "blackrock"):
+            if not self.writes_to(system):
+                continue
+            self.require_dir(system)
+            for path in (self.sorted_for(system), self.export_for(system)):
+                path.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass(frozen=True)
@@ -706,6 +819,12 @@ class SessionConfig:
     #: (-> 1250 Hz) is safe against a band hardware-limited to ~500 Hz and
     #: anything above it aliases.
     lfp_decimate: int = 1
+    #: Whether to export the OneBox's analog inputs (eye, pupil, photodiode, the
+    #: burst) on Blackrock time. Off unless asked for, like ``export_lfp``: at
+    #: ``analog_decimate: 1`` it is ~0.7 GB/hour for twelve inputs.
+    export_analog: bool = False
+    #: Stride for that export: a plain stride with no anti-alias filter.
+    analog_decimate: int = 1
     #: Whether the export stage draws per-unit and overview figures.
     export_figures: bool = True
     #: Period of the fine-alignment square wave, in seconds. TPrime -syncperiod.
@@ -732,6 +851,7 @@ class SessionConfig:
             self.neuropixels_dir,
             self.sorter,
             probe_tag=self.probe_tag,
+            sorts_blackrock=self.sorts_blackrock,
         )
 
     @property
@@ -852,10 +972,38 @@ class SessionConfig:
 
         Empty means Kilosort's defaults. The tracked templates state every key
         anyway, so a sort is described by its session file alone.
+
+        **One override: ``preprocess.motion`` turns Kilosort's drift correction
+        off.** A preset corrects drift before Kilosort reads the binary, so
+        ``nblocks`` is 0 here whatever the block states -- correcting twice
+        would only add the second estimate's noise. The two are alternatives,
+        and the session switches between them with the one ``motion`` line;
+        ``nblocks`` keeps the value Kilosort uses when ``motion`` is null.
+        :meth:`nblocks_override` says when this happened.
         """
+        merged = self._stated_kilosort(system)
+        if self._motion_preset(system) is not None:
+            merged["nblocks"] = 0
+        return merged
+
+    def nblocks_override(self, system: str) -> str | None:
+        """Why ``nblocks`` is not what the session states, or None when it is."""
+        preset = self._motion_preset(system)
+        stated = self._stated_kilosort(system).get("nblocks", 1)
+        if preset is None or stated == 0:
+            return None
+        return (f"kilosort nblocks: {stated} is not used: preprocess.motion: {preset} "
+                "corrects drift before Kilosort, so Kilosort sorts with nblocks: 0")
+
+    def _stated_kilosort(self, system: str) -> dict[str, Any]:
         merged = dict(self.kilosort)
         merged.update(self.kilosort_by_system.get(system) or {})
         return merged
+
+    def _motion_preset(self, system: str) -> str | None:
+        if system not in ("blackrock", "neuropixels"):
+            return None
+        return self.preprocess_for(system).motion
 
     def waveforms_for(self, system: str) -> WaveformSpec:
         """How to cut and filter waveforms for one system.
@@ -930,6 +1078,14 @@ class SessionConfig:
         """
         problems: list[str] = []
 
+        # Each system's own directory first: it is where the recording lives, so a
+        # wrong one is usually *the* mistake, and every file below it then fails
+        # too. Said once, plainly, rather than only as a list of missing files.
+        for system in ("neuropixels", "blackrock"):
+            directory = getattr(self, f"{system}_dir")
+            if self.has_data(system) and directory is not None and not directory.is_dir():
+                problems.append(f"{system}_dir does not exist: {directory}")
+
         # Gated on the data being *declared*, not on sorting being wanted: the
         # LFP and sync stages read the same files, so an unsortable session still
         # needs them to be there.
@@ -964,6 +1120,8 @@ class SessionConfig:
                 problems.append(f"blackrock.sync_file does not exist: {brk.sync_file}")
             if brk.spike_file is not None and not brk.spike_file.exists():
                 problems.append(f"blackrock.spike_file does not exist: {brk.spike_file}")
+            if brk.analog_file is not None and not brk.analog_file.exists():
+                problems.append(f"blackrock.analog_file does not exist: {brk.analog_file}")
 
         # A channel map that is *named* but absent is a hard error -- the
         # alternative is finding out after the recording has been copied to the
@@ -1088,6 +1246,8 @@ _SESSION_KEYS = frozenset({
     "kilosort_on_blackrock",
     "export_lfp",
     "lfp_decimate",
+    "export_analog",
+    "analog_decimate",
     "export_figures",
     "sync_period_s",
     "burst_interval_s",
@@ -1120,7 +1280,19 @@ _RENAMED = {"cmp_file": "probe_file"}
 
 #: Keys removed outright, with what replaced them. Same reason as ``_RENAMED``:
 #: ``export_groups`` is closest to ``export_figures``, an unrelated switch.
+_SYNC_BY_INPUT = (
+    "the .ns5 sync channels are now named by analog input -- sync_1hz_input / "
+    "burst_input (the n of ainp<n>, e.g. 7 and 8) plus nsp_frontend_channels "
+    "(e.g. 32); the channel ID is their sum -- replace the line"
+)
 _RETIRED = {
+    "sync_1hz_channel": _SYNC_BY_INPUT,
+    # Only ever reached in blackrock: (neuropixels.analog_channels is a setting).
+    "analog_channels": "blackrock.analog_channels held 0-based positions in the "
+    ".ns2; it is now analog_inputs, the n of ainp<n> each copy is wired into "
+    "(the sync inputs' numbering) -- a file saving ainp1..ainp4 in order turns "
+    "{eye_x: 0, ...} into {eye_x: 1, ...}; check the .ns2 header's names",
+    "burst_channel": _SYNC_BY_INPUT,
     "export_groups": "the export now keeps every cluster not labelled noise in "
     "Phy, so there is nothing to choose -- delete the line",
     "highpass_hz": "waveforms are now read through Kilosort's own preprocessing, which "
@@ -1275,6 +1447,8 @@ def load_session_config(
         ),
         export_lfp=bool(data.get("export_lfp", False)),
         lfp_decimate=int(data.get("lfp_decimate", 1)),
+        export_analog=bool(data.get("export_analog", False)),
+        analog_decimate=int(data.get("analog_decimate", 1)),
         export_figures=bool(data.get("export_figures", True)),
         sync_period_s=float(data.get("sync_period_s", 1.0)),
         burst_interval_s=float(data.get("burst_interval_s", 14.0)),
@@ -1289,6 +1463,8 @@ def load_session_config(
     _reject_bad_probe_list(config, session_path)
     _reject_bad_preprocess(config, session_path)
     _reject_sorting_nothing(config, data, session_path)
+    _reject_bad_analog_channels(config, session_path)
+    _reject_bad_blackrock_analog(config, session_path)
     _reject_colliding_system_dirs(config, session_path)
     return config
 
@@ -1363,17 +1539,78 @@ def _reject_bad_preprocess(config: SessionConfig, path: Path) -> None:
                     "correct_motion preset: " + ", ".join(MOTION_PRESETS)
                     + ", or null"
                 )
-            if getattr(config, f"sorts_{system}"):
-                # Per probe: a by_probe: block may set nblocks for one of them.
-                for _, stream in config.per_probe():
-                    nblocks = stream.kilosort_for(system).get("nblocks", 1)
-                    if nblocks != 0:
-                        tag = f" ({stream.probe_tag})" if stream.probe_tag else ""
-                        raise ValueError(
-                            f"{where}.motion: {spec.motion} corrects drift before "
-                            f"Kilosort, but kilosort nblocks{tag} is {nblocks}, so "
-                            "it would be corrected twice. Set nblocks: 0."
-                        )
+
+
+def _reject_bad_analog_channels(config: SessionConfig, path: Path) -> None:
+    """Refuse an ``analog_channels`` map that cannot describe the wiring.
+
+    Checked at load, before an hour of reading the OneBox file: a label that is
+    not a MATLAB identifier, two labels on one input, or a label on the input
+    the 14 s burst arrives on -- that one is the sync signal, and naming it
+    ``eye_x`` would mean the burst detector and the eye export disagree about
+    what is wired where. Whether each input was actually *saved* can only be
+    answered by the ``.obx.meta``, so ``export_onebox_analog`` checks that.
+    """
+    npx = config.neuropixels
+    named = npx.analog_channels
+    if config.analog_decimate < 1:
+        raise ValueError(f"{path}: analog_decimate must be >= 1, got {config.analog_decimate}")
+    for name, number in named.items():
+        if not re.match(r"^[A-Za-z][A-Za-z0-9_]{0,62}$", name):
+            raise ValueError(
+                f"{path}: neuropixels.analog_channels label {name!r} is not a MATLAB "
+                "identifier (a letter, then letters, digits or _)"
+            )
+        if number < 0:
+            raise ValueError(f"{path}: neuropixels.analog_channels.{name} is XA{number}")
+        if number == npx.burst_word:
+            raise ValueError(
+                f"{path}: neuropixels.analog_channels.{name} is XA{number}, which is "
+                f"burst_word -- the input carrying the 14 s sync burst. It is "
+                "exported as 'sync_burst'; name a different input."
+            )
+    numbers = list(named.values())
+    shared = sorted({n for n in numbers if numbers.count(n) > 1})
+    if shared:
+        raise ValueError(
+            f"{path}: neuropixels.analog_channels names "
+            + ", ".join(f"XA{n}" for n in shared) + " more than once"
+        )
+
+
+def _reject_bad_blackrock_analog(config: SessionConfig, path: Path) -> None:
+    """``analog_file`` and ``analog_inputs`` come together, as ainp numbers.
+
+    One without the other is read by nobody. A label the OneBox does not also
+    carry has nothing to be compared with, which is the only thing these are for
+    -- so it is refused rather than left to be silently skipped.
+    """
+    brk = config.blackrock
+    if bool(brk.analog_file) != bool(brk.analog_inputs):
+        named, missing = (
+            ("analog_file", "analog_inputs") if brk.analog_file
+            else ("analog_inputs", "analog_file")
+        )
+        raise ValueError(
+            f"{path}: blackrock.{named} is set but blackrock.{missing} is not; "
+            "they describe one file and its channels, so state both or neither"
+        )
+    inputs = list(brk.analog_inputs.values())
+    if any(n < 1 for n in inputs):
+        raise ValueError(
+            f"{path}: blackrock.analog_inputs are ainp numbers, n >= 1 (ainp1 -> 1)"
+        )
+    if len(set(inputs)) != len(inputs):
+        raise ValueError(f"{path}: blackrock.analog_inputs names one input twice")
+    onebox = set(config.neuropixels.analog_channels)
+    if brk.analog_inputs and config.has_data("neuropixels"):
+        unmatched = sorted(set(brk.analog_inputs) - onebox)
+        if unmatched:
+            raise ValueError(
+                f"{path}: blackrock.analog_inputs {unmatched} have no OneBox copy "
+                f"in neuropixels.analog_channels ({sorted(onebox) or 'none'}); the "
+                "labels are what pair the two recordings"
+            )
 
 
 def _reject_sorting_nothing(

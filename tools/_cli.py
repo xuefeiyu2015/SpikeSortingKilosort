@@ -8,9 +8,14 @@ shared conda env is not always possible.
 from __future__ import annotations
 
 import argparse
+import io
+import logging
 import os
+import shutil
 import sys
+import time
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -137,10 +142,13 @@ def load(args: argparse.Namespace, require_inputs: bool = True) -> SessionConfig
         config = with_overrides(config, **overrides)
     config = _select_probes(config, getattr(args, "probe", None))
 
-    for _, probe_config in config.per_probe():
-        probe_config.paths.mkdirs()
+    # Check before creating anything: a mistyped directory must not be built on
+    # disk. mkdirs refuses one that does not exist even when the inputs are not
+    # required (the exporting driver), since every output goes inside it.
     if require_inputs:
         config.require_inputs()
+    for _, probe_config in config.per_probe():
+        probe_config.paths.mkdirs()
 
     print(f"session '{config.session}' on machine '{config.machine.name}'")
     if overrides:
@@ -176,6 +184,9 @@ class Runner:
         self.stopped = False
         #: True when the last call raised, so a caller can skip what depended on it.
         self.last_failed = False
+        #: Every stage that ran, in order: ``{"label", "stage", "status",
+        #: "seconds", "started", "steps"}``. What ``record_timing`` is given.
+        self.stages: list[dict] = []
 
     def __call__(self, verb, *args, system: str | None = None, label: str | None = None,
                  config: SessionConfig | None = None, **kwargs):
@@ -197,28 +208,286 @@ class Runner:
             print(f"[--] {label}\n       {why}")
             return None
 
+        from datetime import datetime
+
+        wall = datetime.now().astimezone().isoformat(timespec="seconds")
+        started = time.perf_counter()
         try:
             value = verb(*args, **kwargs)
         except Exception as error:  # a stage that blows up must not hide the rest
             self.failures += 1
             self.last_failed = True
-            print(f"[!!] {label}\n       {type(error).__name__}: {error}")
+            self._record(shown, verb, "failed", time.perf_counter() - started, wall, None)
+            took = _elapsed(time.perf_counter() - started)
+            print(f"[!!] {label}  ({took})\n       {type(error).__name__}: {error}")
             self.stopped = True
             return None
 
+        seconds = time.perf_counter() - started
+        took = _elapsed(seconds)
+        if getattr(value, "passed", None) is False:
+            # A check that ran and failed (validate_remapping's burst check):
+            # the stage worked, its verdict is the failure. Stop here, so nothing
+            # is exported on a time base the check just rejected.
+            self.failures += 1
+            self.last_failed = True
+            self.stopped = True
+            self._record(shown, verb, "failed check", seconds, wall, value)
+            print(f"[!!] {label}  ({took})\n       {_describe(value)}\n"
+                  "       stopping: nothing is exported on a map that failed its check")
+            return value
+        self._record(shown, verb, "nothing to do" if value is None else "ok",
+                     seconds, wall, value)
         if value is None:
-            print(f"[--] {label}\n       nothing to do")
+            print(f"[--] {label}  ({took})\n       nothing to do")
         else:
-            print(f"[ok] {label}\n       {_describe(value)}")
+            print(f"[ok] {label}  ({took})\n       {_describe(value)}")
         return value
 
+    def _record(self, shown, verb, status, seconds, wall, value) -> None:
+        steps = value.get("timing") if isinstance(value, dict) else None
+        self.stages.append({
+            "label": shown, "stage": verb.__name__, "status": status,
+            "seconds": round(seconds, 2), "started": wall,
+            "steps": steps if isinstance(steps, dict) else None,
+        })
+
+    def stages_for(self, label: str) -> list[dict]:
+        """The stages that ran for one stream (``label`` as printed), in order."""
+        return [s for s in self.stages if s["label"] == label]
+
+    def stage_table(self) -> str:
+        """Every stage of this run, one line each: stream, stage, outcome, time."""
+        if not self.stages:
+            return ""
+        width = max(len(s["label"] or "") for s in self.stages) + 2
+        lines = ["stage times"]
+        for s in self.stages:
+            lines.append(
+                f"  {s['label'] or '':<{width}}{s['stage']:<22}{s['status']:<15}"
+                f"{_elapsed(s['seconds']):>10}"
+            )
+        total = sum(s["seconds"] for s in self.stages)
+        lines.append(f"  {'':<{width}}{'total':<37}{_elapsed(total):>10}")
+        return "\n".join(lines)
+
     def finish(self, name: str) -> int:
+        table = self.stage_table()
+        if table:
+            print()
+            print(table)
         print()
         if self.failures:
             print(f"{name} finished with {self.failures} failure(s)")
             return 1
         print(f"{name} finished")
         return 0
+
+
+def render_bar(state, columns: int = 100, fill: str = "█", empty: str = "░") -> str:
+    """One line for a ``_progress.ProgressState``: label, bar, percent, amount, rate, time left.
+
+    Pure: the same state and width give the same line. The bar takes what the
+    text leaves of ``columns``; a label too long for it is shortened from the
+    left, keeping the file name's distinctive end.
+    """
+    from spikesorting._progress import format_amount, format_done, format_duration
+
+    unit = state.unit
+    amount = format_done(state.done, state.total, unit)
+    rate = f"{format_amount(state.rate, unit)}/s" if state.rate else ""
+    if state.final:
+        tail = f"done in {format_duration(state.elapsed_s)}"
+    else:
+        tail = f"~{format_duration(state.left_s)} left" if state.left_s is not None else ""
+    info = "  ".join(x for x in (f"{100 * state.fraction:5.1f}%", amount, rate, tail) if x)
+
+    indent = "       "
+    label = state.label
+    room = columns - len(indent) - len(info) - 6           # brackets and spaces
+    bar_width = max(20, min(30, room - len(label)))
+    if len(label) > room - bar_width:
+        keep = max(8, room - bar_width - 1)
+        label = "…" + label[-keep:] if len(label) > keep else label
+    filled = int(round(bar_width * state.fraction))
+    bar = fill * filled + empty * (bar_width - filled)
+    return f"{indent}{label} [{bar}] {info}"
+
+
+class TerminalLog(logging.Handler):
+    """The drivers' terminal output for the ``spikesorting`` logger.
+
+    Ordinary records (INFO and up) print as lines. Progress records
+    (``_progress.Progress``) redraw one bar in place on a terminal -- at most
+    every ``interval_s``, plus the final state -- and print only their INFO
+    milestones when the output is a file or a pipe (a batch job), where ``\r``
+    would leave thousands of lines. Writes to stderr, so the bar never enters
+    the run log, which tees stdout.
+    """
+
+    def __init__(self, stream=None, interval_s: float = 0.2, live: bool | None = None):
+        super().__init__(logging.DEBUG)
+        self.stream = stream if stream is not None else sys.stderr
+        isatty = getattr(self.stream, "isatty", lambda: False)
+        self.live = isatty() if live is None else live
+        self.interval_s = interval_s
+        self._drawn = 0          # length of the bar line on screen; 0 = none
+        self._last = 0.0
+        encoding = getattr(self.stream, "encoding", None) or "ascii"
+        try:
+            "█░…".encode(encoding)
+            self._glyphs = ("█", "░")
+        except (UnicodeEncodeError, LookupError):
+            self._glyphs = ("#", "-")
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            state = getattr(record, "progress", None)
+            if state is not None and self.live:
+                self._draw(state)
+            elif record.levelno >= logging.INFO:
+                self._end_bar()
+                self.stream.write(self.format(record) + "\n")
+                self.stream.flush()
+        except Exception:  # noqa: BLE001 -- logging must never stop the run
+            self.handleError(record)
+
+    def _draw(self, state) -> None:
+        now = time.monotonic()
+        if not state.final and self._drawn and now - self._last < self.interval_s:
+            return
+        self._last = now
+        columns = shutil.get_terminal_size((100, 20)).columns - 1
+        line = render_bar(state, columns, *self._glyphs)
+        if self._glyphs[0] == "#":
+            line = line.replace("…", "...")
+        # Pad over the previous line instead of an ANSI erase, which an old
+        # Windows console prints literally.
+        self.stream.write("\r" + line + " " * max(0, self._drawn - len(line)))
+        self._drawn = len(line)
+        if state.final:
+            self._end_bar()
+        self.stream.flush()
+
+    def _end_bar(self) -> None:
+        if self._drawn:
+            self.stream.write("\n")
+            self._drawn = 0
+
+
+def log_pipeline_messages() -> TerminalLog:
+    """Show this pipeline's own log lines on the terminal, and only its own.
+
+    ``logging.basicConfig`` would configure the *root* logger, which turns on
+    INFO for every installed package too -- faiss announcing which build it
+    loaded, matplotlib announcing a backend -- all wearing this project's indent.
+    Everything here logs to one named logger (``pipeline.py``, ``_sync/``), so
+    that is the one to attach a handler to. DEBUG is let through the logger for
+    the progress updates; ``TerminalLog`` and ``RunLog`` each keep only what
+    they show.
+    """
+    handler = TerminalLog()
+    handler.setFormatter(logging.Formatter("       %(message)s"))
+    log = logging.getLogger("spikesorting")
+    log.handlers[:] = [handler]
+    log.setLevel(logging.DEBUG)
+    log.propagate = False
+    return handler
+
+
+class _Tee(io.TextIOBase):
+    """A stream that writes to the terminal and to the run log."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text: str) -> int:
+        for stream in self.streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
+class RunLog:
+    """Everything a driver prints, kept so it can be saved beside the outputs.
+
+    The terminal shows the run as it happens and is gone afterwards; this keeps
+    the same text -- the ``[ok]/[--]/[!!]`` lines, the pipeline's log messages,
+    the stage times and timing tables -- and :meth:`save` writes it, named by
+    script, start time and machine, so runs accumulate rather than overwrite
+    and a run from the share can be read beside one from a local disk.
+
+    Kilosort's own log is not in it (Kilosort writes ``kilosort4.log`` beside
+    the sorting), nor are progress bars, which go to stderr.
+    """
+
+    def __init__(self, script: str):
+        self.script = script
+        self.started = datetime.now().astimezone()
+        self.buffer = io.StringIO()
+        self._stdout = sys.stdout
+        sys.stdout = _Tee(self._stdout, self.buffer)
+        self._handler = logging.StreamHandler(self.buffer)
+        self._handler.setFormatter(logging.Formatter("       %(message)s"))
+        # INFO and up: a long read's progress arrives as a line every 10%,
+        # not as the per-block updates that move the terminal's bar.
+        self._handler.setLevel(logging.INFO)
+        logging.getLogger("spikesorting").addHandler(self._handler)
+        print(f"{script} started {self.started.isoformat(timespec='seconds')}, "
+              f"command: {' '.join(sys.argv)}")
+
+    def close(self) -> None:
+        """Stop capturing. Safe to call twice."""
+        sys.stdout = self._stdout
+        logging.getLogger("spikesorting").removeHandler(self._handler)
+
+    def filename(self, machine: str) -> str:
+        return f"{self.script}_{self.started:%Y%m%d-%H%M%S}_{machine}.log"
+
+    def save(self, directories, machine: str) -> list[Path]:
+        """Write the log into ``<dir>/logs/`` for each directory. Returns the paths."""
+        text = self.buffer.getvalue()
+        saved = []
+        for directory in dict.fromkeys(Path(d) for d in directories):
+            target = directory / "logs" / self.filename(machine)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+            except OSError as error:  # a log must never turn a finished run into a failure
+                print(f"could not write {target}: {error}")
+                continue
+            saved.append(target)
+        return saved
+
+
+def log_directories(config: SessionConfig) -> list[Path]:
+    """Where a run's log goes: each stream's sorting folder the session declares.
+
+    Blackrock only when its array is sorted: a sync-only Blackrock's outputs
+    are in the Neuropixels folder, and so is the log.
+
+    Beside ``run_info.json`` and the sorting it describes; one copy per stream,
+    so each folder holds the record of every run that touched it.
+    """
+    dirs = []
+    for _, probe_config in config.per_probe():
+        if probe_config.has_data("neuropixels"):
+            dirs.append(probe_config.paths.sorted_for("neuropixels"))
+    if config.paths.writes_to("blackrock"):     # only a sorted Utah array
+        dirs.append(config.paths.sorted_for("blackrock"))
+    return dirs
+
+
+def _elapsed(seconds: float) -> str:
+    """``0.4 s``, ``12.3 s``, ``4.2 min``, ``1.53 h`` -- how long a stage took."""
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f} min"
+    return f"{seconds / 3600:.2f} h"
 
 
 def _describe(value) -> str:

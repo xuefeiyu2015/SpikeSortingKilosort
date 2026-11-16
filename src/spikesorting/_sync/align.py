@@ -34,6 +34,9 @@ __all__ = [
     "fit_same_run_map",
     "apply_linear_map",
     "validate_alignment",
+    "interval_offset_map",
+    "MIN_BURST_COVERAGE",
+    "MIN_BURSTS_MATCHED",
 ]
 
 
@@ -72,17 +75,33 @@ class AlignmentReport:
     #: Residuals over time, for plotting.
     times_s: np.ndarray
     residuals_s: np.ndarray
+    #: Bursts both systems hold inside their common window -- what *should* match.
+    n_expected: int = 0
+    #: Time from the first matched burst to the last.
+    span_s: float = 0.0
+    #: Length of the stretch both systems recorded, when it was given.
+    shared_s: float | None = None
+    #: Why it failed, when it did; empty on a pass.
+    fail_reason: str = ""
+
+    @property
+    def coverage(self) -> float:
+        """Matched bursts as a fraction of those both systems hold."""
+        return self.n_checked / self.n_expected if self.n_expected else 0.0
 
     def summary(self) -> str:
         if self.n_checked == 0:
-            return "alignment NOT validated: no burst onsets matched"
+            return "alignment FAIL, NOT validated: no burst onsets matched"
         verdict = "PASS" if self.passed else "FAIL"
-        return (
-            f"alignment {verdict}: {self.n_checked} bursts checked, "
+        text = (
+            f"alignment {verdict}: {self.n_checked} of {self.n_expected} bursts matched "
+            f"({100 * self.coverage:.0f}%, over {self.span_s / 60:.1f} min"
+            + (f" of {self.shared_s / 60:.1f}" if self.shared_s else "") + "), "
             f"max |residual| {self.max_residual_s * 1e3:.3f} ms, "
             f"median {self.median_residual_s * 1e3:.3f} ms "
             f"(tolerance {self.tolerance_s * 1e3:.3f} ms)"
         )
+        return f"{text} -- {self.fail_reason}" if self.fail_reason else text
 
 
 def overlap_window(
@@ -195,9 +214,35 @@ def fit_same_run_map(
     return fit_linear_map(other[other_idx], reference[ref_idx])
 
 
+def compose_linear_maps(outer: LinearMap, inner: LinearMap) -> LinearMap:
+    """``outer(inner(t))`` as one map: inner's clock straight onto outer's reference.
+
+    Two lines compose to a line, so the OneBox -> probe fit followed by the
+    probe -> Blackrock fit is ``blackrock = (s_o * s_i) * t + (s_o * i_i + i_o)``.
+    There is no fit of its own, so ``residuals_s`` is empty; ``n_points`` is the
+    smaller of the two, the fewer edges either step rests on.
+    """
+    return LinearMap(
+        slope=float(outer.slope * inner.slope),
+        intercept=float(outer.slope * inner.intercept + outer.intercept),
+        n_points=int(min(outer.n_points, inner.n_points)),
+        residuals_s=np.empty(0),
+    )
+
+
 def apply_linear_map(times_s: np.ndarray, mapping: LinearMap) -> np.ndarray:
     """Map times onto the reference timebase."""
     return mapping.slope * np.asarray(times_s, dtype=np.float64) + mapping.intercept
+
+
+#: A pass needs at least this fraction of the bursts both systems hold to match.
+#: A burst the map puts more than ``match_tolerance_s`` off has no partner and
+#: so no residual -- without a coverage floor, a map wrong over half the session
+#: would pass on the half it got right.
+MIN_BURST_COVERAGE = 0.9
+
+#: ...and at least this many, so a check over two bursts is not a pass.
+MIN_BURSTS_MATCHED = 3
 
 
 def validate_alignment(
@@ -205,6 +250,9 @@ def validate_alignment(
     reference_s: np.ndarray,
     tolerance_s: float = 1e-3,
     match_tolerance_s: float = 0.05,
+    min_coverage: float = MIN_BURST_COVERAGE,
+    min_matched: int = MIN_BURSTS_MATCHED,
+    shared_interval_s: tuple[float, float] | None = None,
 ) -> AlignmentReport:
     """Step 9: compare already-mapped burst onsets against the reference ones.
 
@@ -212,11 +260,35 @@ def validate_alignment(
     is deliberately far looser than ``tolerance_s``, which is the accuracy the
     alignment must then achieve. Using one tight window for both would silently
     discard the very mismatches this check exists to catch.
+
+    Passing takes three things: every matched residual within ``tolerance_s``,
+    at least ``min_matched`` matches, and at least ``min_coverage`` of the
+    bursts both systems hold inside their common window matched. The last is
+    what catches a map that is wrong over part of the session: those bursts
+    land outside ``match_tolerance_s``, find no partner, and would otherwise
+    simply be left out.
+
+    ``shared_interval_s`` is the stretch both systems recorded, on the
+    reference clock (the matched 1 Hz edges). Given it, a burst *either* system
+    holds inside it is expected -- so a burst channel that stops partway on one
+    side is a shortfall, not a short session -- and only bursts inside it are
+    matched and judged, so matches outside cannot make up for misses inside.
+    Without it the window is where the
+    detected bursts overlap, and the expected count is the smaller side's.
     """
     from .burst import match_times  # local import keeps the two modules independent
 
     mapped = np.asarray(mapped_s, dtype=np.float64).reshape(-1)
     reference = np.asarray(reference_s, dtype=np.float64).reshape(-1)
+
+    if shared_interval_s is not None:
+        # One window for everything: matching, residuals and coverage. Matches
+        # outside it would otherwise count toward a coverage measured inside
+        # it, and could hide every burst inside being wrong.
+        start = float(shared_interval_s[0]) - match_tolerance_s
+        stop = float(shared_interval_s[1]) + match_tolerance_s
+        reference = reference[(reference >= start) & (reference <= stop)]
+        mapped = mapped[(mapped >= start) & (mapped <= stop)]
 
     if mapped.size == 0 or reference.size == 0:
         empty = np.empty(0, dtype=np.float64)
@@ -231,12 +303,64 @@ def validate_alignment(
     residuals = matched_ref - mapped[other_idx]
     max_res = float(np.abs(residuals).max())
 
+    if shared_interval_s is not None:
+        combine = max                      # start/stop: the window set above
+    else:
+        start = max(reference.min(), mapped.min()) - match_tolerance_s
+        stop = min(reference.max(), mapped.max()) + match_tolerance_s
+        combine = min
+    n_expected = int(combine(
+        np.count_nonzero((reference >= start) & (reference <= stop)),
+        np.count_nonzero((mapped >= start) & (mapped <= stop)),
+    ))
+    n_checked = int(ref_idx.size)
+    n_expected = max(n_expected, n_checked)
+    coverage = n_checked / n_expected
+
+    reasons = []
+    if max_res > tolerance_s:
+        reasons.append(f"max residual exceeds {tolerance_s * 1e3:g} ms")
+    if n_checked < min_matched:
+        reasons.append(f"fewer than {min_matched} bursts matched")
+    if coverage < min_coverage:
+        reasons.append(
+            f"only {100 * coverage:.0f}% of the bursts matched (need "
+            f"{100 * min_coverage:.0f}%); the rest are more than "
+            f"{match_tolerance_s * 1e3:g} ms off"
+        )
+
     return AlignmentReport(
-        n_checked=int(ref_idx.size),
+        n_checked=n_checked,
         max_residual_s=max_res,
         median_residual_s=float(np.median(np.abs(residuals))),
         tolerance_s=tolerance_s,
-        passed=bool(max_res <= tolerance_s),
+        passed=not reasons,
         times_s=matched_ref,
         residuals_s=residuals,
+        n_expected=n_expected,
+        span_s=float(matched_ref.max() - matched_ref.min()),
+        shared_s=(float(shared_interval_s[1] - shared_interval_s[0])
+                  if shared_interval_s is not None else None),
+        fail_reason="; ".join(reasons),
     )
+
+
+def interval_offset_map(
+    times_s: np.ndarray, from_edges_s: np.ndarray, to_edges_s: np.ndarray
+) -> np.ndarray:
+    """TPrime's own model: ``t + (to_k - from_k)``, ``k`` the last *to* edge <= ``t``.
+
+    Measured on a real session (TPrime's output fits it to 0.1 us): one constant
+    offset per sync interval, the interval chosen by comparing ``t`` against the
+    reference edges. Before the first edge the first interval's offset applies.
+    The two edge lists must be matched pairs.
+    """
+    t = np.asarray(times_s, dtype=np.float64)
+    frm = np.asarray(from_edges_s, dtype=np.float64).reshape(-1)
+    to = np.asarray(to_edges_s, dtype=np.float64).reshape(-1)
+    if frm.size != to.size or not to.size:
+        raise ValueError(
+            f"interval map needs matched edge pairs, got {frm.size} and {to.size}"
+        )
+    k = np.clip(np.searchsorted(to, t, side="right") - 1, 0, to.size - 1)
+    return t + (to[k] - frm[k])

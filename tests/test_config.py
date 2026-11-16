@@ -246,7 +246,7 @@ def test_every_tracked_kilosort_block_states_the_same_parameters():
         k: v for k, v in by_system["neuropixels"].items() if k not in hardware
     }
     assert by_system["blackrock"]["nblocks"] == 0
-    assert by_system["neuropixels"]["nblocks"] == 1
+    assert by_system["neuropixels"]["nblocks"] == 5      # non-rigid: a 4 mm NHP shank does not move as one piece
 
 
 def test_no_tracked_kilosort_block_names_a_setting_the_pipeline_owns():
@@ -272,12 +272,13 @@ def test_the_utah_only_template_differs_only_by_the_missing_probe():
 
     # So there is nothing to align to, and the cross-system stages skip.
     assert utah.aligns_systems is False
-    # ...and the time map has nowhere but the Blackrock folder to live, which is
-    # where it would have gone anyway.
+    # ...and with no Neuropixels sorting to map, the path names the Blackrock folder.
     assert utah.paths.aligned == utah.paths.sorted_for("blackrock")
 
-    # The array half is untouched.
-    assert utah.blackrock == one.blackrock
+    # The array half is untouched -- except the .ns2 behaviour channels, which
+    # exist only to be compared with a OneBox, and this session has none.
+    from dataclasses import replace
+    assert utah.blackrock == replace(one.blackrock, analog_file=None, analog_inputs={})
     assert utah.sorts_blackrock is True
 
     stated = {
@@ -286,6 +287,8 @@ def test_the_utah_only_template_differs_only_by_the_missing_probe():
         "neuropixels_dir",
         "kilosort_on_neuropixels",
         "kilosort_by_system",
+        "export_analog",      # the OneBox's inputs; no SpikeGLX run, no OneBox
+        "blackrock",          # compared above, less the .ns2 it has no use for
     }
     differing = [
         f
@@ -372,11 +375,10 @@ def test_a_binary_whose_name_carries_no_probe_falls_back_to_its_position(tmp_pat
     assert session.for_probe(1).neuropixels.bin_file.name == "right.bin"
 
 
-def test_each_probe_gets_its_own_time_map_under_the_blackrock_folder(tmp_path):
-    # Both probes are fitted onto the SAME Blackrock recording, so `aligned` is
-    # the one path a probe list can make collide -- one time_map.json, written
-    # twice, the second winning. Each probe has its own oscillator and SY word,
-    # so those are genuinely different maps.
+def test_each_probe_gets_its_own_time_map_beside_its_own_sorting(tmp_path):
+    # Both probes are fitted onto the SAME Blackrock recording, but each has its
+    # own oscillator and SY word, so the maps genuinely differ. Each lands in its
+    # own probe's folder, which already keeps them apart.
     path = tmp_path / "two.yaml"
     path.write_text(
         'blackrock_dir: "Y:/br"\n'
@@ -389,9 +391,11 @@ def test_each_probe_gets_its_own_time_map_under_the_blackrock_folder(tmp_path):
     a, b = (config for _, config in session.per_probe())
 
     assert a.paths.aligned != b.paths.aligned
-    assert a.paths.aligned.name == "imec0" and b.paths.aligned.name == "imec1"
-    # Still under Blackrock, which is the reference timebase.
-    assert a.paths.aligned.parent == session.paths.sorted_br
+    assert a.paths.aligned == a.paths.sorted_for("neuropixels")
+    assert b.paths.aligned == b.paths.sorted_for("neuropixels")
+    assert "imec0" in str(a.paths.aligned) and "imec1" in str(b.paths.aligned)
+    # Nothing of either probe's lands in the Blackrock folder.
+    assert session.paths.sorted_br not in a.paths.aligned.parents
 
 
 def test_a_session_naming_one_binary_projects_to_itself(tmp_path):
@@ -507,15 +511,47 @@ def test_by_probe_takes_kilosort_and_nothing_else(tmp_path):
 
 def test_output_paths_are_derived_from_each_systems_directory(tmp_path):
     paths = cfg.OutputPaths(tmp_path / "br", tmp_path / "np")
-    assert paths.sync_for("blackrock").parent == tmp_path / "br"
-    assert paths.aligned.parent == tmp_path / "br"
+    # Blackrock's pulses only align Neuropixels, so they sit with its sorting.
+    assert paths.sync_for("blackrock").parent == tmp_path / "np"
+    assert paths.aligned.parent == tmp_path / "np"
+    (tmp_path / "br").mkdir(), (tmp_path / "np").mkdir()   # the recordings' folders
     paths.mkdirs()
     assert all(p.exists() for p in paths.all())
+
+
+def test_an_unsorted_blackrock_gets_no_output_folder(tmp_path):
+    # Blackrock that only carries the pulses: everything it contributes lives in
+    # the Neuropixels folder, so nothing is created beside the .ns5.
+    paths = cfg.OutputPaths(tmp_path / "br", tmp_path / "np", sorts_blackrock=False)
+    (tmp_path / "br").mkdir(), (tmp_path / "np").mkdir()
+    paths.mkdirs()
+
+    assert list((tmp_path / "br").iterdir()) == []
+    assert paths.sorted_for("neuropixels").is_dir()
+    assert paths.sync_for("blackrock") == paths.sorted_for("neuropixels")
+    assert not any(tmp_path / "br" in p.parents for p in paths.all())
+
+
+def test_a_session_without_a_spike_file_does_not_sort_blackrock(tmp_path):
+    session = cfg.load_session_config(_write_session(tmp_path, _TWO_SYSTEMS), "windows_rig", CONFIG_DIR)
+    assert session.sorts_blackrock is False
+    assert session.paths.sorts_blackrock is False
+    assert session.paths.all() == (session.paths.sorted_np, session.paths.export_for("neuropixels"))
+
+
+def test_two_probes_each_read_the_blackrock_pulses_from_their_own_folder(tmp_path):
+    session = _two_probe_session(
+        tmp_path, f'blackrock_dir: "{tmp_path / "br"}"\nblackrock:\n  sync_file: "/b/y.ns5"\n'
+    )
+    folders = [c.paths.sync_for("blackrock") for _, c in session.per_probe()]
+    assert folders == [c.paths.sorted_for("neuropixels") for _, c in session.per_probe()]
+    assert len(set(folders)) == 2
 
 
 def test_only_the_reachable_directories_are_created(tmp_path):
     # A single-system session must not be asked for the other system's paths.
     paths = cfg.OutputPaths(neuropixels_dir=tmp_path / "np")
+    (tmp_path / "np").mkdir()
     paths.mkdirs()
 
     assert all(p.exists() for p in paths.all())
@@ -542,14 +578,14 @@ def test_everything_from_one_system_lands_in_one_folder(tmp_path):
     assert "imec0" not in str(paths.sorted_for("neuropixels"))
 
 
-def test_the_time_map_goes_under_the_reference_timebase(tmp_path):
-    # Cross-system output is owned by neither sorting, so it goes to Blackrock's
-    # folder -- Blackrock is the axis everything is mapped onto.
+def test_the_time_map_goes_beside_the_sorting_it_maps(tmp_path):
+    # The map turns Neuropixels times into Blackrock time, so it belongs to the
+    # Neuropixels sorting: a local sorting stays local, whatever share Blackrock
+    # is on.
     paths = cfg.OutputPaths(tmp_path / "br", tmp_path / "np")
-    assert paths.aligned == paths.sorted_for("blackrock")
+    assert paths.aligned == paths.sorted_for("neuropixels")
 
-    # ...and falls back to the only system that recorded, so a Neuropixels-only
-    # session still has somewhere to write.
+    # ...and the same for a Neuropixels-only session.
     npx_only = cfg.OutputPaths(neuropixels_dir=tmp_path / "np")
     assert npx_only.aligned == npx_only.sorted_for("neuropixels")
 
@@ -615,6 +651,7 @@ def test_two_sessions_pointed_at_one_directory_would_share_a_folder(tmp_path):
 
 def test_mkdirs_creates_both_systems_folders(tmp_path):
     paths = cfg.OutputPaths(tmp_path / "br", tmp_path / "np")
+    (tmp_path / "br").mkdir(), (tmp_path / "np").mkdir()
     paths.mkdirs()
 
     for system in ("neuropixels", "blackrock"):
@@ -762,8 +799,9 @@ def test_sync_edges_follow_the_system_they_came_from(tmp_path):
     session = cfg.load_session_config(_write_session(tmp_path, _TWO_SYSTEMS), "windows_rig", CONFIG_DIR)
     paths = session.paths
 
-    # Each system's edges sit in that system's own folder, beside its sorting.
-    assert str(paths.sync_for("blackrock")) == "Z:/server/Monkey Athos/2026-08-13/kilosort4"
+    # Both systems' edges sit with the Neuropixels sorting they align: the
+    # Blackrock share is read, never written to, for synchronization.
+    assert str(paths.sync_for("blackrock")) == "Y:/npx/Monkey Athos/2026-08-13/kilosort4"
     assert str(paths.sync_for("neuropixels")) == "Y:/npx/Monkey Athos/2026-08-13/kilosort4"
     # The LF band is a Neuropixels product and goes in its export bundle;
     # Blackrock LFPs are saved separately by Central.
@@ -772,12 +810,13 @@ def test_sync_edges_follow_the_system_they_came_from(tmp_path):
     )
 
 
-def test_cross_system_output_goes_under_the_reference_timebase(tmp_path):
-    # Blackrock is the reference timebase, so the alignment that maps everything
-    # onto it belongs beside the Blackrock recording.
+def test_the_time_map_stays_off_the_blackrock_share(tmp_path):
+    # Blackrock is on the server, the Neuropixels sorting is not: the map that
+    # belongs to the sorting goes where the sorting is.
     session = cfg.load_session_config(_write_session(tmp_path, _TWO_SYSTEMS), "windows_rig", CONFIG_DIR)
 
-    assert str(session.paths.aligned) == "Z:/server/Monkey Athos/2026-08-13/kilosort4"
+    assert session.paths.aligned == session.paths.sorted_for("neuropixels")
+    assert not str(session.paths.aligned).startswith("Z:/server")
 
 
 def test_cross_system_output_falls_back_when_blackrock_never_recorded(tmp_path):
@@ -944,7 +983,8 @@ def test_a_probe_file_that_exists_is_not_a_problem(tmp_path):
     probe.write_text("{}", encoding="utf-8")
     session = _flags(tmp_path, f"blackrock:\n  probe_file: '{probe}'\n")
 
-    assert not any("probe" in p for p in session.missing_inputs())
+    # Match the message, not a substring: tmp_path carries this test's name.
+    assert not any("probe_file does not exist" in p for p in session.missing_inputs())
 
 
 def test_naming_no_map_at_all_is_not_a_missing_input(tmp_path):
@@ -1368,7 +1408,7 @@ def test_drift_correction_is_off_for_the_utah_array():
     session = cfg.load_session_config(CONFIG_DIR / "session_template_utah_probe.yaml", "windows_rig", CONFIG_DIR)
 
     assert session.kilosort_for("blackrock")["nblocks"] == 0
-    assert session.kilosort_for("neuropixels")["nblocks"] == 1
+    assert session.kilosort_for("neuropixels")["nblocks"] == 5
 
 
 def _load_session(tmp_path: Path, body: str):
@@ -1510,3 +1550,116 @@ def test_every_tracked_config_uses_only_real_settings(config):
     # The top-level key set is the one part of the check written by hand, so it
     # is pinned against the files that have to keep loading.
     cfg.load_session_config(CONFIG_DIR / config, "windows_rig", CONFIG_DIR)
+
+
+# ----------------------------------------------------------------------------
+# OneBox analog inputs
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name", ["session_template_1probe.yaml", "session_template_2probes.yaml",
+             "session_template_utah_probe.yaml"],
+)
+def test_every_template_with_a_onebox_states_the_rig_wiring(name):
+    # XA0 is the burst; the four behavioural signals follow it. One wiring, so
+    # a template that disagrees with the others is a typo, not a choice.
+    session = cfg.load_session_config(CONFIG_DIR / name, "windows_rig", CONFIG_DIR)
+    assert session.neuropixels.burst_word == 0
+    assert session.neuropixels.analog_channels == {
+        "eye_x": 1, "eye_y": 2, "pupil": 3, "photodiode": 4,
+    }
+    assert session.export_analog is True
+    assert session.analog_decimate == 1
+
+
+@pytest.mark.parametrize(
+    "channels, message",
+    [
+        ("{eye_x: 0}", "burst_word"),                 # XA0 is the sync burst
+        ("{eye_x: 1, eye_y: 1}", "more than once"),
+        ("{'eye x': 1}", "MATLAB"),
+        ("{eye_x: -1}", "XA-1"),
+    ],
+)
+def test_an_analog_map_that_cannot_describe_the_wiring_is_refused(tmp_path, channels, message):
+    with pytest.raises(ValueError, match=message):
+        _load_session(
+            tmp_path,
+            "neuropixels:\n  bin_file: '/a/run_g0_t0.imec0.ap.bin'\n"
+            f"  analog_channels: {channels}\n",
+        )
+
+
+def test_analog_decimate_below_one_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="analog_decimate"):
+        _load_session(
+            tmp_path,
+            "analog_decimate: 0\nneuropixels:\n  bin_file: '/a/run_g0_t0.imec0.ap.bin'\n",
+        )
+
+
+def test_a_missing_system_directory_is_reported_and_never_created(tmp_path):
+    paths = cfg.OutputPaths(blackrock_dir=tmp_path / "br_typo", neuropixels_dir=tmp_path / "np")
+    (tmp_path / "np").mkdir()
+
+    with pytest.raises(FileNotFoundError, match="blackrock_dir does not exist"):
+        paths.mkdirs()
+    assert not (tmp_path / "br_typo").exists()
+
+    session = _flags(tmp_path, "")                      # np exists, br does not
+    problems = session.missing_inputs()
+    assert any(p.startswith("blackrock_dir does not exist") for p in problems)
+    assert not any(p.startswith("neuropixels_dir") for p in problems)
+
+
+def test_extraction_never_creates_the_recordings_folder(tmp_path):
+    from spikesorting._sync import extract
+
+    session = _flags(tmp_path, "")                       # neuropixels_dir: tmp/np, absent
+    with pytest.raises(FileNotFoundError, match="neuropixels_dir does not exist"):
+        extract.extract_neuropixels_edges(session)
+    assert not session.paths.dir_for("neuropixels").exists()
+
+
+def test_the_sync_channel_id_is_the_front_end_count_plus_the_analog_input():
+    spec = cfg.BlackrockSpec.from_dict({})
+    assert (spec.nsp_frontend_channels, spec.sync_1hz_input, spec.burst_input) == (32, 7, 8)
+    assert spec.channel_id(spec.sync_1hz_input) == 39
+    assert spec.channel_id(spec.burst_input) == 40
+    bigger = cfg.BlackrockSpec.from_dict({"nsp_frontend_channels": 128})
+    assert bigger.channel_id(7) == 135
+    with pytest.raises(ValueError, match="ainp<n> with n >= 1"):
+        cfg.BlackrockSpec.from_dict({"sync_1hz_input": 0})
+
+
+@pytest.mark.parametrize("key", ["sync_1hz_channel", "burst_channel"])
+def test_the_old_sync_channel_keys_say_what_replaced_them(tmp_path, key):
+    body = _TWO_SYSTEMS.replace(
+        'sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"',
+        f'sync_file: "{{blackrock_dir}}/NSP-Athos_001.ns5"\n  {key}: 39',
+    )
+    with pytest.raises(ValueError, match="retired.*sync_1hz_input / burst_input"):
+        cfg.load_session_config(_write_session(tmp_path, body), "windows_rig", CONFIG_DIR)
+
+
+def test_blackrock_analog_inputs_replace_the_positional_analog_channels(tmp_path):
+    with_inputs = _TWO_SYSTEMS.replace(
+        'sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"',
+        'sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"\n'
+        '  analog_file: "{blackrock_dir}/NSP-Athos_001.ns2"\n'
+        "  analog_inputs: {photodiode: 4}",
+    ) + "  analog_channels: {photodiode: 4}\n"     # the OneBox's: still a setting
+    session = cfg.load_session_config(
+        _write_session(tmp_path, with_inputs), "windows_rig", CONFIG_DIR
+    )
+    assert session.blackrock.analog_inputs == {"photodiode": 4}
+    assert session.blackrock.channel_id(4) == 36
+
+    old = with_inputs.replace("analog_inputs: {photodiode: 4}", "analog_channels: {photodiode: 3}")
+    with pytest.raises(ValueError, match="retired.*now analog_inputs"):
+        cfg.load_session_config(_write_session(tmp_path, old), "windows_rig", CONFIG_DIR)
+
+    zero = with_inputs.replace("analog_inputs: {photodiode: 4}", "analog_inputs: {photodiode: 0}")
+    with pytest.raises(ValueError, match="ainp numbers, n >= 1"):
+        cfg.load_session_config(_write_session(tmp_path, zero), "windows_rig", CONFIG_DIR)

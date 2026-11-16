@@ -9,6 +9,8 @@ being read directly by the loops.
 
 from __future__ import annotations
 
+import pytest
+
 import argparse
 
 from _cli import flag_overrides
@@ -56,6 +58,7 @@ def test_overrides_reach_the_loaded_session_without_touching_the_file(tmp_path):
         encoding="utf-8",
     )
     common = {"config": str(session), "machine": "mac", "probe": None}
+    (tmp_path / "np").mkdir()
 
     assert load(_args(**common), require_inputs=False).export_lfp is False
 
@@ -81,3 +84,140 @@ def test_a_printed_path_survives_being_pasted_into_a_shell():
     ]
     # ...and a path with nothing to protect is printed as it was typed.
     assert shell_arg("session_x") == "session_x"
+
+
+def test_each_stage_reports_how_long_it_took():
+    from _cli import _elapsed
+
+    assert _elapsed(0.42) == "0.4 s"
+    assert _elapsed(252) == "4.2 min"
+    assert _elapsed(5508) == "1.53 h"
+
+
+@pytest.mark.parametrize("require_inputs", [True, False])     # sorting / exporting driver
+def test_a_mistyped_directory_is_never_created(tmp_path, require_inputs):
+    # The bug: load() made <typo>/kilosort4/export with mkdir(parents=True) before
+    # anything checked the path, leaving a fake recording folder on disk.
+    from _cli import load
+
+    typo = tmp_path / "SGL_DATA" / "Athos_g1_typo"
+    session = tmp_path / "s.yaml"
+    session.write_text(
+        f"neuropixels_dir: '{typo}'\nneuropixels:\n  bin_file: '{{neuropixels_dir}}/x.ap.bin'\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(FileNotFoundError, match="neuropixels_dir does not exist"):
+        load(_args(config=str(session), machine="mac", probe=None),
+             require_inputs=require_inputs)
+    assert not (tmp_path / "SGL_DATA").exists()          # not even the parent
+
+
+def test_the_runner_keeps_each_stages_time_and_breakdown(monkeypatch):
+    from types import SimpleNamespace
+
+    import _cli
+    from _cli import Runner
+
+    def export_results(config, system):
+        return {"n_units": 3, "timing": {"figures": 1.0}}
+
+    def extract_sync(config, system):
+        return None
+
+    monkeypatch.setattr(_cli, "skip_reason", lambda *a, **k: None)
+    run = Runner(SimpleNamespace())
+    run(extract_sync, None, "blackrock", system="blackrock")
+    run(export_results, None, "neuropixels", system="neuropixels", label="neuropixels imec1")
+
+    (stage,) = run.stages_for("neuropixels imec1")
+    assert stage["stage"] == "export_results" and stage["status"] == "ok"
+    assert stage["steps"] == {"figures": 1.0}
+    assert run.stages_for("blackrock")[0]["status"] == "nothing to do"
+
+
+def test_a_failed_check_stops_the_run_before_anything_is_exported(monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    import _cli
+    from _cli import Runner
+
+    report = SimpleNamespace(passed=False, summary=lambda: "alignment FAIL: 50% matched")
+    exported = []
+
+    def validate_remapping(config, figures):
+        return report
+
+    def export_results(config, system):
+        exported.append(system)
+        return {"n_units": 1}
+
+    monkeypatch.setattr(_cli, "skip_reason", lambda *a, **k: None)
+    run = Runner(SimpleNamespace())
+    assert run(validate_remapping, None, True, system="neuropixels") is report
+    run(export_results, None, "neuropixels", system="neuropixels")
+
+    assert exported == []
+    assert run.stages_for("neuropixels")[0]["status"] == "failed check"
+    out = capsys.readouterr().out
+    assert "[!!] validate_remapping(neuropixels)" in out and "50% matched" in out
+    assert run.finish("exporting pipeline") == 1
+
+
+def test_a_passing_check_is_an_ordinary_stage(monkeypatch):
+    from types import SimpleNamespace
+
+    import _cli
+    from _cli import Runner
+
+    monkeypatch.setattr(_cli, "skip_reason", lambda *a, **k: None)
+    run = Runner(SimpleNamespace())
+
+    def validate_remapping(config, figures):
+        return SimpleNamespace(passed=True, summary=lambda: "alignment PASS")
+
+    run(validate_remapping, None, True, system="neuropixels")
+    assert not run.stopped and run.failures == 0
+
+
+def test_the_run_log_keeps_what_was_printed_and_logged_and_saves_it_per_stream(tmp_path):
+    import logging
+    import sys
+
+    from _cli import RunLog
+
+    terminal = sys.stdout
+    run_log = RunLog("exporting")
+    try:
+        print("[ok] extract_sync(neuropixels)")
+        logging.getLogger("spikesorting").warning("a pipeline message")
+    finally:
+        run_log.close()
+    assert sys.stdout is terminal                    # capture is undone
+
+    saved = run_log.save([tmp_path / "np", tmp_path / "br", tmp_path / "np"], "rig")
+
+    assert [p.parent for p in saved] == [tmp_path / "np" / "logs", tmp_path / "br" / "logs"]
+    name = saved[0].name
+    assert name.startswith("exporting_") and name.endswith("_rig.log")
+    text = saved[0].read_text()
+    assert "[ok] extract_sync(neuropixels)" in text and "a pipeline message" in text
+    assert "command:" in text.splitlines()[0]
+
+
+def test_the_stage_table_lists_every_stage_and_the_total(monkeypatch):
+    from types import SimpleNamespace
+
+    import _cli
+    from _cli import Runner
+
+    monkeypatch.setattr(_cli, "skip_reason", lambda *a, **k: None)
+    run = Runner(SimpleNamespace())
+    run.stages = [
+        {"label": "neuropixels", "stage": "preprocess", "status": "ok", "seconds": 90.0},
+        {"label": "blackrock", "stage": "sort_with_kilosort", "status": "ok", "seconds": 30.0},
+    ]
+    lines = run.stage_table().splitlines()
+
+    assert lines[0] == "stage times"
+    assert "preprocess" in lines[1] and "1.5 min" in lines[1]
+    assert lines[-1].split()[-3:] == ["total", "2.0", "min"]

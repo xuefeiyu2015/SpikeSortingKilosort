@@ -32,6 +32,8 @@ kilosort_on_blackrock: true
 
 export_lfp: false      # LF-band copy, ~7 GB/hour at 385 channels -- see "LFP"
 lfp_decimate: 1        # stride for it; 2 is safe, more aliases
+export_analog: true    # OneBox XA inputs (eye, pupil, photodiode) on Blackrock time -- see "OneBox analog"
+analog_decimate: 1     # stride for it; plain, no anti-alias filter
 export_figures: true   # per-unit and overview PNGs at export time
 
 # ---------- edit for this session ----------
@@ -48,6 +50,12 @@ blackrock:
   # ---------- edit for this session ----------
   spike_file: "{blackrock_dir}/HUB-Athos_001.ns6"   # Utah array spikes
   sync_file: "{blackrock_dir}/NSP-Athos_001.ns5"    # the two sync channels
+  # Blackrock's copy of the OneBox behaviour channels, 1 kHz: compared after
+  # synchronization as an independent check -- see "OneBox analog".
+  analog_file: "{blackrock_dir}/NSP-Athos_001.ns2"
+  analog_inputs: {eye_x: 1, eye_y: 2, pupil: 3, photodiode: 4}   # ainp<n> on the NSP
+  nsp_frontend_channels: 32   # electrode channels on this NSP: its analog inputs
+                              # are numbered after them -- see "Sync channels"
   # This array's channel map: its own .cmp, or a .json/.mat built from one.
   # Read by extension, so there is one key whatever the format.
   probe_file: "configs/probes/utah_athos_A.json"
@@ -114,8 +122,8 @@ blackrock:
     clear_cache: false           # free GPU memory between steps: slower, smaller
 
   # ---------- defaults: change only if you know what they mean ----------
-  sync_1hz_channel: 1    # NSP-*.ns5 channel carrying the 1 Hz square wave
-  burst_channel: 2       # ...and the one carrying the 14 s coded burst
+  sync_1hz_input: 7      # analog input carrying the 1 Hz wave: ainp7
+  burst_input: 8         # ...and the 14 s coded burst: ainp8 -- see "Sync channels"
   sync_threshold: 2.5    # rising-edge thresholds, in volts after neo scaling
   burst_threshold: 2.5
   stream_id: null        # pin one when a .nsX exposes several streams
@@ -133,6 +141,11 @@ neuropixels:
   # read back off this filename -- see "Where the SpikeGLX run went".
   bin_file: "{neuropixels_dir}/Athos_2026_08_13_g0_t0.imec0.ap.bin"
   lf_file: null          # only when the LF band is not beside the AP one
+  analog_channels:       # what is wired into the OneBox XA inputs -- see "OneBox analog"
+    eye_x: 1             # (XA0 is the 14 s burst -- burst_word -- exported as sync_burst)
+    eye_y: 2
+    pupil: 3
+    photodiode: 4        # fixation-point onset
   preprocess:            # done before Kilosort, which then only whitens -- see "Preprocessing"
     method: catgt        # catgt | spikeinterface. CatGT that cannot run stops; it never switches
     highpass_hz: 300     # band-pass, Hz: CatGT -apfilter=butter,12,lo,hi
@@ -143,11 +156,11 @@ neuropixels:
                          #   0.10 mV/sample, until it falls below 0.02 mV.
                          #   For chewing/licking/cable artifacts -- see "Preprocessing"
     phase_shift: true    # ADC multiplexing correction (CatGT tshift)
-    motion: null         # a SpikeInterface correct_motion preset (dredge, ...); needs nblocks: 0
+    motion: null         # or a SpikeInterface preset: dredge, medicine, ... -- see "Preprocessing"; Kilosort then runs nblocks: 0
   kilosort:                    # every Kilosort parameter, stated -- see "Kilosort settings"
     # ---- this session ----
     bad_channels: []             # dead sites, as recording channel numbers -- see "Bad channels"
-    nblocks: 1                   # rigid drift correction -- see "Drift correction"
+    nblocks: 5                   # non-rigid drift correction, 5 depth blocks -- see "Drift correction"
     tmin: 0                      # sort from this second of the binary -- see "Sort window"
     tmax: .inf                   # ...to this one; .inf = the end of the file
     # ---- Kilosort's own values: change only if you know what they mean ----
@@ -203,7 +216,7 @@ neuropixels:
   n_chan_bin: null       # read from the .meta
   sync_bit: 6            # SY-word bit carrying the 1 Hz wave (SpikeGLX default)
   sync_pulse_ms: 500     # its high duration; a CatGT -xd argument
-  burst_word: 1          # XA input on the OneBox carrying the 14 s burst
+  burst_word: 0          # XA input on the OneBox carrying the 14 s burst (XA0)
   burst_threshold_v: [1.0, 0.0]   # CatGT -xa volts (primary, secondary)
   burst_pulse_ms: 0      # expected burst width in ms; 0 accepts any
   waveforms:             # the mean-waveform export -- see "Waveforms"
@@ -269,6 +282,27 @@ kilosort: {}
 #   hardware-limited to ~500 Hz at 2500 Hz sampling, so 2 (-> 1250 Hz) is safe
 #   and anything above it aliases.
 #
+# OneBox analog
+#   export_analog writes every XA input the OneBox saved to
+#   export/<run>.obx0.obx.analog.mat -- the ones named in analog_channels under
+#   those names, the 14 s burst as sync_burst, the rest as XA<n>. In MATLAB:
+#     a = load(f).analog;  eye_x = double(a.data(a.index.eye_x, :)) * a.v_per_digit(1);
+#     t = a.t0_blackrock + (0:a.n_samples-1) / a.fs_blackrock;   % NSP clock, s
+#   The samples are on the OneBox clock; Blackrock time is time_map.json's
+#   onebox_to_blackrock, stamped in once time_remapping has run. It is the
+#   chain the held-out burst travels, so validation.json is its check.
+#
+#   blackrock.analog_file/analog_inputs name Blackrock's own copies in the
+#   .ns2, by the analog input each is wired into (ainp1 -> 1) -- the same
+#   numbering, and the same ID lookup, as the sync inputs: see "Sync
+#   channels". validate_remapping
+#   compares them with the OneBox's after synchronization and adds the result
+#   to export/sync_report.txt: photodiode by edges, the rest by
+#   cross-correlation. Judged on drift across the session -- a constant offset
+#   is Blackrock's filter delay on its 1 kHz stream. They warn, never fail.
+#   ~0.7 GB/hour at analog_decimate: 1 for twelve inputs; the stride has no
+#   anti-alias filter, so keep it where the photodiode edge still resolves.
+#
 # Which systems recorded
 #   Derived from whether a block declares paths, not from a flag. To say a system
 #   did not record, remove its block; there is then nothing to keep in step with
@@ -281,16 +315,21 @@ kilosort: {}
 #   whether to sort, which is what kilosort_on_* is for.
 #
 # Outputs -- one folder per system, beside its own recording
-#   {blackrock_dir}/kilosort4/          sorted Utah array, NSP edge files,
-#                                       the cross-system time map, and export/
-#   {neuropixels_dir}/kilosort4/        sorted Neuropixels, SpikeGLX edge files,
+#   {blackrock_dir}/kilosort4/          sorted Utah array and export/
+#                                       (only when the array is sorted)
+#   {neuropixels_dir}/kilosort4/        sorted Neuropixels, every edge file
+#                                       (Blackrock's too), the time map onto
+#                                       Blackrock time,
 #                                       the LF band, and export/
 #
 #   Everything derived from one recording lands in one directory, so handing an
 #   analysis a sorting means handing it a folder rather than a tour of three
 #   trees. There is no system or probe level above it: the directory this file
-#   names already says which recording it is. Cross-system results go under the
-#   Blackrock one, because Blackrock is the reference timebase.
+#   names already says which recording it is. Synchronization belongs to the
+#   Neuropixels sorting: the time map and the Blackrock edge files it was
+#   fitted from sit beside it, so a local sorting stays local and the Blackrock
+#   share is only read. {blackrock_dir}/kilosort4/ exists only when the Utah
+#   array is sorted.
 #
 # Where the SpikeGLX run went
 #   A session names one binary -- bin_file -- and nothing else. There is no
@@ -409,7 +448,18 @@ kilosort: {}
 # Drift correction
 #   nblocks is how many depth blocks Kilosort tracks: 1 is rigid (the whole shank
 #   moves together), 5 gives 5 non-overlapping blocks plus 4 straddling their
-#   boundaries, 0 disables it.
+#   boundaries, 0 disables it. The Neuropixels default here is 5: a 4 mm NHP
+#   probe does not move as one piece -- the tip and the top drift by different
+#   amounts -- and rigid correction fits one shift to both. Kilosort then writes
+#   drift_amount.png and drift_scatter.png beside the sorting.
+#
+#   Or correct it before Kilosort instead, with preprocess.motion: Kilosort
+#   then sorts with nblocks: 0 whatever is written here (the log says so), and
+#   the value here is used again once motion is null. Each preset writes to
+#   preprocessed/motion_<preset>/ -- its binary, what it measured, and
+#   motion_drift_scatter.png (peaks across time and depth, before and after
+#   correction) and motion_drift_amount.png (the estimated motion) go beside the
+#   sorting and into export/figures/.
 #
 #   It is off on the Utah array because the correction interpolates between
 #   neighbouring contacts with a Gaussian kernel of sig_interp = 20 um. At 400 um
@@ -458,9 +508,20 @@ kilosort: {}
 #                   a sample apart; this re-aligns them (CatGT tshift, which is
 #                   on unless -no_tshift). Needs the .meta.
 #     motion        null keeps drift correction inside Kilosort (nblocks). A
-#                   SpikeInterface correct_motion preset (dredge, ...) corrects it
-#                   here instead and writes a motion-corrected binary; nblocks
-#                   must then be 0, or drift is corrected twice -- refused at load.
+#                   SpikeInterface correct_motion preset corrects it here
+#                   instead and writes a motion-corrected binary; Kilosort's
+#                   nblocks is then 0 automatically, so drift is never
+#                   corrected twice. Every channel is kept (border_mode
+#                   force_extrapolate), whatever the preset's own default.
+#                   Presets: dredge, dredge_fast, medicine, nonrigid_accurate,
+#                   nonrigid_fast_and_accurate, rigid_fast, kilosort_like.
+#                   medicine needs one more package in the sorting env:
+#                   pip install medicine-neuro (check_env.py --config says so).
+#                   With CatGT, changing only this re-runs only the motion
+#                   step: CatGT's output in preprocessed/catgt/ is reused.
+#                   Each preset keeps its own folder, motion_<preset>/, so
+#                   switching back to one reuses it; each holds a binary the
+#                   size of the recording -- delete a folder to free it.
 #
 #   The result is written to <system>_dir/preprocessed/ -- a .bin the size of
 #   the recording, with preprocess.json beside it saying exactly what made it --
@@ -514,3 +575,16 @@ kilosort: {}
 #   one of these (cluster_init_seed, max_cluster_subset, batch_downsampling are
 #   recent), the sort stops at once naming it: delete that line.
 #   `run_sorting_pipeline.py --dry-run` makes the same check without a GPU.
+#
+# Sync channels
+#   sync_1hz_input / burst_input are the analog inputs the cables go into, as
+#   labelled on the NSP: ainp7 -> 7. The .ns5 header lists each channel by an
+#   ID, and the NSP numbers its analog inputs after its front-end (electrode)
+#   channels, so the ID is nsp_frontend_channels + input: ainp7 is 39 on a
+#   32-channel NSP and 135 on a 128-channel one. The count is a property of the
+#   rig, not the session. The reader also checks that the channel with that ID
+#   is named ainp<n>, so a wrong count stops with the count the file implies
+#   rather than reading another channel.
+#   analog_inputs (the .ns2 copies of the OneBox channels) are numbered the
+#   same way and found the same way, never by their place in the file: an
+#   input switched off in Central would otherwise shift every one after it.

@@ -120,12 +120,21 @@ def build_unit_table(
     duration_s: float | None = None,
     refractory_s: float = 1.5e-3,
     start_s: float | None = None,
+    mean_waveforms: dict[int, np.ndarray] | None = None,
+    waveform_units: str = "",
 ) -> pd.DataFrame:
     """One row of metrics per unit.
 
     ``spike_times_s`` supplies already-aligned times per unit; without it the
     sorter's own timebase is used. Either way the metrics are computed on whatever
     timebase is passed, and the recording window is derived to match.
+
+    The shape columns (``trough_amplitude``, ``peak_amplitude``,
+    ``peak_to_trough_ms``, ``half_width_ms``) come from ``mean_waveforms`` --
+    each unit's *measured* mean on its peak channel, in ``waveform_units``
+    (``uV``, or ``ADC`` where a gain is unknown) -- and are NaN without one.
+    Never from ``templates.npy``: that is Kilosort's fitted shape in whitened,
+    arbitrary units, and an amplitude read off it looks like a near-silent unit.
     """
     unit_ids = results.unit_ids if unit_ids is None else np.asarray(unit_ids)
     window_start, window_duration = recording_window(results, unit_ids, spike_times_s)
@@ -140,7 +149,10 @@ def build_unit_table(
             if spike_times_s is not None and unit_id in spike_times_s
             else results.times_for(unit_id)
         )
-        waveform, channel = mean_template_waveform(results, unit_id)
+        channel = best_channel(results, unit_id)
+        waveform = (np.asarray(mean_waveforms[unit_id])
+                    if mean_waveforms is not None and unit_id in mean_waveforms
+                    else np.empty(0))
 
         row: dict[str, Any] = {
             "unit_id": unit_id,
@@ -156,12 +168,13 @@ def build_unit_table(
                 spike_times_s=times,
                 duration_s=duration_s,
                 amplitudes=results.amplitudes_for(unit_id),
-                mean_waveform=waveform if waveform.size else None,
+                mean_waveform=waveform,
                 fs=results.fs,
                 refractory_s=refractory_s,
                 start_s=start_s,
             )
         )
+        row["waveform_units"] = waveform_units if waveform.size else ""
         rows.append(row)
 
     return pd.DataFrame(rows)
