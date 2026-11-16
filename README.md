@@ -18,7 +18,7 @@ run_sorting_pipeline.py             →           phy template-gui  →  run_exp
 | missing a channel map (`probe_file`) | **[Extra 1](#Extra-1--probe-files-channel-maps)** |
 | staring at a `[--]` skipped or `[!!]` failed line | **[Extra 2](#Extra-2--when-a-stage-skips-or-fails)** |
 
-Five notebooks sit alongside the steps below, in `notebooks/`:
+Six notebooks sit alongside the steps below, in `notebooks/`:
 
 - **`step1_run_sorting_stepbystep.ipynb`** and **`step2_run_export_stepbystep.ipynb`**
   — if you want to understand what each step of the pipeline actually does,
@@ -30,9 +30,15 @@ Five notebooks sit alongside the steps below, in `notebooks/`:
 - **`setup_demo_data.ipynb`** — downloads the official Kilosort4 demo recording
   and its channel map, so you can run the whole pipeline start to finish without
   any rig data. Used in [Step 4f](#4f-prove-it-works).
+- **`step3_compare_sync_analog.ipynb`** — overlays the OneBox and Blackrock copies of
+  the sync and behaviour signals, before and after synchronization, and measures
+  how far apart they are.
+- **`step4_check_export.ipynb`** — reads the exported `.mat` files back with plain
+  h5py: how many units were sorted, how many are single units (`good`) and
+  multi-units (`mua`), which channels they sit on, their firing rates, a few random
+  examples, and (when the LFP was exported) LFP traces and their spectrogram over
+  a window you set.
 - **`build_probe_config.ipynb`** — builds or inspects a channel map by hand.
-- **`compare_sync_analog.ipynb`** — overlays the OneBox and Blackrock copies of
-  the sync and behaviour signals, before and after synchronization.
   **Not needed in most cases**: a Neuropixels map comes from the run's own
   `.meta`, and a Utah array's comes from its `.cmp`. See
   [Step 5](#step-5--probe-files-channel-maps).
