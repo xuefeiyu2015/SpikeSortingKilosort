@@ -36,7 +36,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-__all__ = ["Chunked", "write_mat", "update_mat", "matlab_shape"]
+__all__ = ["Chunked", "MatLockedError", "write_mat", "update_mat", "matlab_shape"]
 
 #: numpy kind -> the MATLAB class name that must be stamped on the dataset.
 _CLASSES = {
@@ -155,6 +155,37 @@ def _write_struct(group, fields: dict[str, Any]) -> None:
         _write_value(group, name, value)
 
 
+class MatLockedError(OSError):
+    """A ``.mat`` the pipeline must write is held open by another program.
+
+    An ``OSError``, so callers that guard file access with ``except OSError``
+    still catch it; the message names the file and what usually holds it.
+    """
+
+
+def _open_for_writing(path: Path, mode: str, **kwargs: Any) -> Any:
+    """``h5py.File(path, mode)``, with a lock refusal turned into a message that says what to do.
+
+    HDF5 locks a file when it opens it. On Windows a second process that has
+    the file open -- even only for reading -- makes the open fail with
+    "unable to lock file ... GetLastError() = 33", which names neither the
+    file nor the cause.
+    """
+    import h5py
+
+    try:
+        return h5py.File(path, mode, **kwargs)
+    except OSError as error:
+        if "lock" not in str(error).lower():
+            raise
+        raise MatLockedError(
+            f"cannot write {path}: another program has it open ({error}). Usually a "
+            "notebook kernel that opened it with h5py and is still running -- restart "
+            "or shut down that kernel -- or HDFView, or a MATLAB/Python session "
+            "holding it; close it and run again"
+        ) from None
+
+
 def write_mat(path: str | Path, variables: dict[str, Any]) -> Path:
     """Write ``variables`` as a MATLAB v7.3 ``.mat``. Returns the path.
 
@@ -164,14 +195,12 @@ def write_mat(path: str | Path, variables: dict[str, Any]) -> Path:
     docstring for the three things that make the file a ``.mat`` rather than
     plain HDF5.
     """
-    import h5py
-
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # The userblock has to be reserved at creation and can only be written once
     # the file is closed -- h5py owns those bytes while the file is open.
-    with h5py.File(path, "w", userblock_size=512) as handle:
+    with _open_for_writing(path, "w", userblock_size=512) as handle:
         for name, value in variables.items():
             if isinstance(value, dict):
                 _write_struct(handle.create_group(name), value)
@@ -196,10 +225,8 @@ def update_mat(path: str | Path, variables: dict[str, dict[str, Any]]) -> Path:
     rebuilt from what the group holds afterwards -- otherwise a field added here
     would be invisible to MATLAB.
     """
-    import h5py
-
     path = Path(path)
-    with h5py.File(path, "a") as handle:
+    with _open_for_writing(path, "a") as handle:
         for variable, fields in variables.items():
             if variable not in handle:
                 raise KeyError(f"{path.name} has no variable {variable!r} to update")

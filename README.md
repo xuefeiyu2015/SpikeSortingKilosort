@@ -634,6 +634,7 @@ and the indented line under it is the reason. Common ones:
 | unresolved `{placeholder}` | a `{name}` no longer defined. Only `{blackrock_dir}` and `{neuropixels_dir}` exist |
 | neo raises on a timestamp jump | set `blackrock.gap_tolerance_ms`; most real PTP files need it. Above the tolerance the recording splits into segments, and `allow_segments` decides whether that is acceptable |
 | both systems share a directory | point `neuropixels_dir` at the `…_imec<n>` folder holding the `.ap.bin` |
+| `MatLockedError: cannot write …\x.lfp.mat: another program has it open` | a notebook kernel (or HDFView) still holds that export open. Restart or shut down the kernel, then run again. The step-3/4 notebooks read each file and close it, so they no longer hold it |
 
 A few traps that do *not* announce themselves:
 

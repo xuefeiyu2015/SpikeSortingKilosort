@@ -111,3 +111,44 @@ def test_nested_structs_round_trip(tmp_path):
     with h5py.File(path, "r") as handle:
         assert handle["a/b"].attrs["MATLAB_class"] == b"struct"
         assert handle["a/b/c"][()].ravel()[0] == 7.0
+
+
+def test_a_mat_another_process_holds_open_is_named_with_what_to_do(tmp_path):
+    # The rig's "Unable to synchronously open file (unable to lock file ...
+    # GetLastError() = 33)" named neither the file nor the cause: a notebook
+    # kernel still holding the export open.
+    import subprocess
+    import sys
+
+    from spikesorting._io import matlab
+
+    path = matlab.write_mat(tmp_path / "x.lfp.mat", {"lfp": {"timebase": "stream"}})
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         f"import h5py, time; f = h5py.File({str(path)!r}, 'r'); print('open', flush=True); "
+         "time.sleep(30)"],
+        stdout=subprocess.PIPE, text=True)
+    try:
+        holder.stdout.readline()
+        try:
+            matlab.update_mat(path, {"lfp": {"timebase": "blackrock"}})
+        except matlab.MatLockedError as error:
+            assert str(path) in str(error) and "notebook kernel" in str(error)
+            assert isinstance(error, OSError)       # every `except OSError` still catches it
+        else:
+            pytest.skip("HDF5 does not lock files on this platform")
+    finally:
+        holder.kill()
+        holder.wait()
+    # Released, the same write goes through.
+    matlab.update_mat(path, {"lfp": {"timebase": "blackrock"}})
+
+
+def test_an_open_failure_that_is_not_a_lock_is_left_as_it_was(tmp_path):
+    from spikesorting._io import matlab
+
+    broken = tmp_path / "x.mat"
+    broken.write_bytes(b"not an HDF5 file")
+    with pytest.raises(OSError) as raised:
+        matlab.update_mat(broken, {"lfp": {"timebase": "blackrock"}})
+    assert not isinstance(raised.value, matlab.MatLockedError)
