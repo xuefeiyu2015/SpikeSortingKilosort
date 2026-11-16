@@ -88,7 +88,7 @@ keys it answers:
 | `bad_channels` | recording channel numbers to drop (rows of the binary, not array positions) |
 | `do_CAR` | subtract the median across channels each batch (default true) |
 | `highpass_cutoff` | Kilosort's own highpass, in Hz (default 300) |
-| `nblocks` | Kilosort's drift correction: `0` off, `1` rigid, `5` (the template) five depth blocks. Ignored -- Kilosort sorts with `0` -- whenever `preprocess.motion` is set |
+| `nblocks` | Kilosort's drift correction: `0` off (the templates: MEDiCINe corrects drift instead), `1` rigid, `5` five depth blocks (use this with `motion: null`). Ignored -- Kilosort sorts with `0` -- whenever `preprocess.motion` is set |
 | `artifact_threshold` | zero out batches above this amplitude |
 | `tmin` / `tmax` | sort only this window of the binary, in seconds |(haven't implemented yet)
 
@@ -162,15 +162,18 @@ Kilosort corrects drift by interpolating between neighbouring contacts, and at
 400 µm pitch there is no neighbour — a nonzero shift estimate *attenuates* the
 signal instead of moving it.
 
-**Neuropixels drift is corrected one of two ways — switched by one line.**
+**Neuropixels drift is corrected one of two ways — switched by one line.** The templates use
+**MEDiCINe** (`motion: medicine`, `nblocks: 0`): it tracked this lab's probes better than
+Kilosort's own correction.
 
 | `preprocess.motion` | who corrects drift | figures beside the sorting |
 |---|---|---|
-| `null` | Kilosort, at `kilosort.nblocks` (5 in the template) | Kilosort's `drift_amount.png`, `drift_scatter.png` |
-| `dredge`, `dredge_fast`, `medicine`, … | SpikeInterface, before Kilosort; Kilosort runs with `nblocks: 0` automatically, whatever the YAML says | `motion_drift_scatter.png` (before vs after), `motion_drift_amount.png` |
+| `null` | Kilosort, at `kilosort.nblocks` (set it to 5) | Kilosort's `drift_amount.png`, `drift_scatter.png` |
+| `medicine` (the templates), `dredge`, `dredge_fast`, … | SpikeInterface, before Kilosort; Kilosort runs with `nblocks: 0` automatically, whatever the YAML says | `motion_drift_scatter.png` (before vs after), `motion_drift_amount.png` |
 
-So leave `nblocks: 5` in the file: it is used again as soon as `motion` is back
-to `null`, and the log says when it was overridden. With CatGT, changing only
+To go back to Kilosort's correction, set `motion: null` **and** `nblocks: 5` —
+with `nblocks: 0` nothing would correct drift. While `motion` is set, `nblocks` is
+overridden to 0 whatever it says, and the log says so. With CatGT, changing only
 `motion` re-runs only the motion step — CatGT's output in
 `preprocessed/catgt/` is reused.
 
@@ -314,7 +317,7 @@ python run_exporting_pipeline.py --config session_Porthos_1probe
 | stage | what it does |
 |---|---|
 | `extract_sync` | the 1 Hz train and the 14 s coded burst from each stream. CatGT where the machine has it, always the NumPy detector, and the two compared |
-| `lfp` | the LF band, when `export_lfp: true`. Off by default: ~7 GB per hour at 385 channels |
+| `lfp` | the LF band, when `export_lfp: true` (on in the templates): ~7 GB per hour at 385 channels |
 | `time_remapping` | coarse offset from the bursts, fine fit on the 1 Hz train, onto Blackrock time |
 | `validate_remapping` | the same map checked against the **held-out** burst onsets; exits non-zero past `alignment_tolerance_s` (1 ms), so it can gate a batch job |
 | `export_results` | aligned spike times, metrics, figures |
@@ -395,7 +398,7 @@ you ended up with, in 4e.
 
 Kilosort4 install docs: <https://kilosort.readthedocs.io/en/latest/installation.html>
 
-**Optional: MEDiCINe**, for `preprocess.motion: medicine`. SpikeInterface
+**MEDiCINe**, for `preprocess.motion: medicine` — **needed by the templates**, which use it for Neuropixels drift. SpikeInterface
 ships the preset but not the method, which is its own package:
 
 ```bash
