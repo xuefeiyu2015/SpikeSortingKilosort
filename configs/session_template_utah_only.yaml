@@ -30,7 +30,7 @@
 # false = extract that system's LFP and sync pulses, but do not sort it.
 kilosort_on_blackrock: true
 
-export_lfp: false      # LF-band copy, ~7 GB/hour at 385 channels -- see "LFP"
+export_lfp: true       # LF-band copy, ~7 GB/hour at 385 channels -- see "LFP"
 lfp_decimate: 1        # stride for it; 2 is safe, more aliases
 export_figures: true   # per-unit and overview PNGs at export time
 
@@ -170,10 +170,11 @@ kilosort: {}
 #   the session six months later.
 #
 # LFP
-#   Off by default because at lfp_decimate: 1 it writes an output the size of the
-#   recording -- about 7 GB per hour at 385 channels -- so it is a deliberate
-#   request, made where the data lives. Blackrock LFPs are already saved
-#   separately by Central, so this is Neuropixels only.
+#   On in the templates, so every export has the LF band beside the spikes. It
+#   costs disk: at lfp_decimate: 1 it writes an output the size of the recording
+#   -- about 7 GB per hour at 385 channels -- so set it false (or lfp_decimate: 2)
+#   when that matters, and run it where the data lives. Blackrock LFPs are
+#   already saved separately by Central, so this is Neuropixels only.
 #
 #   Decimation is a plain stride with no anti-alias filter. The LF band is
 #   hardware-limited to ~500 Hz at 2500 Hz sampling, so 2 (-> 1250 Hz) is safe
@@ -324,14 +325,18 @@ kilosort: {}
 # Drift correction
 #   nblocks is how many depth blocks Kilosort tracks: 1 is rigid (the whole shank
 #   moves together), 5 gives 5 non-overlapping blocks plus 4 straddling their
-#   boundaries, 0 disables it. The Neuropixels default here is 5: a 4 mm NHP
-#   probe does not move as one piece -- the tip and the top drift by different
-#   amounts -- and rigid correction fits one shift to both. Kilosort then writes
-#   drift_amount.png and drift_scatter.png beside the sorting.
+#   boundaries, 0 disables it. The templates set 0 for Neuropixels because drift
+#   is corrected before Kilosort instead, by preprocess.motion: medicine (it
+#   tracked this lab's probes better than Kilosort's own correction). With
+#   motion set, Kilosort sorts with nblocks: 0 whatever is written here (the log
+#   says so), so the 0 only states it.
 #
-#   Or correct it before Kilosort instead, with preprocess.motion: Kilosort
-#   then sorts with nblocks: 0 whatever is written here (the log says so), and
-#   the value here is used again once motion is null. Each preset writes to
+#   To go back to Kilosort's correction, set motion: null and nblocks: 5 -- not
+#   1: a 4 mm NHP probe does not move as one piece, the tip and the top drift by
+#   different amounts, and rigid correction fits one shift to both. Kilosort then
+#   writes drift_amount.png and drift_scatter.png beside the sorting.
+#
+#   Each motion preset writes to
 #   preprocessed/motion_<preset>/ -- its binary, what it measured, and
 #   motion_drift_scatter.png (peaks across time and depth, before and after
 #   correction) and motion_drift_amount.png (the estimated motion) go beside the
@@ -383,7 +388,8 @@ kilosort: {}
 #     phase_shift   Neuropixels digitises its channels in groups, a fraction of
 #                   a sample apart; this re-aligns them (CatGT tshift, which is
 #                   on unless -no_tshift). Needs the .meta.
-#     motion        null keeps drift correction inside Kilosort (nblocks). A
+#     motion        medicine in the templates (Neuropixels). null keeps drift
+#                   correction inside Kilosort (then set nblocks: 5). A
 #                   SpikeInterface correct_motion preset corrects it here
 #                   instead and writes a motion-corrected binary; Kilosort's
 #                   nblocks is then 0 automatically, so drift is never

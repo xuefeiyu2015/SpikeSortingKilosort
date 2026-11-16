@@ -1408,7 +1408,22 @@ def test_drift_correction_is_off_for_the_utah_array():
     session = cfg.load_session_config(CONFIG_DIR / "session_template_utah_probe.yaml", "windows_rig", CONFIG_DIR)
 
     assert session.kilosort_for("blackrock")["nblocks"] == 0
-    assert session.kilosort_for("neuropixels")["nblocks"] == 5
+    assert session.preprocess_for("blackrock").motion is None     # nor before Kilosort
+    # Neuropixels drift is corrected, by MEDiCINe before Kilosort rather than by it.
+    assert session.preprocess_for("neuropixels").motion == "medicine"
+    assert session.kilosort_for("neuropixels")["nblocks"] == 0
+
+
+def test_every_template_corrects_neuropixels_drift_with_medicine_and_exports_the_lfp():
+    for path in sorted(CONFIG_DIR.glob("session_template_*.yaml")):
+        session = cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
+        assert session.export_lfp, path.name
+        for _, probe in session.per_probe():
+            if probe.has_data("neuropixels"):
+                assert probe.preprocess_for("neuropixels").motion == "medicine", path.name
+                assert probe._stated_kilosort("neuropixels")["nblocks"] == 0, path.name
+            if probe.has_data("blackrock"):
+                assert probe.preprocess_for("blackrock").motion is None, path.name
 
 
 def _load_session(tmp_path: Path, body: str):
