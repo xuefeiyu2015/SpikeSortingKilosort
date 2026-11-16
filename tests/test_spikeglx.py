@@ -187,6 +187,30 @@ def test_the_probe_stops_at_its_time_budget(tmp_path):
     assert probe.bytes_per_s > 0
 
 
+def test_the_probe_reads_grow_to_what_a_share_streams_at():
+    # 256 KB reads timed SMB round trips: 69 MB/s on a share that streams 550.
+    # The reads double from 1 MB to 8 MB, and cover exactly the sample.
+    sizes = reachable.read_sizes(64 << 20)
+
+    assert sizes[0] == 1 << 20
+    assert max(sizes) == 8 << 20
+    body = sizes[:-1]                         # the last read is what is left
+    assert all(b >= a for a, b in zip(body, body[1:]))
+    assert sum(sizes) == 64 << 20
+    assert reachable.read_sizes(3, first=2, largest=4) == [2, 1]
+    assert reachable.read_sizes(0) == []
+    with pytest.raises(ValueError):
+        reachable.read_sizes(10, first=8, largest=4)
+
+
+def test_the_default_probe_samples_enough_to_reach_the_largest_read(tmp_path):
+    path = tmp_path / "big.bin"
+    path.write_bytes(bytes(80 << 20))
+    probe = spikeglx.probe_read(path, time_budget_s=60.0)
+
+    assert probe.sample_bytes == 64 << 20
+
+
 def test_an_unreachable_file_fails_at_the_probe_not_hours_later(tmp_path):
     # An unmounted share is the case this exists for: stat first, so the failure
     # is immediate and named rather than a stall inside the read loop.
