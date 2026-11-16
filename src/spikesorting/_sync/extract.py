@@ -39,7 +39,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import numpy as np
 
@@ -55,6 +55,9 @@ __all__ = [
     "extract_neuropixels_edges",
     "extract_blackrock_edges",
     "extract_session_edges",
+    "catgt_sync_trains",
+    "run_catgt_extraction_into",
+    "blackrock_sync_trains",
 ]
 
 NPX_1HZ = "npx_1hz"
@@ -529,25 +532,9 @@ def extract_blackrock_edges(
         _write_nsp_map(directory, time_map, spec.sync_file)
     report.note(f"Blackrock edge times are on the NSP clock: {time_map.summary()}")
 
-    jobs = [
-        (BR_1HZ, spec.sync_1hz_input, spec.sync_threshold, config.sync_period_s * 1000.0 / 2.0),
-        (BR_BURST, spec.burst_input, spec.burst_threshold, 0.0),
-    ]
-    for name, analog_input, threshold, duration_ms in jobs:
-        stream = blackrock.stream_for_analog_input(
-            reader, analog_input, spec.nsp_frontend_channels
-        )
-        if stream.n_segments > 1:
-            report.note(
-                f"{spec.sync_file.name} has {stream.n_segments} segments (paused recording); "
-                "only segment 0 is extracted."
-            )
-        times = edges.stream_pulse_times(
-            blackrock.iter_channel(reader, stream, chunk_samples),
-            threshold=threshold,
-            fs=stream.fs,
-            duration_ms=duration_ms,
-        )
+    for name, analog_input, threshold, stream, times in _blackrock_pulses(
+        config, reader, chunk_samples, report
+    ):
         # stream_pulse_times counts from the first sample at the nominal rate;
         # the map supplies the origin and the measured one.
         times = time_map.apply(np.rint(times * stream.fs).astype(np.int64))
@@ -570,6 +557,129 @@ def extract_blackrock_edges(
             catgt.write_edge_file(directory / f"{name}.txt", times)
 
     return report
+
+
+def _blackrock_pulses(
+    config: SessionConfig, reader: Any, chunk_samples: int, report: ExtractionReport
+) -> Iterator[tuple[str, int, float, Any, np.ndarray]]:
+    """``(name, ainp, threshold, stream, seconds from the first sample)`` per train.
+
+    The one detection loop for Blackrock's sync inputs, shared by
+    :func:`extract_blackrock_edges` and :func:`blackrock_sync_trains`, so the
+    exam counts exactly what extraction would find.
+    """
+    from .._io import blackrock
+
+    spec = config.blackrock
+    jobs = [
+        (BR_1HZ, spec.sync_1hz_input, spec.sync_threshold, config.sync_period_s * 1000.0 / 2.0),
+        (BR_BURST, spec.burst_input, spec.burst_threshold, 0.0),
+    ]
+    for name, analog_input, threshold, duration_ms in jobs:
+        stream = blackrock.stream_for_analog_input(
+            reader, analog_input, spec.nsp_frontend_channels
+        )
+        if stream.n_segments > 1:
+            report.note(
+                f"{spec.sync_file.name} has {stream.n_segments} segments (paused recording); "
+                "only segment 0 is extracted."
+            )
+        times = edges.stream_pulse_times(
+            blackrock.iter_channel(reader, stream, chunk_samples),
+            threshold=threshold,
+            fs=stream.fs,
+            duration_ms=duration_ms,
+        )
+        yield name, analog_input, threshold, stream, times
+
+
+def _neuropixels_where(config: SessionConfig, layout: spikeglx.RunLayout) -> dict[str, str]:
+    """The stream each Neuropixels train is read from, for a report."""
+    npx = config.neuropixels
+    obx = layout.obx.name if layout.obx is not None else "no OneBox file in the run"
+    return {
+        NPX_1HZ: f"{Path(npx.bin_file).name} SY bit {npx.sync_bit}",
+        NPX_OBX_1HZ: f"{obx} SY bit {npx.sync_bit}",
+        NPX_BURST: f"{obx} XA{npx.burst_word}",
+    }
+
+
+def catgt_sync_trains(
+    config: SessionConfig, edge_dir: str | Path
+) -> dict[str, tuple[str, np.ndarray | None, str]]:
+    """The Neuropixels trains CatGT wrote under ``edge_dir``, for :mod:`.edge_check`.
+
+    ``name -> (kind, edge times or None, stream)``. A train CatGT was asked for
+    but wrote no file for has no edges (an empty array); the OneBox trains of a
+    run with no OneBox file were never asked for (None). Reads only small text
+    files: used on the preprocessing pass's ``edge_dir`` and on the exam's.
+    """
+    from .edge_check import BURST, ONE_HZ
+
+    layout = _run_layout(config)
+    if layout is None:
+        return {}
+    specs = catgt_extractors(config, layout)
+    found = _match_edge_files(catgt.find_edge_files(edge_dir), specs, ExtractionReport())
+    asked = {spec.label for spec in specs}
+    where = _neuropixels_where(config, layout)
+    return {
+        name: (BURST if name == NPX_BURST else ONE_HZ,
+               found.get(name, np.empty(0)) if name in asked else None, where[name])
+        for name in (NPX_1HZ, NPX_OBX_1HZ, NPX_BURST)
+    }
+
+
+def run_catgt_extraction_into(config: SessionConfig, dest: Path) -> str:
+    """Run CatGT's edge extraction alone into a fresh ``dest``. Returns the command.
+
+    For the sync exam: the same extractors and arguments ``extract_sync`` uses,
+    but written where nothing else reads them, so the edge files the pipeline
+    aligns from stay as they are. Raises when CatGT cannot run here.
+    """
+    layout = _run_layout(config)
+    if layout is None:
+        raise ValueError(
+            "neuropixels.bin_file is not named like SpikeGLX output "
+            "(<run>_g<n>_t<n>.imec<n>.ap.bin), so CatGT has no run to read")
+    if not config.machine.has_catgt:
+        raise RuntimeError(
+            f"machine '{config.machine.name}' defines no catgt_dir; the sync exam "
+            "runs CatGT. Run it where CatGT is installed, or run "
+            "run_exporting_pipeline.py, whose extract_sync falls back to NumPy")
+    args = catgt.build_extract_args(
+        run_dir=layout.directory, run_name=layout.run_name,
+        specs=catgt_extractors(config, layout), gate=layout.gate,
+        trigger=layout.trigger, probes=(layout.probe,), dest=dest, folders=layout.folders,
+    )
+    catgt.fresh_dest(dest)
+    catgt.run_catgt(config.machine.catgt_dir, args)
+    return "CatGT " + " ".join(args)
+
+
+def blackrock_sync_trains(
+    config: SessionConfig, chunk_samples: int = 30_000_000
+) -> tuple[dict[str, tuple[str, np.ndarray, str]], float, list[str]]:
+    """Blackrock's 1 Hz and burst as extraction would find them; nothing written.
+
+    ``(trains, duration_s, notes)``. Reads the two sync inputs of the ``.ns5``
+    once, with the same detector and thresholds as :func:`extract_blackrock_edges`.
+    """
+    from .._io import blackrock
+    from .edge_check import BURST, ONE_HZ
+
+    spec = config.blackrock
+    report = ExtractionReport()
+    reader = blackrock.open_reader(spec.sync_file, gap_tolerance_ms=spec.gap_tolerance_ms)
+    trains: dict[str, tuple[str, np.ndarray, str]] = {}
+    duration = 0.0
+    for name, analog_input, threshold, stream, times in _blackrock_pulses(
+        config, reader, chunk_samples, report
+    ):
+        duration = max(duration, stream.n_samples / stream.fs)
+        where = f"{spec.sync_file.name} ainp{analog_input} (ID {stream.channel_id}), threshold {threshold}"
+        trains[name] = (BURST if name == BR_BURST else ONE_HZ, times, where)
+    return trains, duration, report.notes
 
 
 def _write_nsp_map(sync_dir: Path, time_map, source: Path) -> Path:
