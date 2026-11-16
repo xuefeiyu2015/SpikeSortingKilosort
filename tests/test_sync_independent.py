@@ -595,3 +595,115 @@ def test_without_a_burst_the_second_probe_uses_the_one_onebox_export(tmp_path, m
     second = probes[1].paths.export_for("neuropixels")
     assert not list(second.glob("*.analog.mat"))          # no duplicate export
     assert probes[0].paths.aligned != probes[1].paths.aligned   # each its own map
+
+
+# ---------------------------------------------------------------------------
+# sync_overview.png: what synchronization did, drawn
+# ---------------------------------------------------------------------------
+
+
+def test_the_sync_figure_window_sits_in_the_middle_of_the_overlap():
+    from spikesorting._sync import overlay
+
+    assert overlay.centre_window(0.0, 1000.0, 120.0) == (440.0, 560.0)
+    assert overlay.centre_window(10.0, 50.0, 120.0) == (10.0, 50.0)     # shorter: all of it
+    with pytest.raises(ValueError):
+        overlay.centre_window(5.0, 5.0, 1.0)
+
+
+def test_the_1hz_train_is_rebuilt_from_its_rising_edges():
+    from spikesorting._sync import overlay
+
+    t = np.array([0.0, 0.1, 0.99, 1.0, 1.2, 1.5, 1.6, 2.0])
+    y = overlay.square_wave(np.array([1.0, 2.0]), t, high_s=0.5)
+    assert y.tolist() == [0, 0, 0, 1, 1, 0, 0, 1]          # nothing before the first edge
+    assert not overlay.square_wave(np.empty(0), t, 0.5).any()
+
+
+def test_the_zoom_edge_the_scaling_and_the_thinning():
+    from spikesorting._sync import overlay
+
+    assert overlay.nearest_event(np.array([1.0, 5.0, 9.0]), 2.0, 10.0, 6.0) == 5.0
+    assert overlay.nearest_event(np.array([1.0]), 2.0, 10.0, 6.0) is None
+    t = np.arange(0.0, 10.0, 0.01)
+    y = ((t > 2.0) & (t < 7.0)).astype(float)              # up at 2 s, down at 7 s
+    assert overlay.nearest_crossing(t, y, 0.5, 6.0) == pytest.approx(7.0, abs=0.011)
+    assert overlay.nearest_crossing(t, y, 0.5, 6.0, margin_s=3.5) is None
+    assert overlay.nearest_crossing(t, np.zeros_like(t), 0.5, 6.0) is None
+    y = np.linspace(-3.0, 7.0, 1001)
+    scaled = overlay.normalise(y)
+    assert np.percentile(scaled, 1) == pytest.approx(0.0) and np.percentile(scaled, 99) == pytest.approx(1.0)
+    assert not overlay.normalise(np.ones(10)).any()                      # flat: zeros, no NaN
+    x, yy = overlay.thin(np.arange(100_000), np.arange(100_000), max_points=1000)
+    assert x.size <= 1000 and x[0] == 0 and np.array_equal(x, yy)
+
+
+def _sync_figure_session(tmp_path, monkeypatch):
+    import spikesorting as ss
+
+    _, _, session = _remap_with_a_planted_cycle_error(tmp_path, monkeypatch, with_session=True)
+    ss.validate_remapping(session, figures=False)          # the report the figure is titled with
+    return session
+
+
+def _lag_ms(sides, max_lag_s=0.9):
+    """How far the OneBox trace sits after Blackrock's: their cross-correlation peak."""
+    (xb, yb), (xo, yo) = sides["blackrock"], sides["onebox"]
+    grid = np.arange(max(xb[0], xo[0]), min(xb[-1], xo[-1]), 1e-4)
+    b, o = np.interp(grid, xb, yb), np.interp(grid, xo, yo)
+    lag, _ = compare.xcorr_lag(b - b.mean(), o - o.mean(), 1e4, max_lag_s)
+    return lag * 1e3
+
+
+def test_the_sync_figure_shows_the_clocks_apart_before_and_together_after(tmp_path, monkeypatch):
+    from spikesorting import pipeline
+
+    session = _sync_figure_session(tmp_path, monkeypatch)
+    data = pipeline._sync_figure_data(session)
+
+    assert [c["name"] for c in data["channels"]] == ["1 Hz", "eye_x", "photodiode"]
+    assert data["window_s"][1] - data["window_s"][0] == pytest.approx(20.0)
+    assert data["verdict"].startswith("CONSISTENT")
+    one_hz, photodiode = data["channels"][0], data["channels"][2]
+    # Before: each on its own clock -- the OneBox started 0.5 s after Blackrock.
+    assert abs(_lag_ms(one_hz["before"])) > 100
+    # After: the planted 1 Hz edges coincide under the map...
+    assert _lag_ms(one_hz["after"]) == pytest.approx(0.0, abs=0.2)
+    # ...and Blackrock's filtered photodiode copy is FILTER_DELAY late, nothing more
+    # (the overview is thinned to a few ms per point, so within that).
+    assert _lag_ms(photodiode["after"], 0.05) == pytest.approx(-FILTER_DELAY * 1e3, abs=3.0)
+    # Every 1 Hz edge: all paired, residual ~0 (they were planted on the true map).
+    edges = data["edges"]
+    assert edges["n_paired"] > 250 and edges["max_dev_ms"] < 0.01
+    # The zoom is a few ms either side of an edge, the edge at 0.
+    xb, yb = one_hz["zoom"]["blackrock"]
+    assert xb.min() >= -20.0 and xb.max() <= 20.0 and yb[xb < 0].max() == 0 and yb[xb > 0.5].min() == 1
+    # Each channel zooms on its own edge: the photodiode's flash, not the 1 Hz's.
+    xo, yo = photodiode["zoom"]["onebox"]
+    assert xo.size and np.ptp(yo) > 0.5 and abs(xo[np.argmax(np.abs(np.diff(yo)))]) < 1.0
+
+
+def test_validation_draws_the_sync_figure_and_withdrawing_it_removes_it(tmp_path, monkeypatch):
+    import spikesorting as ss
+    from spikesorting import pipeline
+
+    session = _sync_figure_session(tmp_path, monkeypatch)
+    figure = session.paths.figures_for("neuropixels") / pipeline.SYNC_FIGURE
+    assert not figure.exists()                       # figures=False drew nothing
+    ss.validate_remapping(session, figures=True)
+    assert figure.exists() and figure.stat().st_size > 10_000
+    pipeline._withdraw_acceptance(session)           # what extract_sync does first
+    assert not figure.exists()
+
+
+def test_a_figure_that_cannot_be_drawn_does_not_fail_validation(tmp_path, monkeypatch):
+    import spikesorting as ss
+    from spikesorting import pipeline
+
+    session = _sync_figure_session(tmp_path, monkeypatch)
+    def broken(_):
+        raise RuntimeError("no display")
+    monkeypatch.setattr(pipeline, "_sync_figure_data", broken)
+    result = ss.validate_remapping(session, figures=True)
+    assert result.verdict.startswith("CONSISTENT")
+    assert not (session.paths.figures_for("neuropixels") / pipeline.SYNC_FIGURE).exists()

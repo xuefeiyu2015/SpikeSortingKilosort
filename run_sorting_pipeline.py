@@ -34,6 +34,14 @@ one file per run, so runs on different machines or data paths sit side by side.
 
 Stops at the first stage that fails and exits non-zero. Stages that are
 skipped are reported and do not fail the run.
+
+``--sync-exam`` does none of the above: it only extracts the sync pulses --
+CatGT on the SpikeGLX run (probe 1 Hz, OneBox 1 Hz, 14 s burst), the NumPy
+detector on Blackrock's ``.ns5`` -- counts each train against the recording's
+length, and exits non-zero if any is missing or short. It writes only to
+``<neuropixels_dir>/kilosort4/sync_exam/``, so it is safe at any point:
+
+    python run_sorting_pipeline.py --config <session> --sync-exam
 """
 
 from __future__ import annotations
@@ -76,6 +84,13 @@ def main() -> int:
         help="sort one system this run, whatever kilosort_on_* says in the session",
     )
     parser.add_argument(
+        "--sync-exam",
+        action="store_true",
+        help="only extract the sync pulses (CatGT for SpikeGLX, NumPy for the .ns5) "
+        "and report whether the 1 Hz and the 14 s burst are there; preprocesses "
+        "and sorts nothing, and changes nothing the pipeline reads",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="report the map, the preprocessing, the binary and the settings for "
@@ -87,11 +102,11 @@ def main() -> int:
     # Everything printed from here on is also kept, and saved as
     # <system>_dir/kilosort4/logs/sorting_<start>_<machine>.log. A dry run
     # changes nothing, so it leaves no log either.
-    run_log = None if args.dry_run else RunLog("sorting")
+    run_log = None if args.dry_run else RunLog("sync_exam" if args.sync_exam else "sorting")
     config = None
     try:
         config = load(args)
-        return _sort(args, config)
+        return _exam(config) if args.sync_exam else _sort(args, config)
     finally:
         _save_log(run_log, config)
 
@@ -103,6 +118,27 @@ def _save_log(run_log, config) -> None:
     if config is not None:
         for path in run_log.save(log_directories(config), config.machine.name):
             print(f"log: {path}")
+
+
+def _exam(config) -> int:
+    """Each probe's pulses, then Blackrock's once; non-zero if any train is short."""
+    run = Runner(config)
+    print()
+    exams = []
+    for tag, probe_config in config.per_probe():
+        label = "neuropixels" if tag is None else f"neuropixels {tag}"
+        exams.append(run(ss.exam_sync, probe_config, "neuropixels",
+                         system="neuropixels", label=label, config=probe_config))
+    exams.append(run(ss.exam_sync, config, "blackrock", system="blackrock"))
+
+    code = run.finish("sync exam")
+    short = [e for e in exams if e is not None and not e.ok]
+    if short:
+        print("\nsync exam: pulses missing or short on "
+              + ", ".join(sorted({e.system for e in short}))
+              + " -- see the WARNING lines above; synchronization cannot use them")
+        return max(code, 1)
+    return code
 
 
 def _sort(args, config) -> int:

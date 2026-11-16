@@ -106,11 +106,23 @@ Two cheaper checks in the same spirit, neither of which needs a GPU:
 ```bash
 python tools/check_env.py --config <session>               # env + inputs present
 python run_sorting_pipeline.py --config <session> --dry-run
+python run_sorting_pipeline.py --config <session> --sync-exam   # are the sync pulses there?
 ```
 
 `--dry-run` resolves the channel map, names the binary and prints the exact
 settings Kilosort would get — without sorting. It is the way to check a session
 file before booking rig time.
+
+`--sync-exam` extracts only the sync pulses — CatGT on the SpikeGLX run (the
+probe's 1 Hz, the OneBox's 1 Hz, the 14 s burst on XA0), the NumPy detector on
+Blackrock's `.ns5` (its 1 Hz and burst inputs) — counts each against the
+recording's length, and prints `OK` / `MISSING` / `TOO FEW` per train. It
+exits non-zero if any is missing or short, so it can gate a job. It writes only
+to `<neuropixels_dir>/kilosort4/sync_exam/` and changes nothing the pipeline
+reads, so it is safe right after a recording, before sorting. Needs CatGT on the
+machine. A sort whose CatGT pass already found a pulse missing says so too: a
+`WARNING sync pulses:` line under its `[ok]`, and `sync_edges` in `run_info.json`
+(copied into the export's `sorting_summary_info.json` as `sync_edges_at_sorting`).
 
 To watch the same thing happen one verb at a time, open
 `notebooks/step1_run_sorting_stepbystep.ipynb`, then
@@ -218,6 +230,7 @@ rig: it defaults to the platform (win32 → `windows_rig`).
 | `--config` | the session: a name looked up in `configs/` (`session_x`), or a path |
 | `--machine` | profile in `configs/machines/`; defaults to the platform, so omit it on the rig |
 | `--dry-run` | report the map, binary and settings; sort nothing |
+| `--sync-exam` | extract only the sync pulses and report whether the 1 Hz and 14 s burst are there, per system; sort nothing, change nothing |
 Don't use dry-run if you want to start real sorting.
 
 
@@ -325,7 +338,7 @@ python run_exporting_pipeline.py --config session_Porthos_1probe
 | `extract_sync` | the 1 Hz train and the 14 s coded burst from each stream. CatGT where the machine has it, always the NumPy detector, and the two compared |
 | `lfp` | the LF band, when `export_lfp: true` (on in the templates): ~7 GB per hour at 385 channels |
 | `time_remapping` | coarse offset from the bursts, fine fit on the 1 Hz train, onto Blackrock time |
-| `validate_remapping` | the same map checked against the **held-out** burst onsets; exits non-zero past `alignment_tolerance_s` (1 ms), so it can gate a batch job |
+| `validate_remapping` | the same map checked against the **held-out** burst onsets; exits non-zero past `alignment_tolerance_s` (1 ms), so it can gate a batch job. Draws `export/figures/sync_overview.png`: the channels both systems recorded (1 Hz, eye, pupil, photodiode), 20 s on each system's own clock and then on Blackrock time, ±20 ms around an edge, and every 1 Hz edge's residual across the session |
 | `export_results` | aligned spike times, metrics, figures |
 | `waveforms` | a mean waveform per unit, in µV and centred on the spike, cut through Kilosort's own preprocessing from the binary it sorted (needs the `kilosort4` env) |
 
@@ -340,7 +353,8 @@ python run_exporting_pipeline.py --config session_Porthos_1probe
 <blackrock_dir>/kilosort4/              only when the Utah array is sorted
                                         (nothing is written beside a sync-only .ns5)
                        export/
-                           figures/                     units.pdf (a row per unit), overview.png
+                           figures/                     units.pdf (a row per unit), overview.png,
+                                                        sync_overview.png (Neuropixels: what synchronization did)
                            sorting_summary_info.json    what ran, on what, from where
                            <recording>.sorted_spikes.mat  times, channel, unit, mean waveform
                            <recording>.waveforms.mat      per-spike snippets (when kept)
@@ -620,6 +634,7 @@ and the indented line under it is the reason. Common ones:
 | unresolved `{placeholder}` | a `{name}` no longer defined. Only `{blackrock_dir}` and `{neuropixels_dir}` exist |
 | neo raises on a timestamp jump | set `blackrock.gap_tolerance_ms`; most real PTP files need it. Above the tolerance the recording splits into segments, and `allow_segments` decides whether that is acceptable |
 | both systems share a directory | point `neuropixels_dir` at the `…_imec<n>` folder holding the `.ap.bin` |
+| `MatLockedError: cannot write …\x.lfp.mat: another program has it open` | a notebook kernel (or HDFView) still holds that export open. Restart or shut down the kernel, then run again. The step-3/4 notebooks read each file and close it, so they no longer hold it |
 
 A few traps that do *not* announce themselves:
 

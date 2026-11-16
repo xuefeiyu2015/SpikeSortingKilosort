@@ -127,9 +127,16 @@ def skip_reason(config: SessionConfig, verb: Any, system: str | None = None) -> 
         "export_results",
         "export_waveforms",
         "record_timing",
+        "exam_sync",
     }:
         if not config.has_data(system):
             return f"no {system} paths declared in the session"
+
+    if name == "exam_sync" and system == "blackrock":
+        if config.blackrock.sync_file is None:
+            return "no blackrock.sync_file in the session: no Blackrock pulses to examine"
+        if not config.has_data("neuropixels"):
+            return "no Neuropixels in this session: Blackrock's pulses align nothing"
 
     if name in {"preprocess", "sort_with_kilosort"} and system is not None:
         if not getattr(config, f"kilosort_on_{system}"):
@@ -374,7 +381,119 @@ def preprocess(config: SessionConfig, system: str) -> Binary | None:
     if not getattr(config, f"sorts_{system}"):
         return None
     _check_input_reachable(config, system)
-    return _binary_for(config, system)
+    binary = _binary_for(config, system)
+    if system == "neuropixels":
+        checked = _preprocessing_sync_check(config)
+        for problem in (checked or {}).get("problems", []):
+            log.warning("sync pulses: %s -- synchronization will not be able to use it; "
+                        "run_sorting_pipeline.py --sync-exam checks it on its own", problem)
+    return binary
+
+
+@dataclass
+class SyncExam:
+    """What :func:`exam_sync` found: each sync train, counted against the recording."""
+
+    system: str
+    checks: list[dict[str, Any]]
+    notes: list[str]
+    report_path: Path | None = None
+
+    @property
+    def ok(self) -> bool:
+        """Every train there in full. Not ``passed``: one system's missing pulse
+        must not stop the runner before the other system is examined."""
+        return all(c["status"] == "ok" for c in self.checks)
+
+    def summary(self) -> str:
+        lines = []
+        for c in self.checks:
+            found = "-" if c["found"] is None else f"{c['found']:,}"
+            lines.append(f"{c['status'].upper():13} {c['kind']:10} {c['name']:16} "
+                         f"{found:>7} of ~{c['expected']:,} {c['unit']}  <- {c['stream']}")
+        lines.extend(self.notes)
+        if self.report_path is not None:
+            lines.append(f"report: {self.report_path}")
+        return "\n       ".join(lines)
+
+
+#: Where the sync exam writes: its own folder, read by nothing else.
+SYNC_EXAM_DIR = "sync_exam"
+
+
+def exam_sync(config: SessionConfig, system: str) -> SyncExam | None:
+    """Extract one system's sync pulses on their own and say whether they are there.
+
+    A check to run before (or instead of) a whole pipeline, e.g. right after a
+    recording: ``run_sorting_pipeline.py --sync-exam``. Neuropixels runs CatGT's
+    edge extraction alone -- the probe's 1 Hz, the OneBox's 1 Hz and the 14 s
+    burst, with the session's extractors -- and Blackrock reads the ``.ns5``'s
+    two sync inputs with the detector ``extract_sync`` uses (CatGT cannot read a
+    ``.ns5``). Each train is counted against the recording's length.
+
+    **Changes nothing the pipeline uses.** It writes to
+    ``<neuropixels_dir>/kilosort4/sync_exam/`` only: the edge files the map is
+    fitted from, the map and any accepted verdict stay as they are. Returns
+    ``None`` when the session declares no such system.
+    """
+    from ._sync import edge_check
+
+    _check(system)
+    if skip_reason(config, exam_sync, system):
+        return None
+    if system == "neuropixels":
+        config.paths.require_dir("neuropixels")
+        _check_input_reachable(config, "neuropixels")
+        folder = config.paths.sorted_for("neuropixels") / SYNC_EXAM_DIR
+        command = extract.run_catgt_extraction_into(config, folder / "catgt")
+        trains = extract.catgt_sync_trains(config, folder / "catgt")
+        stream = _neuropixels_stream(config)
+        duration, notes, folders = stream.n_samples / stream.fs, [command], [folder]
+    else:
+        source = config.blackrock.sync_file
+        log.info("%s: %s", source, reachable.check_reachable(source).summary())
+        trains, duration, notes = extract.blackrock_sync_trains(config)
+        folders = [c.paths.sorted_for("neuropixels") / SYNC_EXAM_DIR
+                   for _, c in config.per_probe()]
+    checks = edge_check.check_sync_edges(trains, duration, config.sync_period_s,
+                                         config.burst_interval_s)
+    for problem in edge_check.sync_problems(checks):
+        log.warning("sync pulses: %s", problem)
+    payload = {"system": system, "duration_s": duration, "checks": checks, "notes": notes,
+               "ok": all(c["status"] == "ok" for c in checks)}
+    path = None
+    for folder in folders:
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"sync_exam_{system}.json"
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+    return SyncExam(system, checks, notes, path)
+
+
+def _preprocessing_sync_check(config: SessionConfig) -> dict[str, Any] | None:
+    """Were the 1 Hz and the 14 s burst in the edges the CatGT pass extracted?
+
+    None unless this probe's binary came from CatGT (only CatGT extracts edges
+    while it preprocesses). Reads the record and the small edge files it points
+    at; the result goes into ``run_info.json["sync_edges"]`` and the sort's
+    summary, so a missing pulse is known at sorting time, not at synchronization.
+    """
+    from ._sync import edge_check
+
+    record = provenance.read(config.paths.preprocessed_for("neuropixels")) or {}
+    if record.get("engine") != "catgt" or not record.get("edge_dir"):
+        return None
+    try:
+        duration = float(record["n_samples"]) / float(record["fs"])
+        trains = extract.catgt_sync_trains(config, record["edge_dir"])
+    except (KeyError, TypeError, ValueError, OSError) as error:
+        log.info("sync pulses not checked: %s", error)
+        return None
+    checks = edge_check.check_sync_edges(trains, duration, config.sync_period_s,
+                                         config.burst_interval_s)
+    return {"source": "CatGT preprocessing pass", "edge_dir": record["edge_dir"],
+            "duration_s": duration, "checks": checks,
+            "problems": edge_check.sync_problems(checks)}
 
 
 def _job_kwargs(config: SessionConfig) -> dict[str, Any]:
@@ -1231,12 +1350,17 @@ class SortSummary:
     fs: float
     binary: Path
     settings: dict[str, Any]
+    #: Sync trains the CatGT preprocessing pass found missing or short.
+    sync_problems: tuple[str, ...] = ()
 
     def summary(self) -> str:
-        return (
+        text = (
             f"{self.n_units} units, {self.n_spikes} spikes at {self.fs:g} Hz "
             f"-> {self.results_dir}"
         )
+        for problem in self.sync_problems:
+            text += f"\n       WARNING sync pulses: {problem}"
+        return text
 
 
 #: Arguments this verb decides for itself. A session naming one under ``kilosort:``
@@ -1397,6 +1521,7 @@ def sort_with_kilosort(
         raise
     t_published = time.perf_counter()
 
+    sync_edges = _preprocessing_sync_check(config) if system == "neuropixels" else None
     result = SortSummary(
         results_dir=final_dir,
         n_units=int(np.unique(clusters).size),
@@ -1404,6 +1529,7 @@ def sort_with_kilosort(
         fs=binary.fs,
         binary=binary.path,
         settings=settings,
+        sync_problems=tuple((sync_edges or {}).get("problems", ())),
     )
 
     # Blackrock only: record what turns these sample indices into NSP-clock
@@ -1432,7 +1558,7 @@ def sort_with_kilosort(
             **({"NSP clock map": t_done - t_published} if system == "blackrock" else {}),
         },
     )
-    _write_run_info(config, system, result, kwargs, timing)
+    _write_run_info(config, system, result, kwargs, timing, sync_edges)
     return result
 
 
@@ -1988,6 +2114,9 @@ def _write_summary(
         "time_units": "seconds",
         "curated": curated,
         "n_units_exported": int(np.asarray(unit_ids).size),
+        # Whether the sync pulses were there when the sort's CatGT pass ran.
+        **({"sync_edges_at_sorting": run_info["sync_edges"]}
+           if (run_info or {}).get("sync_edges") else {}),
         # What units.csv's firing rates and presence ratios are taken over.
         "recording_window": (
             {"start_s": window[0], "duration_s": window[1], "from": "samples sorted"}
@@ -2089,6 +2218,7 @@ def _write_run_info(
     result: SortSummary,
     kwargs: dict[str, Any],
     timing: dict[str, Any] | None = None,
+    sync_edges: dict[str, Any] | None = None,
 ) -> None:
     """Record what produced this sorting, beside the sorting itself."""
     payload = {
@@ -2110,6 +2240,10 @@ def _write_run_info(
         # What was done to the signal before Kilosort read it, as recorded beside
         # the binary -- engine, settings, the steps and the source it came from.
         "preprocessing": provenance.read(config.paths.preprocessed_for(system)),
+        # Whether the sync pulses were in the edges that pass extracted: kept
+        # apart from "preprocessing", which must stay the record verbatim (the
+        # waveform guard compares the two).
+        "sync_edges": sync_edges,
     }
     with open(result.results_dir / "run_info.json", "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, default=str)
@@ -2955,6 +3089,7 @@ def _withdraw_acceptance(config: SessionConfig) -> None:
     export_dir = config.paths.export_for("neuropixels")
     for name in ("sync_report.json", "sync_report.txt"):
         (export_dir / name).unlink(missing_ok=True)
+    (config.paths.figures_for("neuropixels") / SYNC_FIGURE).unlink(missing_ok=True)
     _remove_copied_sync_records(config)
     _unstamp_exports(config)
     _remove_aligned_spike_exports(config)
@@ -3482,6 +3617,8 @@ def validate_remapping(
             settled["tprime_line_gap_s"] = tprime_gap
         _settle_acceptance(config, mapping, result.passed, settled,
                            exports_accepted=line_ok)
+        if figures:
+            _draw_sync_figure(config)
         return result
 
     br_onsets = burst.group_burst_onsets(br_burst, config.burst_interval_s / 2)
@@ -3550,6 +3687,8 @@ def validate_remapping(
         )
         plots.save_figure(axes.figure, path)
         log.info("wrote %s", path)
+    if figures:
+        _draw_sync_figure(config)
 
     return report
 
@@ -3558,6 +3697,7 @@ def _refuse(config: SessionConfig, reason: str) -> "Unvalidated":
     """No map from this run's edges to check: not accepted, and the runner stops."""
     log.warning("%s", reason)
     config.paths.aligned.mkdir(parents=True, exist_ok=True)
+    (config.paths.figures_for("neuropixels") / SYNC_FIGURE).unlink(missing_ok=True)
     _settle_acceptance(config, None, False,
                        {"verdict": "NOT VALIDATED", "n_checked": 0, "reason": reason})
     return Unvalidated(_write_refusal_report(config, reason), reason, "NOT VALIDATED")
@@ -3836,6 +3976,193 @@ def _independent_checks(config: SessionConfig) -> list[dict[str, Any]]:
         entry["status"] = "consistent" if abs(stats["drift_ms"]) <= tolerance_ms else "DRIFT"
         checks.append(entry)
     return checks
+
+
+#: ``validate_remapping``'s picture of what synchronization did, in ``export/figures/``.
+SYNC_FIGURE = "sync_overview.png"
+
+
+def _blackrock_start(config: SessionConfig, br: Any) -> float | None:
+    """NSP seconds at Blackrock's first sample: the ``.ns2``'s, else the sync file's."""
+    if br is not None:
+        return float(br.time_map.segments[0].intercept)
+    from ._io.blackrock import NspTimeMap
+
+    path = config.paths.sync_for("blackrock") / extract.SYNC_NSP_MAP
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return float(NspTimeMap.from_dict(json.load(handle)).segments[0].intercept)
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+
+
+def _sync_figure_data(config: SessionConfig) -> dict[str, Any] | None:
+    """What ``sync_overview.png`` draws, read and computed; None with nothing to draw.
+
+    The OneBox side is the analog export plus the OneBox 1 Hz edges, put on
+    Blackrock time by the fitted ``onebox_to_blackrock`` (accepted or not -- the
+    figure shows what the map does, and its title the verdict on it). The
+    Blackrock side is the ``.ns2`` on its own NSP clock and the Blackrock 1 Hz
+    edges. "Before" is the same OneBox samples on the OneBox's own clock and
+    Blackrock's samples the same number of seconds into its own recording.
+    Nothing here re-reads a raw ``.obx.bin`` or ``.ns5``.
+    """
+    from ._io import analog
+    from ._sync import compare, overlay
+
+    onebox_map = _fitted_onebox_map(config)
+    if onebox_map is None:
+        log.info("no sync figure: time_map.json has no onebox_to_blackrock map")
+        return None
+    slope, intercept = onebox_map.slope, onebox_map.intercept
+    obx_edges = _load_edges(config, extract.NPX_OBX_1HZ)
+    br_edges = _load_edges(config, extract.BR_1HZ)
+    obx_edges = np.empty(0) if obx_edges is None else obx_edges
+    br_edges = np.empty(0) if br_edges is None else br_edges
+
+    onebox = None
+    try:
+        onebox = analog.load_onebox_analog(
+            analog.find_onebox_analog(_onebox_export_dir(config)), require_blackrock=False)
+        from dataclasses import replace as _replace
+
+        onebox = _replace(onebox, slope=slope, intercept=intercept)
+    except (OSError, ValueError):
+        pass
+    brk = config.blackrock
+    br = None
+    if onebox is not None and brk.analog_file is not None and brk.analog_inputs:
+        try:
+            br = analog.open_blackrock_analog(
+                brk.analog_file, brk.analog_inputs, brk.nsp_frontend_channels,
+                gap_tolerance_ms=brk.gap_tolerance_ms, tolerance_s=config.alignment_tolerance_s)
+        except (OSError, ValueError, KeyError) as error:
+            log.info("sync figure without the .ns2: %s", error)
+    labels = [n for n in brk.analog_inputs if br is not None and n in onebox.names]
+
+    # The window: the middle of what both systems recorded, on Blackrock time.
+    if onebox is not None:
+        start, stop = analog.get_recording_overlap(onebox, br)
+    elif obx_edges.size and br_edges.size:
+        mapped = slope * obx_edges + intercept
+        start, stop = max(mapped[0], br_edges[0]), min(mapped[-1], br_edges[-1])
+    else:
+        log.info("no sync figure: no OneBox analog export and no 1 Hz edges")
+        return None
+    t0, t1 = overlay.centre_window(start, stop, overlay.SYNC_WINDOW_S)
+    br_start = _blackrock_start(config, br)
+    obx_t0 = (t0 - intercept) / slope                      # the window on the OneBox clock
+    width = t1 - t0
+    mapped_edges = slope * obx_edges + intercept
+    centre = overlay.nearest_event(mapped_edges, t0 + overlay.SYNC_ZOOM_S,
+                                   t1 - overlay.SYNC_ZOOM_S, (t0 + t1) / 2)
+
+    def zoom(t: np.ndarray, y: np.ndarray, at: float | None) -> tuple[np.ndarray, np.ndarray]:
+        if at is None:
+            return np.empty(0), np.empty(0)
+        keep = np.abs(t - at) <= overlay.SYNC_ZOOM_S
+        return (t[keep] - at) * 1e3, y[keep]
+
+    high = config.neuropixels.sync_pulse_ms / 1e3
+    grid = np.linspace(0.0, width, int(width * 1000) + 1)          # 1 kHz: a pulse is 500 ms
+    fine = (centre + np.linspace(-overlay.SYNC_ZOOM_S, overlay.SYNC_ZOOM_S, 4001)
+            if centre is not None else np.empty(0))
+    one_hz: dict[str, Any] = {"name": "1 Hz", "before": {}, "after": {}, "zoom": {}}
+    if obx_edges.size:
+        one_hz["before"]["onebox"] = (grid, overlay.square_wave(obx_edges, obx_t0 + grid, high))
+        one_hz["after"]["onebox"] = (grid, overlay.square_wave(mapped_edges, t0 + grid, high))
+        one_hz["zoom"]["onebox"] = zoom(fine, overlay.square_wave(mapped_edges, fine, high), centre)
+    if br_edges.size:
+        if br_start is not None:
+            own = br_start + obx_t0                         # as far into Blackrock's recording
+            one_hz["before"]["blackrock"] = (grid, overlay.square_wave(br_edges, own + grid, high))
+        one_hz["after"]["blackrock"] = (grid, overlay.square_wave(br_edges, t0 + grid, high))
+        one_hz["zoom"]["blackrock"] = zoom(fine, overlay.square_wave(br_edges, fine, high), centre)
+    channels = [one_hz]
+
+    for name in labels:
+        k0, k1 = compare.onebox_sample_range(t0, t1, onebox.fs, slope, intercept, onebox.n_samples)
+        obx_y = analog.read_onebox(onebox, name, k0, k1)
+        obx_after_t = onebox.blackrock_time(k0, k1)
+        s0, s1 = compare.blackrock_sample_range(t0, t1, br.segments)
+        br_y = analog.read_blackrock(br, name, s0, s1)
+        br_after_t = br.time_map.apply(np.arange(s0, s1))
+        stream = br.streams[name]
+        b0 = int(round(obx_t0 * stream.fs))                 # as far into Blackrock's recording
+        b1 = min(stream.n_samples, b0 + int(round(width * stream.fs)))
+        br_before = analog.read_blackrock(br, name, b0, b1) if b1 > b0 else np.empty(0)
+        obx_n, br_n = overlay.normalise(obx_y), overlay.normalise(br_y)
+        # Each channel zooms on its own transition nearest the window's middle:
+        # a flash rarely falls within milliseconds of a 1 Hz edge.
+        at = overlay.nearest_crossing(obx_after_t, obx_n, 0.5, (t0 + t1) / 2,
+                                      margin_s=overlay.SYNC_ZOOM_S)
+        channels.append({
+            "name": name,
+            "before": {
+                "onebox": overlay.thin(np.arange(k0, k1) / onebox.fs - obx_t0, obx_n),
+                "blackrock": overlay.thin(np.arange(b0, b1) / stream.fs - obx_t0,
+                                          overlay.normalise(br_before, br_y)),
+            },
+            "after": {
+                "onebox": overlay.thin(obx_after_t - t0, obx_n),
+                "blackrock": overlay.thin(br_after_t - t0, br_n),
+            },
+            "zoom": {"onebox": zoom(obx_after_t, obx_n, at), "blackrock": zoom(br_after_t, br_n, at)},
+        })
+
+    edges = None
+    if obx_edges.size and br_edges.size:
+        try:
+            comp = compare.compare_event_times(br_edges, obx_edges, slope, intercept,
+                                               label="1 Hz", tolerance_s=overlay.EDGE_PAIRING_S)
+            residual_ms = comp.after_s * 1e3
+            median = float(np.median(residual_ms))
+            edges = {
+                "t_min": (comp.blackrock_s - comp.blackrock_s[0]) / 60.0,
+                "residual_ms": residual_ms,
+                "median_ms": median,
+                "max_dev_ms": float(np.max(np.abs(residual_ms - median))),
+                "n_paired": comp.n_pairs, "n_onebox": comp.n_onebox,
+                "n_blackrock": comp.n_blackrock,
+            }
+        except ValueError as error:
+            log.info("sync figure without the 1 Hz residuals: %s", error)
+
+    report = {}
+    try:
+        with open(config.paths.export_for("neuropixels") / "sync_report.json",
+                  "r", encoding="utf-8") as handle:
+            report = json.load(handle)
+    except (OSError, ValueError):
+        pass
+    title = f"{config.session} | {stream_label('neuropixels')}"
+    if config.probe_tag is not None:
+        title += f" {config.probe_tag}"
+    return {
+        "title": title, "verdict": report.get("verdict", "?"), "note": report.get("verdict_note", ""),
+        "window_s": (t0, t1), "zoom_ms": overlay.SYNC_ZOOM_S * 1e3,
+        "channels": channels, "edges": edges,
+    }
+
+
+def _draw_sync_figure(config: SessionConfig) -> Path | None:
+    """``export/figures/sync_overview.png``. A failure warns; it never fails validation."""
+    path = config.paths.figures_for("neuropixels") / SYNC_FIGURE
+    path.unlink(missing_ok=True)                 # never last run's picture under this verdict
+    try:
+        from ._plots import summary as plots
+        from ._plots.sync import plot_sync_overview
+
+        data = _sync_figure_data(config)
+        if data is None:
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        plots.save_figure(plot_sync_overview(data), path)
+    except Exception as error:  # noqa: BLE001 -- a figure must not stop the run
+        log.warning("sync figure not drawn: %s: %s", type(error).__name__, error)
+        return None
+    log.info("wrote %s", path)
+    return path
 
 
 # ----------------------------------------------------------------------------
