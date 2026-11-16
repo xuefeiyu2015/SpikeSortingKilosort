@@ -650,9 +650,14 @@ def _run_preprocessing(
         target = folder / f"{config.blackrock.spike_file.stem}.bin"
     else:
         info = _neuropixels_stream(config)
+        has_meta = _has_spikeglx_meta(config)
+        locations = None
+        if spec.motion and not has_meta:
+            n_ap = info.n_chan - (info.sy_index is not None)
+            locations = locations_by_row(setup_probe(config, system), n_ap)
         recording, motion_info = si.build_chain(
             si.read_neuropixels(
-                info.path, info.n_chan, info.fs, info.sy_index, _has_spikeglx_meta(config)
+                info.path, info.n_chan, info.fs, info.sy_index, has_meta, locations
             ),
             spec,
             jobs,
@@ -776,6 +781,33 @@ def _draw_drift(config: SessionConfig, system: str, folder: Path, drift: dict) -
         ),
         folder / DRIFT_FIGURES[1],
     )
+
+
+def locations_by_row(probe: dict, n_rows: int) -> np.ndarray:
+    """Each binary row's contact position, ``(n_rows, 2)`` in um, from a Kilosort probe.
+
+    For motion correction on a binary with no ``.meta``: the probe dict lists
+    contacts in its own order and ``chanMap`` says which row each reads. Every
+    row needs a position -- a row with none could not be localised -- so a map
+    that leaves one out (or names a row twice, or one past the end) raises
+    rather than inventing it.
+    """
+    rows = np.asarray(probe["chanMap"], dtype=np.int64)
+    xy = np.column_stack([np.asarray(probe["xc"], float), np.asarray(probe["yc"], float)])
+    if rows.size != np.unique(rows).size:
+        raise ValueError("the probe's chanMap names a binary row twice")
+    if rows.size and (rows.min() < 0 or rows.max() >= n_rows):
+        raise ValueError(f"the probe's chanMap names rows outside the binary's {n_rows}")
+    missing = np.setdiff1d(np.arange(n_rows), rows)
+    if missing.size:
+        raise ValueError(
+            f"motion correction needs a position for every channel, and the probe "
+            f"file has none for {missing.size} of the binary's {n_rows} rows "
+            f"(first: {missing[:5].tolist()}); name a probe_file covering them all"
+        )
+    out = np.empty((n_rows, 2))
+    out[rows] = xy
+    return out
 
 
 def _has_spikeglx_meta(config: SessionConfig) -> bool:

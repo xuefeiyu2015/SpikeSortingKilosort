@@ -87,9 +87,10 @@ def motion_chain(
 
     if not recording.has_probe():
         raise ValueError(
-            "motion correction needs the probe's contact positions, which "
-            "SpikeInterface reads from a SpikeGLX .meta -- this recording has none. "
-            "Set preprocess.motion: null and let Kilosort's nblocks correct drift."
+            "motion correction needs the probe's contact positions, read from the "
+            "SpikeGLX .meta or, with none, from the session's probe_file -- this "
+            "recording has neither. Name a probe_file, or set preprocess.motion: "
+            "null and let Kilosort's nblocks correct drift."
         )
     if preset == "medicine":
         check_medicine()
@@ -192,7 +193,8 @@ def peak_drift(recording: Any, motion_info: dict, n_max: int) -> dict | None:
 
 
 def read_neuropixels(
-    bin_file: Path, n_chan: int, fs: float, sy_index: int | None, has_meta: bool
+    bin_file: Path, n_chan: int, fs: float, sy_index: int | None, has_meta: bool,
+    locations: Any = None,
 ) -> Any:
     """The AP band as a SpikeInterface recording, without the SY word.
 
@@ -210,17 +212,26 @@ def read_neuropixels(
     channel's ADC sample offset, which ``phase_shift`` and motion correction
     need -- is attached from this binary's own ``.meta``, the way SpikeInterface
     itself does it. A bare binary with no ``.meta`` (the Kilosort demo) gets
-    neither.
+    neither, except contact ``locations`` -- ``(n AP rows, 2)`` in um, by binary
+    row -- when the caller has them from the session's ``probe_file``, since
+    motion correction cannot localise a peak without them.
     """
     from spikeinterface.core import read_binary
 
     recording = read_binary(bin_file, sampling_frequency=fs, dtype="int16", num_channels=n_chan)
     if sy_index is not None:
         recording = recording.remove_channels([recording.channel_ids[sy_index]])
-    if not has_meta:
-        return recording
-
+    import numpy as np
     import probeinterface
+
+    if not has_meta:
+        if locations is not None:
+            probe = probeinterface.Probe(ndim=2, si_units="um")
+            probe.set_contacts(positions=np.asarray(locations, dtype=float),
+                               shapes="square", shape_params={"width": 12})
+            probe.set_device_channel_indices(np.arange(recording.get_num_channels()))
+            recording = recording.set_probe(probe)
+        return recording
 
     probe = probeinterface.read_spikeglx(Path(bin_file).with_suffix(".meta"))
     if probe.shank_ids is not None:

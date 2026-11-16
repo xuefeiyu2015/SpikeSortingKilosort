@@ -460,6 +460,40 @@ def test_a_bare_binary_is_read_without_its_sy_word_and_written_flat(tmp_path):
     assert np.array_equal(written, data[:, :4])
 
 
+def test_a_bare_binary_takes_its_contact_positions_from_the_probe_file(tmp_path):
+    # No .meta, so motion correction has no positions unless the probe file
+    # supplies them -- by binary row, whatever order the probe lists contacts in.
+    from spikesorting import pipeline
+    from spikesorting._preprocess import si
+
+    pytest.importorskip("spikeinterface.core")
+    probe = {"chanMap": [2, 0, 3, 1], "xc": [20.0, 0.0, 30.0, 10.0],
+             "yc": [40.0, 0.0, 60.0, 20.0]}
+    locations = pipeline.locations_by_row(probe, 4)
+    assert locations.tolist() == [[0, 0], [10, 20], [20, 40], [30, 60]]
+
+    source = tmp_path / "demo.ap.bin"
+    source.write_bytes(np.zeros((3000, 5), dtype=np.int16).tobytes())
+    recording = si.read_neuropixels(source, 5, 30000.0, sy_index=4, has_meta=False,
+                                    locations=locations)
+    assert recording.has_probe()                 # what motion_chain checks for
+    assert np.array_equal(recording.get_channel_locations(), locations)
+    assert not si.read_neuropixels(source, 5, 30000.0, sy_index=4,
+                                   has_meta=False).has_probe()
+
+
+@pytest.mark.parametrize("probe, match", [
+    ({"chanMap": [0, 1, 2], "xc": [0, 0, 0], "yc": [0, 20, 40]}, "none for 1"),
+    ({"chanMap": [0, 1, 1, 3], "xc": [0] * 4, "yc": [0] * 4}, "twice"),
+    ({"chanMap": [0, 1, 2, 4], "xc": [0] * 4, "yc": [0] * 4}, "outside"),
+])
+def test_positions_are_never_invented_for_a_row_the_probe_does_not_place(probe, match):
+    from spikesorting import pipeline
+
+    with pytest.raises(ValueError, match=match):
+        pipeline.locations_by_row(probe, 4)
+
+
 @pytest.mark.parametrize("has_sy_word, kept", [(True, 31), (False, 32)])
 def test_the_session_says_whether_a_bare_binary_ends_in_a_sy_word(tmp_path, has_sy_word, kept):
     # 32 rows, no .meta. Which are neural is the session's statement; unstated,
