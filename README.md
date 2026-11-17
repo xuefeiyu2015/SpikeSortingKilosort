@@ -24,7 +24,8 @@ Six notebooks sit alongside the steps below, in `notebooks/`:
   — if you want to understand what each step of the pipeline actually does,
   follow these, one per runner script. Every cell calls a single verb, in the
   same order the script calls them, and shows what it returns; step 2 also takes
-  synchronization apart one step at a time and recomputes a unit's quality
+  synchronization apart one step at a time (with or without the 14 s burst: when it
+  is missing, section 4b′ shows the photodiode or eye vote that picked the whole second) and recomputes a unit's quality
   metrics by hand. They are for reading and learning; for a real session use the
   scripts.
 - **`setup_demo_data.ipynb`** — downloads the official Kilosort4 demo recording
