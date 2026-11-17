@@ -36,7 +36,6 @@ __all__ = [
     "read_sy_word",
     "raw_to_volts",
     "uv_per_digit",
-    "imro_banks",
     "ap_acquisition_channels",
     "RunLayout",
     "run_layout",
@@ -404,28 +403,6 @@ def uv_per_digit(meta: dict[str, str]) -> tuple[np.ndarray, str]:
         if 0 <= acq < gains.size and gains[acq] > 0:
             out[row] = 1e6 * volts_per_count / gains[acq]
     return out, f"gain {source}"
-
-
-def imro_banks(meta: dict[str, str]) -> np.ndarray | None:
-    """The bank each acquisition channel records from, or None when unknown.
-
-    Read from ``~imroTbl`` on NP 1.0-format probes (``_NP1_IMRO_TYPES``, which
-    includes the NHP probes), whose entries are ``(chan bank refid apgain lfgain
-    ...)``: index ``c`` is channel ``c``'s bank. Other imro formats put the bank
-    elsewhere or per electrode, so they get None rather than a guess -- a figure
-    marks no banks rather than wrong ones.
-    """
-    if int(meta.get("imDatPrb_type", "0")) not in _NP1_IMRO_TYPES:
-        return None
-    imro = meta.get("~imroTbl", meta.get("imroTbl", ""))
-    entries = [e.strip("( ") for e in imro.split(")") if e.strip("( ")][1:]
-    fields = [e.split() for e in entries]
-    if not fields or any(len(f) < 2 for f in fields):
-        return None
-    banks = np.full(max(int(f[0]) for f in fields) + 1, -1, dtype=np.int64)
-    for f in fields:
-        banks[int(f[0])] = int(f[1])
-    return banks
 
 
 def ap_acquisition_channels(meta: dict[str, str], rows: Any) -> list[int]:

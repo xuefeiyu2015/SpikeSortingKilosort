@@ -384,42 +384,31 @@ def plot_sorting_overview(
 _KIND_STYLE = (("other", "0.6", "other"), ("MU", "#64b5f6", "multi-unit"),
                ("SU", "#d32f2f", "single unit"))
 
-#: One colour per bank, so a bank keeps its colour from session to session.
-_BANK_COLOURS = ("#2e7d32", "#66bb6a", "#c62828", "#d81b60", "#1e88e5",
-                 "#8e24aa", "#f9a825", "#00897b", "#6d4c41", "#546e7a",
-                 "#3949ab", "#c0ca33")
-
-
 def plot_probe_waveforms(
     glyphs: list[dict],
     site_xy: np.ndarray,
-    bank_spans: list[tuple[int, float, float]],
     n_total: int,
     amplitude_note: str = "",
     scale_bar_um: float = 125.0,
     colour_by: str = "kind",
     fig: Any = None,
 ) -> Any:
-    """Every unit's mean waveform at its place on the probe, against depth and banks.
+    """Every unit's mean waveform at its place on the probe, against depth.
 
     ``glyphs`` are :func:`.._export.probe_layout.compute_waveform_glyphs`'s, in
     um, each with a ``kind`` (``SU``, ``MU`` or anything else). ``colour_by``
     ``"kind"`` colours single units red and multi-units light blue (with a
     legend); ``"unit"`` gives each unit its own colour, so neighbours can be
-    told apart. ``site_xy`` the recorded sites (drawn faintly, for scale);
-    ``bank_spans`` ``(bank, y_low, y_high)`` in um, or empty to draw no bank
-    bar. Depth is distance from the probe tip, in mm. ``n_total`` is the units
+    told apart. ``site_xy`` the recorded sites (drawn faintly, for scale).
+    Depth is distance from the probe tip, in mm. ``n_total`` is the units
     exported, shown in the title.
     """
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle
 
     sites = np.asarray(site_xy, dtype=np.float64)
     if fig is None:
-        fig = plt.figure(figsize=(4.4, 11), dpi=110)
-    grid = fig.add_gridspec(1, 2, width_ratios=[0.22, 1], wspace=0.02)
-    ax_bank = fig.add_subplot(grid[0, 0])
-    ax = fig.add_subplot(grid[0, 1], sharey=ax_bank)
+        fig = plt.figure(figsize=(3.8, 11), dpi=110)
+    ax = fig.add_subplot(1, 1, 1)
 
     y_lo, y_hi = sites[:, 1].min() - 60, sites[:, 1].max() + 60
     x_lo, x_hi = sites[:, 0].min() - 40, sites[:, 0].max() + 40
@@ -442,7 +431,11 @@ def plot_probe_waveforms(
                   frameon=False, handlelength=1.2, borderaxespad=0.2)
     ax.set_xlim(x_lo, x_hi)
     ax.set_ylim(y_lo, y_hi)
-    ax.axis("off")
+    ax.set_xticks([])
+    for side in ("top", "right", "bottom"):
+        ax.spines[side].set_visible(False)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v / 1000:g}"))
+    ax.set_ylabel("distance from probe tip (mm)")
     # The horizontal scale: a bar under the probe.
     bar_y = y_lo + 15
     ax.plot([x_lo + 5, x_lo + 5 + scale_bar_um], [bar_y, bar_y], color="k", lw=1.2,
@@ -454,19 +447,6 @@ def plot_probe_waveforms(
         ax.text(0.0, -0.035, amplitude_note, transform=ax.transAxes, ha="left",
                 va="top", fontsize=7, color="0.35")
 
-    for bank, low, high in bank_spans:
-        colour = _BANK_COLOURS[bank % len(_BANK_COLOURS)]
-        ax_bank.add_patch(Rectangle((0.55, low), 0.3, high - low, color=colour, lw=0))
-        ax_bank.plot([0.4, 0.9], [low, low], color="k", lw=0.6)
-        if high - low > 0.06 * (y_hi - y_lo):
-            ax_bank.text(0.35, (low + high) / 2, f"Bank {bank}", rotation=90,
-                         ha="right", va="center", fontsize=8)
-    ax_bank.set_xlim(0, 1)
-    ax_bank.set_xticks([])
-    for side in ("top", "right", "bottom"):
-        ax_bank.spines[side].set_visible(False)
-    ax_bank.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v / 1000:g}"))
-    ax_bank.set_ylabel("distance from probe tip (mm)")
     return fig
 
 

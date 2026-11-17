@@ -1,8 +1,7 @@
 """What the overview's waveform page draws, computed: pure NumPy, no files.
 
 Every exported unit's measured mean waveform, drawn as a small glyph where the
-unit sits on the probe, against the probe's depth from its tip and the banks its
-recorded sites belong to. The reading is in ``pipeline._write_overview``, the
+unit sits on the probe, against the probe's depth from its tip. The reading is in ``pipeline._write_overview``, the
 drawing in ``_plots.summary.plot_probe_waveforms``.
 """
 
@@ -14,7 +13,6 @@ __all__ = [
     "GLYPH_WIDTH_UM",
     "GLYPH_HEIGHT_UM",
     "compute_unit_positions",
-    "compute_bank_spans",
     "compute_glyph_scale",
     "compute_waveform_glyphs",
 ]
@@ -43,32 +41,6 @@ def compute_unit_positions(
         if mine.size:
             out[int(unit)] = (float(np.median(mine[:, 0])), float(np.median(mine[:, 1])))
     return out
-
-
-def compute_bank_spans(site_y: np.ndarray, site_bank: np.ndarray) -> list[tuple[int, float, float]]:
-    """``(bank, y_low, y_high)`` for each run of recorded sites in one bank, in um.
-
-    Sites are sorted by depth and grouped while the bank stays the same; each
-    span reaches half a site pitch past its outermost sites, so neighbouring
-    spans meet. Sites with an unknown bank (negative) are skipped.
-    """
-    y = np.asarray(site_y, dtype=np.float64)
-    bank = np.asarray(site_bank, dtype=np.int64)
-    keep = bank >= 0
-    y, bank = y[keep], bank[keep]
-    if y.size == 0:
-        return []
-    order = np.argsort(y, kind="stable")
-    y, bank = y[order], bank[order]
-    rows = np.unique(y)
-    half = float(np.min(np.diff(rows))) / 2 if rows.size > 1 else 10.0
-    spans: list[tuple[int, float, float]] = []
-    start = 0
-    for i in range(1, y.size + 1):
-        if i == y.size or bank[i] != bank[start]:
-            spans.append((int(bank[start]), float(y[start] - half), float(y[i - 1] + half)))
-            start = i
-    return spans
 
 
 def compute_glyph_scale(waveforms: np.ndarray, height_um: float = GLYPH_HEIGHT_UM) -> float:

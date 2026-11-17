@@ -4876,7 +4876,7 @@ def export_results(
         )
 
         log.info("wrote units.pdf (%d units) -> %s", len(units), figure_dir)
-        _write_overview(phy, unit_ids, figure_dir, measured, config, system)
+        _write_overview(phy, unit_ids, figure_dir, measured)
         if len(units) < unit_ids.size:
             log.warning(
                 "only the first %d of %d units were plotted (max_unit_figures)",
@@ -4984,7 +4984,6 @@ def timing_table(config: SessionConfig, system: str) -> str | None:
 
 def _write_overview(
     phy, unit_ids: np.ndarray, figure_dir: Path, measured: dict | None = None,
-    config: SessionConfig | None = None, system: str = "neuropixels",
 ) -> Path | None:
     """``overview.pdf``: the sorting on the probe, at a glance.
 
@@ -5016,7 +5015,7 @@ def _write_overview(
             xy[exported], clusters[exported], background_xy=xy[~exported], n_total=n_total
         ))
 
-    pages.extend(_probe_waveform_pages(phy, unit_ids, xy, clusters, measured, config, system))
+    pages.extend(_probe_waveform_pages(phy, unit_ids, xy, clusters, measured))
     pdf = Path(figure_dir) / "overview.pdf"
     if not pages:
         pdf.unlink(missing_ok=True)
@@ -5028,7 +5027,7 @@ def _write_overview(
 
 def _probe_waveform_pages(
     phy, unit_ids: np.ndarray, xy: np.ndarray | None, clusters: np.ndarray,
-    measured: dict | None, config: SessionConfig | None, system: str,
+    measured: dict | None,
 ) -> list[Any]:
     """Each exported unit's measured mean waveform where it sits on the probe.
 
@@ -5036,9 +5035,8 @@ def _probe_waveform_pages(
     unit with none is counted in the title's total but not drawn. A unit sits at the
     median of its sampled spikes' positions, or at its peak channel's site when
     none was sampled. Two pages of the same glyphs: one colour per unit, then
-    single units (``good``) red and multi-units (``mua``) light blue. Banks come
-    from the ``.meta`` beside a Neuropixels binary (:func:`spikeglx.imro_banks`);
-    without one there is no bank bar. Empty when nothing can be drawn.
+    single units (``good``) red and multi-units (``mua``) light blue. Empty
+    when nothing can be drawn.
     """
     from ._export import final, probe_layout
     from ._plots import summary as plots
@@ -5072,26 +5070,10 @@ def _probe_waveform_pages(
     for glyph in glyphs:
         glyph["kind"] = _UNIT_CLASS.get(phy.labels.get(glyph["unit_id"], ""), "")
 
-    bank_spans: list = []
-    if system == "neuropixels" and config is not None and config.neuropixels.bin_file:
-        from ._io import spikeglx
-
-        meta_path = spikeglx.meta_path_for(config.neuropixels.bin_file)
-        try:
-            meta = spikeglx.read_meta(meta_path)
-            banks = spikeglx.imro_banks(meta)
-            if banks is not None:
-                acquired = np.asarray(spikeglx.ap_acquisition_channels(meta, channel_map))
-                site_bank = np.where(acquired < banks.size,
-                                     banks[np.minimum(acquired, banks.size - 1)], -1)
-                bank_spans = probe_layout.compute_bank_spans(site_xy[:, 1], site_bank)
-        except (OSError, ValueError, KeyError) as error:
-            log.info("no bank bar on the waveform page: %s", error)
-
     units = measured.get("mean_units", "ADC")
     median_ptp = probe_layout.GLYPH_HEIGHT_UM / scale
     note = (f"waveform height: {median_ptp:.0f} {units} trough-to-peak "
             f"= {probe_layout.GLYPH_HEIGHT_UM:g} um")
     n_total = int(np.size(unit_ids))
-    return [plots.plot_probe_waveforms(glyphs, site_xy, bank_spans, n_total, note, colour_by=by)
+    return [plots.plot_probe_waveforms(glyphs, site_xy, n_total, note, colour_by=by)
             for by in ("unit", "kind")]
