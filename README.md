@@ -14,9 +14,9 @@ run_sorting_pipeline.py             →           phy template-gui  →  run_exp
 |---|---|
 | a user with a session to sort, and you already know your sorting parameters | **[Step 1](#step-1--sort)**, then **[2](#step-2--curate-in-phy)** and **[3](#step-3--time-alignment-and-export)** |
 | not sure about bad channels / whitening / drift, and want to see the recording first | **[Step 0](#step-0--optional-look-at-the-recording-first)** |
-| installing this on a new computer | **[Installation Step](#Installation step--install-on-a-new-computer)** |
-| missing a channel map (`probe_file`) | **[Extra 1](#Extra-1--probe-files-channel-maps)** |
-| staring at a `[--]` skipped or `[!!]` failed line | **[Extra 2](#Extra-2--when-a-stage-skips-or-fails)** |
+| installing this on a new computer | **[Installation](#installation--install-on-a-new-computer)** |
+| missing a channel map (`probe_file`) | **[Extra 1](#extra-1--probe-files-channel-maps)** |
+| staring at a `[--]` skipped or `[!!]` failed line | **[Extra 2](#extra-2--when-a-stage-skips-or-fails)** |
 
 Six notebooks sit alongside the steps below, in `notebooks/`:
 
@@ -29,7 +29,7 @@ Six notebooks sit alongside the steps below, in `notebooks/`:
   scripts.
 - **`setup_demo_data.ipynb`** — downloads the official Kilosort4 demo recording
   and its channel map, so you can run the whole pipeline start to finish without
-  any rig data. Used in [Step 4f](#4f-prove-it-works).
+  any rig data. Used in [Installation 6](#6-prove-it-works).
 - **`step3_compare_sync_analog.ipynb`** — overlays the OneBox and Blackrock copies of
   the sync and behaviour signals, before and after synchronization, and measures
   how far apart they are.
@@ -41,7 +41,7 @@ Six notebooks sit alongside the steps below, in `notebooks/`:
 - **`build_probe_config.ipynb`** — builds or inspects a channel map by hand.
   **Not needed in most cases**: a Neuropixels map comes from the run's own
   `.meta`, and a Utah array's comes from its `.cmp`. See
-  [Step 5](#step-5--probe-files-channel-maps).
+  [Extra 1](#extra-1--probe-files-channel-maps).
 
 ---
 
@@ -86,22 +86,39 @@ GUI guide: <https://kilosort.readthedocs.io/en/latest/gui_guide.html>
 You *can* sort from the Kilosort GUI too. Don't — the scripts below batch, log,
 and record what they did in a session file you can read back six months later.
 
-**Write what you learned into the session YAML.** These are the
-keys it answers:
+**Write what you learned into the session YAML.** Each system's block has two parts,
+in this order in the templates: **`preprocess:`** -- what is done to the signal before
+Kilosort -- and **`kilosort:`** -- what Kilosort itself does.
 
-| key (under `kilosort:`) | what it decides |
+**`preprocess:`** (`neuropixels:` → `preprocess:`, `blackrock:` → `preprocess:`):
+
+| key | what it decides |
+|---|---|
+| `method` | `catgt` (Neuropixels: band-pass, reference, `gfix`, tshift and the sync edges in one CatGT pass) or `spikeinterface`. CatGT that cannot run stops; it never switches by itself |
+| `highpass_hz` / `lowpass_hz` | the band-pass, in Hz (300 / 10000) |
+| `car_mode` | the common reference: `gblcar` (median across channels), `gbldmx` (demuxed mean, CatGT only) or `null`. This *is* the CAR -- Kilosort's own `do_CAR` is always off, and writing `do_CAR` under `kilosort:` is refused with a pointer here |
+| `gfix` | CatGT's artifact removal: `null` off, or `[0.40, 0.10, 0.02]` (amplitude mV, slope mV/sample, recovery mV) for chewing, licking or cable artifacts |
+| `phase_shift` | the ADC multiplexing correction (CatGT tshift) |
+| `motion` | drift correction *before* Kilosort: `medicine` (the templates), `dredge`, `dredge_fast`, …, or `null` to leave it to Kilosort's `nblocks` |
+
+**`kilosort:`** (`neuropixels:` → `kilosort:`, per probe under `by_probe:` in the
+two-probe template; `blackrock:` → `kilosort:`) -- not the top-level `kilosort:`,
+which the templates leave `{}`:
+
+| key | what it decides |
 |---|---|
 | `bad_channels` | recording channel numbers to drop (rows of the binary, not array positions) |
-| `do_CAR` | subtract the median across channels each batch (default true) |
 | `highpass_cutoff` | Kilosort's own highpass, in Hz (default 300) |
 | `nblocks` | Kilosort's drift correction: `0` off (the templates: MEDiCINe corrects drift instead), `1` rigid, `5` five depth blocks (use this with `motion: null`). Ignored -- Kilosort sorts with `0` -- whenever `preprocess.motion` is set |
 | `artifact_threshold` | zero out batches above this amplitude |
-| `tmin` / `tmax` | sort only this window of the binary, in seconds |(haven't implemented yet)
+| `tmin` / `tmax` | sort only this window of the binary, in seconds |
 
 
 ---
-## Step 1 — preparation
-Two cheaper checks in the same spirit, neither of which needs a GPU:
+## Checks before sorting
+
+Once the session file exists (Step 1a below), three checks in the same spirit,
+none of which needs a GPU:
 
 ```bash
 python tools/check_env.py --config <session>               # env + inputs present
@@ -138,24 +155,32 @@ I have listed 4 templates for the session cases, you can **COPY, PASTE, RENAME**
 
 | template | Utah array | Neuropixels | aligns systems |
 |---|---|---|---|
-| `session_template_utah_probe.yaml` | spikes | spikes | yes |
 | `session_template_1probe.yaml` | — (sync only) | spikes | yes |
 | `session_template_2probes.yaml` | — (sync only) | spikes, **2 probes** | yes |
 | `session_template_utah_only.yaml` | spikes | — (not recorded) | **no** |
+| `session_template_utah_probe.yaml` | spikes | spikes | yes |
 
-for example, if I record only with 1 neuropixel, I will copy the `session_template_1probe.yaml` and rename it into `session_Porthos_1probe.yaml` . Then update the dir and file name to your folder that stored the .bin file from your recoridng. And the blackrock synchronize pulse dir and file names: *.ns5
+for example, if I record only with 1 neuropixel, I will copy the `session_template_1probe.yaml` and rename it into `session_Porthos_1probe.yaml` . Then update the dir and file name to your folder that stored the .bin file from your recording. And the blackrock synchronize pulse dir and file names: *.ns5
 
-Next, run: 
+Next, from the repo folder, copy the template -- the command depends on the shell:
 
-```bash
+```powershell
+# PowerShell (the rig's terminal: the prompt starts with PS). cp is its alias for Copy-Item
 cp configs/session_template_1probe.yaml configs/session_Porthos_1probe.yaml
 ```
+
+```bat
+:: Command Prompt (cmd.exe) has no cp: use copy, with backslashes
+copy configs\session_template_1probe.yaml configs\session_Porthos_1probe.yaml
+```
+
+On macOS/Linux the `cp` line works as written. Or copy the file in Explorer/Finder.
 
 Here is one example for setting up the yaml file:
 
 ```yaml
 blackrock_dir:   "Z:/Monkey Porthos/2026-08-13"     #dir pointing to the blackrock files, *ns6 or *ns5
-neuropixels_dir: "Z:/Monkey Porthis/2026-08-13/Porthos_2026_08_13_g0/Porthos_2026_08_13_g0_imec0". #dir pointing to the neuropixel files
+neuropixels_dir: "Z:/Monkey Porthos/2026-08-13/Porthos_2026_08_13_g0/Porthos_2026_08_13_g0_imec0"  #dir pointing to the neuropixel files
 ```
 
 Three rules worth knowing before you edit:
@@ -213,7 +238,7 @@ folders kept beside the one in use — delete one to free its space. The
 replaces the previous sorting. `medicine` needs one extra package (see
 Installation, step 1).
 
-### 1b. In your terminal dir to the SpikeSoritngKilosort dir, Run it
+### 1b. In your terminal, cd to the SpikeSortingKilosort folder and run it
 
 ```bash
 conda activate kilosort4
@@ -491,6 +516,45 @@ the recording through Kilosort's own preprocessing — so run both drivers from 
 
 `--no-build-isolation` keeps pip from building in a throwaway env that would
 re-resolve numpy and torch behind your back.
+
+### 3b. CatGT and TPrime (the Windows rig)
+
+Two command-line tools from the SpikeGLX project, run by the pipeline where the
+machine has them:
+
+- **CatGT** preprocesses Neuropixels for `preprocess.method: catgt` (band-pass,
+  `gblcar`, `gfix`, tshift) and extracts the sync edges in the same pass; it is also
+  what `run_sorting_pipeline.py --sync-exam` runs.
+- **TPrime** maps the spike times onto Blackrock time, interval by interval
+  (`time_remapping`).
+
+Neither is required everywhere. Without CatGT, preprocess with
+`method: spikeinterface` (CatGT that cannot run stops and says so; it never switches
+by itself) and the sync edges come from the NumPy detector. Without TPrime, the spike
+times go through the least-squares line instead.
+
+**Install** (Windows): download CatGT and TPrime from the SpikeGLX site,
+<https://billkarsh.github.io/SpikeGLX/> (its command-line tools), and unzip both
+under `C:\SpikeGLX\CommandLineTools\`, giving
+
+```
+C:\SpikeGLX\CommandLineTools\CatGTWinApp\CatGT-win\CatGT.exe
+C:\SpikeGLX\CommandLineTools\TPrimeWinApp\TPrime-win\TPrime.exe
+```
+
+**Point the machine profile at the folders holding the executables** -- not at the
+`.exe` itself. `configs/machines/windows_rig.yaml` already has exactly these:
+
+```yaml
+catgt_dir: "C:/SpikeGLX/CommandLineTools/CatGTWinApp/CatGT-win"     # holds CatGT.exe
+tprime_dir: "C:/SpikeGLX/CommandLineTools/TPrimeWinApp/TPrime-win"  # holds TPrime.exe
+```
+
+(`catgt_dir` may also hold CatGT's `runit.bat`/`runit.sh`, as on Linux.) Then
+`python tools/check_env.py` (step 5) reports both as found, or names what is lost
+without each. Their manuals:
+[CatGT](https://billkarsh.github.io/SpikeGLX/More_help/CatGT_ReadMe.html),
+[TPrime](https://billkarsh.github.io/SpikeGLX/help/syncEdges/Sync_edges/).
 
 ### 4. Add a machine profile
 
