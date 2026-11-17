@@ -29,7 +29,7 @@ CatGT, so on the cluster either preprocess on the rig first and copy
 not switch by itself.
 
 Prints how long each stage and each Kilosort phase took, and saves everything
-it printed to ``<system>_dir/kilosort4/logs/sorting_<start>_<machine>.log``,
+it printed to ``<system>_dir/<export_folder_name>/logs/sorting_<start>_<machine>.log``,
 one file per run, so runs on different machines or data paths sit side by side.
 
 Stops at the first stage that fails and exits non-zero. Stages that are
@@ -39,7 +39,7 @@ skipped are reported and do not fail the run.
 CatGT on the SpikeGLX run (probe 1 Hz, OneBox 1 Hz, 14 s burst), the NumPy
 detector on Blackrock's ``.ns5`` -- counts each train against the recording's
 length, and exits non-zero if any is missing or short. It writes only to
-``<neuropixels_dir>/kilosort4/sync_exam/``, so it is safe at any point:
+``<neuropixels_dir>/<export_folder_name>/sync_exam/``, so it is safe at any point:
 
     python run_sorting_pipeline.py --config <session> --sync-exam
 """
@@ -100,7 +100,7 @@ def main() -> int:
     log_pipeline_messages()
 
     # Everything printed from here on is also kept, and saved as
-    # <system>_dir/kilosort4/logs/sorting_<start>_<machine>.log. A dry run
+    # <system>_dir/<export_folder_name>/logs/sorting_<start>_<machine>.log. A dry run
     # changes nothing, so it leaves no log either.
     run_log = None if args.dry_run else RunLog("sync_exam" if args.sync_exam else "sorting")
     config = None

@@ -245,10 +245,11 @@ on the rig. It writes `<system>_dir/kilosort4/`, then stops and prints the exact
 
 Curation is manual. Run the command Step 1 printed:
 
-On the terminal, cd to the kilorsort4 folder:
+On the terminal, cd to the output folder -- `kilosort4` unless the session's
+`export_folder_name` names another (e.g. `kilosort4_medicine`):
 ```bash
 conda activate phy
-cd  <neuropixels_dir>/kilosort4/
+cd  <neuropixels_dir>/<export_folder_name>/
 phy template-gui params.py
 ```
 
@@ -256,10 +257,10 @@ or directly
 
 ```bash
 conda activate phy
-phy template-gui <neuropixels_dir>/kilosort4/params.py
+phy template-gui <neuropixels_dir>/<export_folder_name>/params.py
 ```
 
-For example, in the above case, it's 
+For example, in the above case (`export_folder_name: kilosort4`), it's 
 ```bash
 conda activate phy
 phy template-gui "Z:/Monkey Porthos/2026-08-13/Porthos_2026_08_13_g0/Porthos_2026_08_13_g0_imec0/kilosort4/params.py"
@@ -361,6 +362,15 @@ python run_exporting_pipeline.py --config session_Porthos_1probe
                            <lf recording>.lfp.mat         the LF band, on Blackrock time
                            units.csv                      one row per unit: label, rate, ISI, ...
 ```
+
+`kilosort4` is the default name of that folder. Set **`export_folder_name`** in the
+session to name it yourself — e.g. `kilosort4_medicine` — and a second sort of the
+same recording (other drift correction, other settings) lands beside the first
+instead of on top of it, with its own sync files, `export/` and `logs/`. `null`
+keeps `kilosort4`. It is one folder name, not a path, and cannot be
+`preprocessed`, which sits beside it and is shared by every sort; each sort's
+waveform export checks the record beside the binary *it* read, so sorting one
+variant does not invalidate another's waveforms.
 
 Each `.mat` is named after the recording it came from — `<run>_t0.imec0.ap` for a
 Neuropixels AP binary, the `.ns6` stem for Blackrock — so a file copied off the rig
