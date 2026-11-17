@@ -419,11 +419,14 @@ def test_export_results_reads_those_settings_rather_than_arguments(
     )
     assert with_noise["n_units"] == 2
     figures = sorted(p.name for p in session.paths.figures_for("neuropixels").iterdir())
-    assert figures == ["overview.png", "units.pdf"]
+    # overview.pdf: the spike-position page (and the waveform pages, when there are
+    # measured waveforms -- none here). No overview.png: it is the PDF's page 1.
+    assert figures == ["overview.pdf", "units.pdf"]
 
-    # A sorting without PC features cannot place spikes: no overview, the rest stands.
+    # A sorting without Kilosort's spike_positions.npy has no positions: no overview,
+    # the rest stands (they are never re-estimated from the PC features).
     shutil.rmtree(session.paths.figures_for("neuropixels"))
-    (sorted_dir / "pc_features.npy").unlink()
+    (sorted_dir / "spike_positions.npy").unlink()
     ss.export_results(cfg.with_overrides(session, export_figures=True), "neuropixels")
     figures = sorted(p.name for p in session.paths.figures_for("neuropixels").iterdir())
     assert figures == ["units.pdf"]

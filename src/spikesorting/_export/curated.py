@@ -207,31 +207,27 @@ def select_units(results: PhyResults) -> np.ndarray:
     )
 
 
-#: The Kilosort files a spike's position is estimated from.
-_POSITION_FILES = (
-    "pc_features.npy", "pc_feature_ind.npy", "channel_positions.npy", "spike_templates.npy",
-)
+#: Kilosort's own per-spike positions (Kilosort 4 writes it), one row per spike.
+_NATIVE_POSITIONS = "spike_positions.npy"
 
 
 def load_spike_positions(results_dir: str | Path, spike_index: np.ndarray) -> np.ndarray | None:
-    """x/y on the probe of the spikes at ``spike_index``, or None without the files.
+    """x/y on the probe of the spikes at ``spike_index``, from Kilosort's own
+    ``spike_positions.npy``; None when it is missing or not one row per spike.
 
-    ``pc_features.npy`` is spikes x PCs x channels -- most of a gigabyte for a
-    long session -- so it is memory-mapped and only the requested rows are read.
-    Positions follow the *template* each spike was fitted with, not its cluster:
-    a Phy merge changes clusters, and the features belong to the template.
+    Kilosort's localizer weights each spike's nearby channels by the norm of
+    their PC features and ignores channels farther than ``position_limit``, so a
+    spike stays on its own column of sites. Nothing is re-estimated here: a
+    plain PC1-weighted average without that limit pulled spikes at a probe's
+    ends across the gap between its columns. Only the requested rows are read.
     """
-    from .metrics import compute_spike_positions
-
     results_dir = Path(results_dir)
-    if not all((results_dir / name).exists() for name in _POSITION_FILES):
+    native = results_dir / _NATIVE_POSITIONS
+    if not native.exists():
         return None
-    index = np.asarray(spike_index, dtype=np.int64)
-    features = np.load(results_dir / "pc_features.npy", mmap_mode="r")
-    templates = np.load(results_dir / "spike_templates.npy", mmap_mode="r").reshape(-1)
-    return compute_spike_positions(
-        spike_templates=np.asarray(templates[index]),
-        pc_features=np.asarray(features[index]),
-        pc_feature_ind=np.load(results_dir / "pc_feature_ind.npy"),
-        channel_positions=np.load(results_dir / "channel_positions.npy"),
-    )
+    positions = np.load(native, mmap_mode="r")
+    times = results_dir / "spike_times.npy"
+    n_spikes = np.load(times, mmap_mode="r").size if times.exists() else positions.shape[0]
+    if positions.ndim != 2 or positions.shape != (n_spikes, 2):
+        return None
+    return np.asarray(positions[np.asarray(spike_index, dtype=np.int64)], dtype=np.float64)

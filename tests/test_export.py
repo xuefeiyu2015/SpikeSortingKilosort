@@ -320,29 +320,6 @@ def test_exports_keep_the_kilosort_label_beside_the_curated_one(kilosort_results
         assert text("KSLabel") == "good | mua | good"
 
 
-def test_spike_position_is_the_channel_carrying_all_the_weight():
-    from spikesorting._export.metrics import compute_spike_positions
-
-    positions = np.array([[0.0, 0.0], [16.0, 20.0], [0.0, 40.0]])
-    features = np.zeros((2, 3, 2))
-    features[0, 0, 1] = 5.0                     # spike 0: all on its second channel
-    features[1, 0, :] = 3.0                     # spike 1: equal on both
-    xy = compute_spike_positions(
-        np.array([0, 1]), features, np.array([[0, 1], [1, 2]]), positions
-    )
-    assert np.allclose(xy[0], [16.0, 20.0])
-    assert np.allclose(xy[1], [8.0, 30.0])      # the midpoint of channels 1 and 2
-
-
-def test_a_spike_with_no_feature_weight_has_no_position():
-    from spikesorting._export.metrics import compute_spike_positions
-
-    xy = compute_spike_positions(
-        np.array([0]), np.zeros((1, 3, 2)), np.array([[0, 1]]), np.array([[0.0, 0.0], [0.0, 20.0]])
-    )
-    assert np.all(np.isnan(xy))
-
-
 def test_spikes_are_selected_evenly_and_repeatably():
     from spikesorting._export.metrics import select_spikes_evenly
 
@@ -362,9 +339,29 @@ def test_loaded_spike_positions_sit_on_each_units_peak_channel(kilosort_results)
     assert np.allclose(xy[:, 1], expected) and np.allclose(xy[:, 0], 0.0)
 
 
-def test_spike_positions_need_the_pc_features(kilosort_results):
-    (kilosort_results / "pc_features.npy").unlink()
+def test_without_kilosorts_spike_positions_there_are_none(kilosort_results):
+    # Positions are never re-estimated from the PC features.
+    (kilosort_results / "spike_positions.npy").unlink()
     assert curated.load_spike_positions(kilosort_results, np.arange(3)) is None
+
+
+def test_kilosorts_own_positions_are_used_when_it_wrote_them(kilosort_results):
+    # Kilosort 4's localizer ignores channels beyond position_limit; recomputing
+    # without that pulled spikes at a probe's ends across a 103 um column gap.
+    n = np.load(kilosort_results / "spike_times.npy").size
+    native = np.column_stack([np.full(n, 114.0), np.arange(n, dtype=float)])
+    np.save(kilosort_results / "spike_positions.npy", native)
+    index = np.arange(0, n, 7)
+    np.testing.assert_array_equal(curated.load_spike_positions(kilosort_results, index), native[index])
+    # It needs no PC features at all.
+    (kilosort_results / "pc_features.npy").unlink()
+    np.testing.assert_array_equal(curated.load_spike_positions(kilosort_results, index), native[index])
+
+
+def test_positions_that_do_not_match_the_spikes_are_not_used(kilosort_results):
+    n = np.load(kilosort_results / "spike_times.npy").size
+    np.save(kilosort_results / "spike_positions.npy", np.zeros((n - 1, 2)))   # one row short
+    assert curated.load_spike_positions(kilosort_results, np.arange(0, n, 7)) is None
 
 
 def test_the_overview_is_one_probe_axis_with_a_layer_per_unit():

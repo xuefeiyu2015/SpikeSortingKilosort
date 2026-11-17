@@ -22,7 +22,9 @@ __all__ = [
     "plot_alignment_residuals",
     "plot_spike_positions",
     "plot_sorting_overview",
+    "plot_probe_waveforms",
     "save_figure",
+    "save_pdf",
 ]
 
 
@@ -77,11 +79,18 @@ def plot_mean_waveform(
 def plot_firing_rate(
     centers_s: np.ndarray, rate_hz: np.ndarray, ax: Any = None, color: str = "steelblue"
 ) -> Any:
-    """Firing rate across the session."""
+    """Firing rate across the session.
+
+    ``centers_s`` are the bins' centres in seconds since the start of the sorted
+    recording (``_unit_page_data``), so the axis starts at 0 rather than at an
+    absolute NSP or Blackrock time like 1.7922e9. Each point stays at its own
+    bin centre, so the first sits half a bin after 0.
+    """
     ax = _axes(ax)
     ax.plot(np.asarray(centers_s), np.asarray(rate_hz), color=color, linewidth=1)
-    ax.set_xlabel("time (s)")
+    ax.set_xlabel("Time since recording start (s)")
     ax.set_ylabel("rate (Hz)")
+    ax.set_xlim(left=0)
     ax.set_ylim(bottom=0)
     return ax
 
@@ -95,7 +104,9 @@ def plot_amplitudes(
 ) -> Any:
     """Spike amplitude against time -- the clearest view of electrode drift.
 
-    Subsamples above ``max_points`` so a million-spike unit still renders.
+    ``times_s`` are seconds since the start of the sorted recording, as the
+    firing-rate panel's are, so the two share an axis starting at 0. Subsamples
+    above ``max_points`` so a million-spike unit still renders.
     """
     ax = _axes(ax)
     times = np.asarray(times_s)
@@ -104,8 +115,9 @@ def plot_amplitudes(
         step = int(np.ceil(times.size / max_points))
         times, amps = times[::step], amps[::step]
     ax.scatter(times, amps, s=1, color=color, alpha=0.3, linewidths=0)
-    ax.set_xlabel("time (s)")
+    ax.set_xlabel("Time since recording start (s)")
     ax.set_ylabel("amplitude")
+    ax.set_xlim(left=0)
     return ax
 
 
@@ -121,8 +133,8 @@ def plot_unit_summary(unit: dict[str, Any], fig: Any = None) -> Any:
     """Four-panel summary for one unit.
 
     ``unit`` carries precomputed arrays: ``waveform``, optional ``waveform_t_ms``
-    and ``waveform_std``, ``isi_counts`` + ``isi_edges_ms``, ``rate_centers_s`` +
-    ``rate_hz``, optional ``amp_times_s`` + ``amplitudes``, plus ``unit_id``,
+    and ``waveform_std``, ``isi_counts`` + ``isi_edges_ms``, ``rate_centers_s``
+    (seconds since the recording start) + ``rate_hz``, optional ``amp_times_s`` (likewise) + ``amplitudes``, plus ``unit_id``,
     ``label`` and ``channel`` for the title.
     """
     import matplotlib.pyplot as plt
@@ -364,6 +376,113 @@ def plot_sorting_overview(
     ax.set_title(title)
     fig.tight_layout()
     return fig
+
+
+#: Waveform colours on the probe page: single units red, multi-units light blue,
+#: anything else (a custom Phy label, or none) grey. Drawn in this order, so
+#: single units sit on top.
+_KIND_STYLE = (("other", "0.6", "other"), ("MU", "#64b5f6", "multi-unit"),
+               ("SU", "#d32f2f", "single unit"))
+
+#: One colour per bank, so a bank keeps its colour from session to session.
+_BANK_COLOURS = ("#2e7d32", "#66bb6a", "#c62828", "#d81b60", "#1e88e5",
+                 "#8e24aa", "#f9a825", "#00897b", "#6d4c41", "#546e7a",
+                 "#3949ab", "#c0ca33")
+
+
+def plot_probe_waveforms(
+    glyphs: list[dict],
+    site_xy: np.ndarray,
+    bank_spans: list[tuple[int, float, float]],
+    n_total: int,
+    amplitude_note: str = "",
+    scale_bar_um: float = 125.0,
+    colour_by: str = "kind",
+    fig: Any = None,
+) -> Any:
+    """Every unit's mean waveform at its place on the probe, against depth and banks.
+
+    ``glyphs`` are :func:`.._export.probe_layout.compute_waveform_glyphs`'s, in
+    um, each with a ``kind`` (``SU``, ``MU`` or anything else). ``colour_by``
+    ``"kind"`` colours single units red and multi-units light blue (with a
+    legend); ``"unit"`` gives each unit its own colour, so neighbours can be
+    told apart. ``site_xy`` the recorded sites (drawn faintly, for scale);
+    ``bank_spans`` ``(bank, y_low, y_high)`` in um, or empty to draw no bank
+    bar. Depth is distance from the probe tip, in mm. ``n_total`` is the units
+    exported, ``len(glyphs)`` the ones drawn.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    sites = np.asarray(site_xy, dtype=np.float64)
+    if fig is None:
+        fig = plt.figure(figsize=(4.4, 11), dpi=110)
+    grid = fig.add_gridspec(1, 2, width_ratios=[0.22, 1], wspace=0.02)
+    ax_bank = fig.add_subplot(grid[0, 0])
+    ax = fig.add_subplot(grid[0, 1], sharey=ax_bank)
+
+    y_lo, y_hi = sites[:, 1].min() - 60, sites[:, 1].max() + 60
+    x_lo, x_hi = sites[:, 0].min() - 40, sites[:, 0].max() + 40
+    ax.scatter(sites[:, 0], sites[:, 1], s=2, color="0.85", linewidths=0, zorder=0)
+    if colour_by not in ("kind", "unit"):
+        raise ValueError(f"colour_by must be 'kind' or 'unit', not {colour_by!r}")
+    if colour_by == "unit":
+        palette = plt.cm.tab20(np.arange(20) / 20)
+        for k, glyph in enumerate(glyphs):
+            ax.plot(glyph["x"], glyph["y"], color=palette[k % 20], lw=0.8, alpha=0.9)
+    else:
+        for kind, colour, name in _KIND_STYLE:
+            mine = [g for g in glyphs if g.get("kind") == kind
+                    or (kind == "other" and g.get("kind") not in ("SU", "MU"))]
+            for k, glyph in enumerate(mine):
+                ax.plot(glyph["x"], glyph["y"], color=colour, lw=0.8, alpha=0.9,
+                        label=f"{name} ({len(mine)})" if k == 0 else None)
+    if glyphs and colour_by == "kind":
+        ax.legend(loc="lower right", bbox_to_anchor=(1.0, 1.0), fontsize=7,
+                  frameon=False, handlelength=1.2, borderaxespad=0.2)
+    ax.set_xlim(x_lo, x_hi)
+    ax.set_ylim(y_lo, y_hi)
+    ax.axis("off")
+    # The horizontal scale: a bar under the probe.
+    bar_y = y_lo + 15
+    ax.plot([x_lo + 5, x_lo + 5 + scale_bar_um], [bar_y, bar_y], color="k", lw=1.2,
+            clip_on=False)
+    ax.text(x_lo + 5 + scale_bar_um / 2, bar_y - 10, f"{scale_bar_um:g} um",
+            ha="center", va="top", fontsize=8)
+    ax.set_title(f"N_total = {n_total:,}\nN_visual = {len(glyphs):,}", fontsize=9,
+                 loc="left")
+    if amplitude_note:
+        ax.text(0.0, -0.035, amplitude_note, transform=ax.transAxes, ha="left",
+                va="top", fontsize=7, color="0.35")
+
+    for bank, low, high in bank_spans:
+        colour = _BANK_COLOURS[bank % len(_BANK_COLOURS)]
+        ax_bank.add_patch(Rectangle((0.55, low), 0.3, high - low, color=colour, lw=0))
+        ax_bank.plot([0.4, 0.9], [low, low], color="k", lw=0.6)
+        if high - low > 0.06 * (y_hi - y_lo):
+            ax_bank.text(0.35, (low + high) / 2, f"Bank {bank}", rotation=90,
+                         ha="right", va="center", fontsize=8)
+    ax_bank.set_xlim(0, 1)
+    ax_bank.set_xticks([])
+    for side in ("top", "right", "bottom"):
+        ax_bank.spines[side].set_visible(False)
+    ax_bank.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v / 1000:g}"))
+    ax_bank.set_ylabel("distance from probe tip (mm)")
+    return fig
+
+
+def save_pdf(figures: list[Any], path: str | Path) -> Path:
+    """Write ``figures`` as the pages of one PDF, in order, and close them."""
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with PdfPages(path) as pdf:
+        for fig in figures:
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+    return path
 
 
 def save_figure(fig: Any, path: str | Path, dpi: int = 150) -> Path:

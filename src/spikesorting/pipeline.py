@@ -2027,9 +2027,12 @@ def _unit_page_data(
             "n_spikes": int(times.size),
             "isi_counts": isi_counts,
             "isi_edges_ms": isi_edges,
-            "rate_centers_s": centers,
+            # Elapsed since the recording window's start -- the same reference for
+            # every unit, so a unit that only fires late still starts late. Binned
+            # on the export's axis first, so the rates are exactly those.
+            "rate_centers_s": centers - start,
             "rate_hz": rate,
-            "amp_times_s": times,
+            "amp_times_s": times - start,         # the rate panel's axis: since the start
             "amplitudes": phy.amplitudes_for(unit_id),
         }
         if unit_id in rows.index:
@@ -4873,7 +4876,7 @@ def export_results(
         )
 
         log.info("wrote units.pdf (%d units) -> %s", len(units), figure_dir)
-        _write_overview(phy, unit_ids, figure_dir / "overview.png")
+        _write_overview(phy, unit_ids, figure_dir, measured, config, system)
         if len(units) < unit_ids.size:
             log.warning(
                 "only the first %d of %d units were plotted (max_unit_figures)",
@@ -4979,11 +4982,18 @@ def timing_table(config: SessionConfig, system: str) -> str | None:
     return tm.render_timing(timing, title)
 
 
-def _write_overview(phy, unit_ids: np.ndarray, path: Path) -> Path | None:
-    """``overview.png``: every exported unit's spikes on the probe, noise in grey.
+def _write_overview(
+    phy, unit_ids: np.ndarray, figure_dir: Path, measured: dict | None = None,
+    config: SessionConfig | None = None, system: str = "neuropixels",
+) -> Path | None:
+    """``overview.pdf``: the sorting on the probe, at a glance.
 
-    Skipped, with a line in the log, when the sorting has no PC features to place
-    spikes with.
+    Page 1 is every exported unit's spikes on the probe, noise in grey, at
+    Kilosort's own positions -- skipped without its ``spike_positions.npy``. Pages 2 and 3 are every exported unit's measured mean waveform at its
+    place on the probe (:func:`_probe_waveform_pages`): one colour per unit,
+    then single units red and multi-units light blue. A page that cannot be
+    drawn is left out, with a line in the log; the PDF is written when at least
+    one can.
     """
     from ._export.curated import load_spike_positions
     from ._export.metrics import select_spikes_evenly
@@ -4992,14 +5002,96 @@ def _write_overview(phy, unit_ids: np.ndarray, path: Path) -> Path | None:
     n_total = int(phy.spike_clusters.size)
     index = select_spikes_evenly(n_total, _OVERVIEW_MAX_SPIKES)
     xy = load_spike_positions(phy.results_dir, index)
-    if xy is None:
-        log.info("no pc_features.npy in %s; no overview.png", phy.results_dir)
-        return None
     clusters = phy.spike_clusters[index]
-    exported = np.isin(clusters, unit_ids)
-    overview = plots.plot_sorting_overview(
-        xy[exported], clusters[exported], background_xy=xy[~exported], n_total=n_total
-    )
-    plots.save_figure(overview, path)
-    log.info("wrote %s (%d of %d spikes)", path.name, index.size, n_total)
-    return path
+    pages = []
+    # Exports before overview.pdf wrote this page as overview.png; it is the PDF's
+    # page 1 now, so an old one would only describe an earlier sort.
+    (Path(figure_dir) / "overview.png").unlink(missing_ok=True)
+    if xy is None:
+        log.info("no spike_positions.npy (Kilosort's own) in %s; no spike-position page",
+                 phy.results_dir)
+    else:
+        exported = np.isin(clusters, unit_ids)
+        pages.append(plots.plot_sorting_overview(
+            xy[exported], clusters[exported], background_xy=xy[~exported], n_total=n_total
+        ))
+
+    pages.extend(_probe_waveform_pages(phy, unit_ids, xy, clusters, measured, config, system))
+    pdf = Path(figure_dir) / "overview.pdf"
+    if not pages:
+        pdf.unlink(missing_ok=True)
+        return None
+    plots.save_pdf(pages, pdf)
+    log.info("wrote %s (%d page%s)", pdf.name, len(pages), "" if len(pages) == 1 else "s")
+    return pdf
+
+
+def _probe_waveform_pages(
+    phy, unit_ids: np.ndarray, xy: np.ndarray | None, clusters: np.ndarray,
+    measured: dict | None, config: SessionConfig | None, system: str,
+) -> list[Any]:
+    """Each exported unit's measured mean waveform where it sits on the probe.
+
+    The waveform is the one ``units.pdf`` and ``sorted_spikes.mat`` hold -- a
+    unit with none is counted in N_total but not drawn. A unit sits at the
+    median of its sampled spikes' positions, or at its peak channel's site when
+    none was sampled. Two pages of the same glyphs: one colour per unit, then
+    single units (``good``) red and multi-units (``mua``) light blue. Banks come
+    from the ``.meta`` beside a Neuropixels binary (:func:`spikeglx.imro_banks`);
+    without one there is no bank bar. Empty when nothing can be drawn.
+    """
+    from ._export import final, probe_layout
+    from ._plots import summary as plots
+
+    results_dir = Path(phy.results_dir)
+    if measured is None:
+        log.info("no measured waveforms, so no waveform pages in overview.pdf")
+        return []
+    positions_file = results_dir / "channel_positions.npy"
+    if not positions_file.exists() or phy.channel_map is None:
+        log.info("no channel_positions.npy in %s; no waveform pages", results_dir)
+        return []
+    site_xy = np.load(positions_file)
+    channel_map = np.asarray(phy.channel_map).ravel()
+
+    positions = (probe_layout.compute_unit_positions(xy, clusters, unit_ids)
+                 if xy is not None else {})
+    for unit in unit_ids:                          # no spike sampled: its peak channel
+        if int(unit) not in positions:
+            row = final.best_channel(phy, int(unit))
+            hit = np.flatnonzero(channel_map == row) if row is not None else []
+            if len(hit):
+                positions[int(unit)] = tuple(float(v) for v in site_xy[hit[0]])
+
+    result = measured["result"]
+    wanted = np.isin(np.asarray(result.unit_ids), unit_ids)
+    waves = np.asarray(result.mean)[:, wanted]
+    ids = np.asarray(result.unit_ids)[wanted]
+    scale = probe_layout.compute_glyph_scale(waves)
+    glyphs = probe_layout.compute_waveform_glyphs(waves, ids, positions, scale)
+    for glyph in glyphs:
+        glyph["kind"] = _UNIT_CLASS.get(phy.labels.get(glyph["unit_id"], ""), "")
+
+    bank_spans: list = []
+    if system == "neuropixels" and config is not None and config.neuropixels.bin_file:
+        from ._io import spikeglx
+
+        meta_path = spikeglx.meta_path_for(config.neuropixels.bin_file)
+        try:
+            meta = spikeglx.read_meta(meta_path)
+            banks = spikeglx.imro_banks(meta)
+            if banks is not None:
+                acquired = np.asarray(spikeglx.ap_acquisition_channels(meta, channel_map))
+                site_bank = np.where(acquired < banks.size,
+                                     banks[np.minimum(acquired, banks.size - 1)], -1)
+                bank_spans = probe_layout.compute_bank_spans(site_xy[:, 1], site_bank)
+        except (OSError, ValueError, KeyError) as error:
+            log.info("no bank bar on the waveform page: %s", error)
+
+    units = measured.get("mean_units", "ADC")
+    median_ptp = probe_layout.GLYPH_HEIGHT_UM / scale
+    note = (f"waveform height: {median_ptp:.0f} {units} trough-to-peak "
+            f"= {probe_layout.GLYPH_HEIGHT_UM:g} um")
+    n_total = int(np.size(unit_ids))
+    return [plots.plot_probe_waveforms(glyphs, site_xy, bank_spans, n_total, note, colour_by=by)
+            for by in ("unit", "kind")]

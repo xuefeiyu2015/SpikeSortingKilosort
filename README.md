@@ -379,7 +379,10 @@ python run_exporting_pipeline.py --config session_Porthos_1probe
 <blackrock_dir>/kilosort4/              only when the Utah array is sorted
                                         (nothing is written beside a sync-only .ns5)
                        export/
-                           figures/                     units.pdf (a row per unit), overview.png,
+                           figures/                     units.pdf (a row per unit), overview.pdf
+                                                        (page 1 = every unit's spikes on the probe; pages 2-3 = each unit's
+                                                        mean waveform on the probe, by bank: one colour
+                                                        per unit, then single red / multi light blue),
                                                         sync_overview.png (Neuropixels: what synchronization did)
                            sorting_summary_info.json    what ran, on what, from where
                            <recording>.sorted_spikes.mat  times, channel, unit, mean waveform
