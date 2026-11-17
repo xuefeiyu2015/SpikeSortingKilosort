@@ -45,6 +45,7 @@ lfp_decimate: 1        # stride for it; 2 is safe, more aliases
 export_analog: true    # OneBox XA inputs (eye, pupil, photodiode) on Blackrock time -- see "OneBox analog"
 analog_decimate: 1     # stride for it; plain, no anti-alias filter
 export_figures: true   # per-unit and overview PNGs at export time
+export_folder_name: kilosort4   # the output folder in each <system>_dir (null also = kilosort4) -- see "Output folder"
 
 # ---------- edit for this session ----------
 # Each system's own directory, written out in full: the raw recording and
@@ -289,6 +290,15 @@ kilosort: {}
 #   --export-lfp, --export-waveforms on exporting). The flag never replaces the key: a
 #   setting reachable only from a command line is one nobody can read back off
 #   the session six months later.
+#
+# Output folder
+#   Everything derived from a recording goes into one folder inside its
+#   <system>_dir: the sorting, the sync edges and time map, export/ and logs/.
+#   kilosort4 is the sorter's name, and what null gives too. Rename it to keep another sort of
+#   the same recording beside the first rather than over it -- e.g.
+#   kilosort4_medicine and kilosort4_nblock5 -- and point Phy and the exporting
+#   run at the session that names it. One folder name, not a path; not
+#   "preprocessed", which sits beside it and is shared by every sort.
 #
 # LFP
 #   On in the templates, so every export has the LF band beside the spikes. It

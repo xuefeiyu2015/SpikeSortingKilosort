@@ -362,6 +362,15 @@ python run_exporting_pipeline.py --config session_Porthos_1probe
                            units.csv                      one row per unit: label, rate, ISI, ...
 ```
 
+`kilosort4` is the default name of that folder. Set **`export_folder_name`** in the
+session to name it yourself — e.g. `kilosort4_medicine` — and a second sort of the
+same recording (other drift correction, other settings) lands beside the first
+instead of on top of it, with its own sync files, `export/` and `logs/`. `null`
+keeps `kilosort4`. It is one folder name, not a path, and cannot be
+`preprocessed`, which sits beside it and is shared by every sort; each sort's
+waveform export checks the record beside the binary *it* read, so sorting one
+variant does not invalidate another's waveforms.
+
 Each `.mat` is named after the recording it came from — `<run>_t0.imec0.ap` for a
 Neuropixels AP binary, the `.ns6` stem for Blackrock — so a file copied off the rig
 still says which recording it is. `export/` holds only what you copy away;

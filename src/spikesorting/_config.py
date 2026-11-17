@@ -800,10 +800,15 @@ class SessionConfig:
     #: Stated outright in the session file; nothing composes it.
     blackrock_dir: Path | None = None
     neuropixels_dir: Path | None = None
-    #: Names the level below ``neuropixels/`` and ``blackrock/`` that results are
-    #: written to. Not a session setting: which sorter ran is a property of the
-    #: code, so this comes from :data:`SORTER_NAME` and is not read from YAML.
+    #: Which sorter ran: a property of the code, so it comes from
+    #: :data:`SORTER_NAME` and is not read from YAML. Recorded in the manifest.
     sorter: str = SORTER_NAME
+    #: The folder in each ``<system>_dir`` everything derived from the recording
+    #: goes to -- the sorting, the sync edges and time map, ``export/``,
+    #: ``logs/``. ``None`` (unstated, or ``null``) is :attr:`sorter`; a name keeps
+    #: a second sort -- other drift correction, other settings -- beside the
+    #: first instead of on top of it. See :attr:`output_folder`.
+    export_folder_name: str | None = None
     blackrock: BlackrockSpec = field(default_factory=BlackrockSpec)
     neuropixels: NeuropixelsSpec = field(default_factory=NeuropixelsSpec)
     # Whether a system recorded is *derived* from whether its paths are declared
@@ -845,11 +850,16 @@ class SessionConfig:
     probe: int | None = None
 
     @property
+    def output_folder(self) -> str:
+        """``export_folder_name``, or the sorter's name when the session sets none."""
+        return self.export_folder_name or self.sorter
+
+    @property
     def paths(self) -> OutputPaths:
         return OutputPaths(
             self.blackrock_dir,
             self.neuropixels_dir,
-            self.sorter,
+            self.output_folder,
             probe_tag=self.probe_tag,
             sorts_blackrock=self.sorts_blackrock,
         )
@@ -1249,6 +1259,7 @@ _SESSION_KEYS = frozenset({
     "export_analog",
     "analog_decimate",
     "export_figures",
+    "export_folder_name",
     "sync_period_s",
     "burst_interval_s",
     "alignment_tolerance_s",
@@ -1450,6 +1461,7 @@ def load_session_config(
         export_analog=bool(data.get("export_analog", False)),
         analog_decimate=int(data.get("analog_decimate", 1)),
         export_figures=bool(data.get("export_figures", True)),
+        export_folder_name=_folder_name(data.get("export_folder_name"), session_path),
         sync_period_s=float(data.get("sync_period_s", 1.0)),
         burst_interval_s=float(data.get("burst_interval_s", 14.0)),
         alignment_tolerance_s=float(data.get("alignment_tolerance_s", 1e-3)),
@@ -1731,12 +1743,48 @@ def _reject_colliding_system_dirs(config: SessionConfig, path: Path) -> None:
     raise ValueError(
         f"{path}: blackrock_dir and neuropixels_dir are the same directory "
         f"({config.blackrock_dir}), but each system writes everything it "
-        f"produces to <dir>/{config.sorter}/ -- so the two sortings would land on "
+        f"produces to <dir>/{config.output_folder}/ -- so the two sortings would land on "
         "top of each other.\n"
         "  Point them at the two recordings' own folders. A SpikeGLX run nests "
         "its own, so neuropixels_dir is usually the <run>_g<n>_imec<n> directory "
         "holding the .ap.bin, while blackrock_dir is where the .ns5/.ns6 sit."
     )
+
+
+#: Names the output folder may not take: ``preprocessed`` already sits beside it
+#: in every ``<system>_dir`` (the binary Kilosort reads), and Windows reserves
+#: these device names whatever the extension.
+_RESERVED_FOLDER_NAMES = {"preprocessed", "con", "prn", "aux", "nul",
+                          *(f"com{n}" for n in range(1, 10)),
+                          *(f"lpt{n}" for n in range(1, 10))}
+
+
+def _folder_name(value: Any, path: Path) -> str | None:
+    """``export_folder_name`` checked: None, or one folder name usable on Windows too.
+
+    One level only -- it is joined to each ``<system>_dir``, and a path there
+    would scatter a sort's outputs outside the recording's folder. Refused at
+    load, naming the line, rather than failing at the first write hours in.
+    """
+    if value is None:
+        return None
+    where = f"{path}: export_folder_name {value!r}"
+    if not isinstance(value, str):
+        raise ValueError(f"{where} must be a folder name in quotes, or null for "
+                         f"{SORTER_NAME}")
+    name = value.strip()
+    if not name:
+        raise ValueError(f"{where} is empty: write a folder name, or null for {SORTER_NAME}")
+    bad = sorted(set(name) & set('/\\:*?"<>|'))
+    if bad or name in {".", ".."}:
+        raise ValueError(f"{where} must be a single folder name, not a path "
+                         f"(it contains {' '.join(bad) or name}); it is created "
+                         "inside each <system>_dir")
+    if name.endswith((".", " ")) or name.lower().split(".")[0] in _RESERVED_FOLDER_NAMES:
+        raise ValueError(f"{where} cannot be used: 'preprocessed' is the folder beside "
+                         "it, and Windows refuses device names and names ending in "
+                         "a dot or space")
+    return name
 
 
 def with_overrides(config: SessionConfig, **overrides: Any) -> SessionConfig:

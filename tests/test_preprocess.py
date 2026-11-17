@@ -1098,6 +1098,34 @@ def test_switching_back_to_a_preset_reuses_its_binary_and_record(tmp_path, monke
                                                again.path) is None
 
 
+def test_a_sort_of_one_preset_keeps_its_waveforms_after_another_preset_is_sorted(
+    tmp_path, monkeypatch
+):
+    # Two sorts of one recording side by side (export_folder_name): MEDiCINe,
+    # then DREDge. preprocess.json now describes DREDge's binary, but the
+    # MEDiCINe sorting's own binary is untouched -- its waveforms must still be
+    # cut, judged by the record beside that binary.
+    from spikesorting import pipeline
+
+    _fake_catgt(monkeypatch, writes=True)
+    _fake_motion(monkeypatch)
+    medicine = _catgt_session(tmp_path, preprocess="    motion: medicine\n")
+    directory = medicine.paths.preprocessed_for("neuropixels")
+    made = pipeline._binary_for(medicine, "neuropixels")
+    run_info = {"preprocessing": provenance.read(directory)}       # what that sort kept
+
+    pipeline._binary_for(_catgt_session(tmp_path, preprocess="    motion: dredge\n"),
+                         "neuropixels")
+    assert provenance.read(directory) != run_info["preprocessing"]
+    assert pipeline._binary_changed_since_sort(medicine, "neuropixels", run_info,
+                                               made.path) is None
+    # Remade with other settings, it is judged changed again.
+    pipeline._binary_for(_catgt_session(tmp_path, highpass=500,
+                                        preprocess="    motion: medicine\n"), "neuropixels")
+    assert "preprocessed again" in pipeline._binary_changed_since_sort(
+        medicine, "neuropixels", run_info, made.path)
+
+
 def test_a_presets_binary_made_with_other_settings_is_remade_in_its_folder(tmp_path, monkeypatch):
     from spikesorting import pipeline
 

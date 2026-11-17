@@ -1678,3 +1678,65 @@ def test_blackrock_analog_inputs_replace_the_positional_analog_channels(tmp_path
     zero = with_inputs.replace("analog_inputs: {photodiode: 4}", "analog_inputs: {photodiode: 0}")
     with pytest.raises(ValueError, match="ainp numbers, n >= 1"):
         cfg.load_session_config(_write_session(tmp_path, zero), "windows_rig", CONFIG_DIR)
+
+
+# ---------------------------------------------------------------------------
+# export_folder_name: the output folder in each <system>_dir
+# ---------------------------------------------------------------------------
+
+
+def _folder_session(tmp_path, line: str = ""):
+    body = (f"blackrock_dir: '{tmp_path / 'br'}'\nneuropixels_dir: '{tmp_path / 'np'}'\n"
+            + line +
+            "blackrock:\n  spike_file: '{blackrock_dir}/HUB_001.ns6'\n"
+            "  probe_file: 'configs/probes/np1_default.json'\n"
+            "neuropixels:\n  bin_file: '{neuropixels_dir}/run_g0_t0.imec0.ap.bin'\n")
+    return cfg.load_session_config(_write_session(tmp_path, body), "windows_rig", CONFIG_DIR)
+
+
+@pytest.mark.parametrize("line", ["", "export_folder_name: null\n"])
+def test_unnamed_the_output_folder_is_the_sorters(tmp_path, line):
+    session = _folder_session(tmp_path, line)
+    assert session.output_folder == cfg.SORTER_NAME == "kilosort4"
+    assert session.paths.sorted_for("neuropixels") == tmp_path / "np" / "kilosort4"
+
+
+def test_a_named_output_folder_holds_everything_the_recording_produces(tmp_path):
+    session = _folder_session(tmp_path, "export_folder_name: kilosort4_medicine\n")
+    np_out, br_out = tmp_path / "np" / "kilosort4_medicine", tmp_path / "br" / "kilosort4_medicine"
+    paths = session.paths
+    assert paths.sorted_for("neuropixels") == np_out and paths.sorted_for("blackrock") == br_out
+    assert paths.export_for("neuropixels") == np_out / "export"
+    assert paths.sync_for("neuropixels") == np_out and paths.aligned == np_out
+    # The preprocessed binary is shared by every sort of the recording, and
+    # which sorter ran is still Kilosort 4 whatever the folder is called.
+    assert paths.preprocessed_for("neuropixels") == tmp_path / "np" / "preprocessed"
+    assert session.sorter == "kilosort4"
+
+
+def test_each_probe_writes_into_its_own_named_folder(tmp_path):
+    body = (f"neuropixels_dir: '{tmp_path / 'run_g0'}'\nexport_folder_name: ks4_dredge\n"
+            "neuropixels:\n  bin_files:\n"
+            "    - '{neuropixels_dir}/run_g0_imec0/run_g0_t0.imec0.ap.bin'\n"
+            "    - '{neuropixels_dir}/run_g0_imec1/run_g0_t0.imec1.ap.bin'\n")
+    session = cfg.load_session_config(_write_session(tmp_path, body), "windows_rig", CONFIG_DIR)
+    assert [c.paths.sorted_for("neuropixels") for _, c in session.per_probe()] == [
+        tmp_path / "run_g0" / "run_g0_imec0" / "ks4_dredge",
+        tmp_path / "run_g0" / "run_g0_imec1" / "ks4_dredge"]
+
+
+@pytest.mark.parametrize("value, match", [
+    ("'a/b'", "single folder name"), ("'..'", "single folder name"),
+    ("'C:\\\\out'", "single folder name"), ("preprocessed", "'preprocessed'"),
+    ("'x.'", "cannot be used"), ("''", "is empty"), ("5", "in quotes"),
+])
+def test_an_output_folder_that_is_not_one_usable_name_is_refused_at_load(tmp_path, value, match):
+    with pytest.raises(ValueError, match=match):
+        _folder_session(tmp_path, f"export_folder_name: {value}\n")
+
+
+def test_every_template_states_the_output_folder_explicitly_as_kilosort4():
+    for path in sorted(CONFIG_DIR.glob("session_template_*.yaml")):
+        assert "\nexport_folder_name: kilosort4 " in path.read_text(), path.name
+        session = cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
+        assert session.output_folder == "kilosort4", path.name
