@@ -522,6 +522,8 @@ def test_a_utah_export_lands_on_the_nsp_clock(tmp_path, kilosort_results):
 
     info = json.loads((sorted_dir / "export" / "sorting_summary_info.json").read_text())
     assert info["timebase"] == "nsp"
+    # Which sorter ran, and the folder it all went to (export_folder_name, or its name).
+    assert info["sorter"] == "kilosort4" and info["output_folder"] == sorted_dir.name
     assert info["nsp_time_map"]["measured_rate_hz"] == pytest.approx(rate, abs=1e-3)
     assert info["nsp_time_map"]["drift_ppm"] == pytest.approx(-4.5, abs=0.2)
 
@@ -1003,8 +1005,11 @@ def test_waveforms_are_not_cut_from_a_binary_the_sorting_did_not_read(
         assert "Phy now shows it the new traces" in caplog.text
         assert (sorted_dir / "spike_times.npy").exists()
     else:
+        # What a rewrite leaves when it is cut short: both records were removed
+        # before the binary was touched.
         preprocessed = session.paths.preprocessed_for("neuropixels")
         (preprocessed / "preprocess.json").unlink()
+        pipeline._binary_record_path(run_info["binary"]).unlink(missing_ok=True)
         if how.endswith("binary gone"):           # CatGT empties its -dest first
             Path(run_info["binary"]).unlink()
 

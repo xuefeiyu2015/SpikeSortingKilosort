@@ -432,7 +432,7 @@ def exam_sync(config: SessionConfig, system: str) -> SyncExam | None:
     ``.ns5``). Each train is counted against the recording's length.
 
     **Changes nothing the pipeline uses.** It writes to
-    ``<neuropixels_dir>/kilosort4/sync_exam/`` only: the edge files the map is
+    ``<neuropixels_dir>/<export_folder_name>/sync_exam/`` only: the edge files the map is
     fitted from, the map and any accepted verdict stay as they are. Returns
     ``None`` when the session declares no such system.
     """
@@ -2110,6 +2110,8 @@ def _write_summary(
         "system": system,
         "stream": stream_label(system),
         "sorter": config.sorter,
+        # The folder it all went to: the sorter's name unless export_folder_name says otherwise.
+        "output_folder": config.output_folder,
         "timebase": timebase,
         "time_units": "seconds",
         "curated": curated,
@@ -4485,17 +4487,23 @@ def _binary_changed_since_sort(
     the rewrite -- or a rewrite cut short, which leaves no record at all, since
     the record is removed first -- leaves the old sorting beside new traces.
     The record the sort saw is in ``run_info.json``; the binary is the same only
-    while ``preprocess.json`` still exists and says the same. A sorting of a
-    binary outside ``preprocessed/`` (made before this pipeline preprocessed)
-    has no record to compare and is not judged.
+    while the record **beside that binary** (``<binary>.json``) still exists
+    and says the same. That record, not ``preprocess.json``, because two sorts of
+    one recording -- other ``export_folder_name``, other ``motion`` -- read two
+    binaries, and ``preprocess.json`` describes only the one made or reused
+    last. It is removed before its binary is rewritten, so a torn rewrite has
+    none. A binary from before those records falls back to ``preprocess.json``.
+    A sorting of a binary outside ``preprocessed/`` (made before this pipeline
+    preprocessed) has no record to compare and is not judged.
     """
     directory = config.paths.preprocessed_for(system)
     if not _inside(binary, directory):
         return None
-    current = provenance.read(directory)
+    own = _binary_record_path(binary)
+    current = _read_record(own) if own.exists() else provenance.read(directory)
     if current is None:
-        return (f"{directory / provenance.SIDECAR} is missing or unreadable -- a "
-                "rewrite was started and not finished")
+        return (f"{own if own.exists() else directory / provenance.SIDECAR} is missing "
+                "or unreadable -- a rewrite was started and not finished")
     at_sort = run_info.get("preprocessing")
     if not at_sort:
         return "run_info.json does not record the preprocessing this sorting read"
