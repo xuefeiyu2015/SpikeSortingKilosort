@@ -32,6 +32,8 @@ __all__ = [
     "template_for_unit",
     "build_unit_table",
     "export_unit_table",
+    "with_unit_positions",
+    "export_channel_positions",
 ]
 
 
@@ -186,6 +188,38 @@ def export_unit_table(out_dir: str | Path, table: pd.DataFrame) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "units.csv"
     table.to_csv(path, index=False)
+    return path
+
+
+def with_unit_positions(
+    table: pd.DataFrame, positions: dict[int, tuple[float, float]]
+) -> pd.DataFrame:
+    """``table`` with ``x_um``/``y_um`` after ``channel``: where each unit sits on
+    the probe (``probe_layout.place_units``), blank when it cannot be placed."""
+    table = table.copy()
+    at = list(table.columns).index("channel") + 1 if "channel" in table else len(table.columns)
+    xy = [positions.get(int(u), (np.nan, np.nan)) for u in table["unit_id"]]
+    table.insert(at, "x_um", [p[0] for p in xy])
+    table.insert(at + 1, "y_um", [p[1] for p in xy])
+    return table
+
+
+def export_channel_positions(
+    out_dir: str | Path, channel_map: np.ndarray, site_xy: np.ndarray
+) -> Path:
+    """Write ``channel_positions.csv``: one row per recorded site, ``channel``
+    (the binary row, as ``units.csv``'s ``channel``), ``x_um``, ``y_um``.
+
+    Kilosort's ``channel_positions.npy`` lists sites in its own order;
+    ``channel_map.npy`` says which binary row each one is.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    site_xy = np.asarray(site_xy, dtype=float)
+    frame = pd.DataFrame({"channel": np.asarray(channel_map).ravel().astype(int),
+                          "x_um": site_xy[:, 0], "y_um": site_xy[:, 1]})
+    path = out_dir / "channel_positions.csv"
+    frame.sort_values("channel").to_csv(path, index=False)
     return path
 
 

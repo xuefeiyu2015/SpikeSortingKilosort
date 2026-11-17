@@ -388,7 +388,8 @@ python run_exporting_pipeline.py --config session_Porthos_1probe
                            <recording>.sorted_spikes.mat  times, channel, unit, mean waveform
                            <recording>.waveforms.mat      per-spike snippets (when kept)
                            <lf recording>.lfp.mat         the LF band, on Blackrock time
-                           units.csv                      one row per unit: label, rate, ISI, ...
+                           units.csv                      one row per unit: label, rate, ISI, ...; x_um, y_um = where it sits on the probe
+                           channel_positions.csv          every electrode: channel (as units.csv), x_um, y_um
 ```
 
 `kilosort4` is the default name of that folder. Set **`export_folder_name`** in the

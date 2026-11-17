@@ -521,7 +521,14 @@ def test_a_utah_export_lands_on_the_nsp_clock(tmp_path, kilosort_results):
     # plus the small records that explain them -- here the .ns6 clock map.
     names = {p.name for p in (sorted_dir / "export").iterdir() if p.is_file()}
     assert names == {"HUB.sorted_spikes.mat", "units.csv", "sorting_summary_info.json",
-                     "nsp_time_map.json"}
+                     "nsp_time_map.json", "channel_positions.csv"}
+    # Where each unit sits, and every site: enough to redraw the probe overview.
+    import pandas as pd
+    units = pd.read_csv(sorted_dir / "export" / "units.csv")
+    assert {"x_um", "y_um"} <= set(units.columns) and units[["x_um", "y_um"]].notna().all().all()
+    sites = pd.read_csv(sorted_dir / "export" / "channel_positions.csv")
+    assert list(sites.columns) == ["channel", "x_um", "y_um"]
+    assert set(units["channel"]) <= set(sites["channel"])     # one numbering for both
 
     info = json.loads((sorted_dir / "export" / "sorting_summary_info.json").read_text())
     assert info["timebase"] == "nsp"

@@ -4825,7 +4825,13 @@ def export_results(
         phy, unit_ids, spike_times_s,
         **({"start_s": window[0], "duration_s": window[1]} if window else {}),
         **_measured_means(measured))
+    # Where each unit sits on the probe: the same placement overview.pdf draws
+    # its waveforms at, so units.csv can redraw it without the sorting folder.
+    layout = _probe_layout(phy, unit_ids)
+    table = final.with_unit_positions(table, layout["positions"])
     units_csv = final.export_unit_table(out_dir, table)
+    channels_csv = (final.export_channel_positions(out_dir, layout["channel_map"], layout["site_xy"])
+                    if layout["site_xy"] is not None else None)
 
     # The spikes in the format the lab's online-spike code already reads, plus
     # the measured waveform when the recording was reachable.
@@ -4849,7 +4855,8 @@ def export_results(
         config, system, out_dir, timebase, unit_ids, measured, phy.curated, time_map,
         window,
     )
-    paths = {"units": units_csv, "sorted_spikes": mat_path, "summary": summary}
+    paths = {"units": units_csv, "sorted_spikes": mat_path, "summary": summary,
+             **({"channel_positions": channels_csv} if channels_csv else {})}
     paths.update(_copy_records(config, system, out_dir))
     lap("write .mat, units.csv, manifest")
 
@@ -4876,7 +4883,7 @@ def export_results(
         )
 
         log.info("wrote units.pdf (%d units) -> %s", len(units), figure_dir)
-        _write_overview(phy, unit_ids, figure_dir, measured)
+        _write_overview(phy, unit_ids, figure_dir, measured, layout)
         if len(units) < unit_ids.size:
             log.warning(
                 "only the first %d of %d units were plotted (max_unit_figures)",
@@ -4982,8 +4989,39 @@ def timing_table(config: SessionConfig, system: str) -> str | None:
     return tm.render_timing(timing, title)
 
 
+def _probe_layout(phy, unit_ids: np.ndarray) -> dict[str, Any]:
+    """The probe and where every exported unit sits on it, read once.
+
+    ``xy``/``clusters``: Kilosort's own positions (``spike_positions.npy``) of
+    an even subsample of spikes, and their clusters -- None without the file.
+    ``positions``: each unit's place (:func:`probe_layout.place_units`: its
+    sampled spikes' median, else its peak channel's site). ``site_xy`` and
+    ``channel_map``: Kilosort's sites and the binary row of each, or None.
+    ``units.csv`` and ``overview.pdf`` both use this, so they agree.
+    """
+    from ._export import final, probe_layout
+    from ._export.curated import load_spike_positions
+    from ._export.metrics import select_spikes_evenly
+
+    results_dir = Path(phy.results_dir)
+    n_total = int(phy.spike_clusters.size)
+    index = select_spikes_evenly(n_total, _OVERVIEW_MAX_SPIKES)
+    xy = load_spike_positions(results_dir, index)
+    clusters = phy.spike_clusters[index]
+    site_file = results_dir / "channel_positions.npy"
+    site_xy = np.load(site_file) if site_file.exists() and phy.channel_map is not None else None
+    channel_map = np.asarray(phy.channel_map).ravel() if site_xy is not None else None
+    medians = probe_layout.compute_unit_positions(xy, clusters, unit_ids) if xy is not None else {}
+    peak_rows = {int(u): final.best_channel(phy, int(u)) for u in unit_ids
+                 if int(u) not in medians}
+    positions = probe_layout.place_units(medians, unit_ids, peak_rows, site_xy, channel_map)
+    return {"xy": xy, "clusters": clusters, "n_total": n_total, "positions": positions,
+            "site_xy": site_xy, "channel_map": channel_map}
+
+
 def _write_overview(
     phy, unit_ids: np.ndarray, figure_dir: Path, measured: dict | None = None,
+    layout: dict[str, Any] | None = None,
 ) -> Path | None:
     """``overview.pdf``: the sorting on the probe, at a glance.
 
@@ -4994,14 +5032,10 @@ def _write_overview(
     drawn is left out, with a line in the log; the PDF is written when at least
     one can.
     """
-    from ._export.curated import load_spike_positions
-    from ._export.metrics import select_spikes_evenly
     from ._plots import summary as plots
 
-    n_total = int(phy.spike_clusters.size)
-    index = select_spikes_evenly(n_total, _OVERVIEW_MAX_SPIKES)
-    xy = load_spike_positions(phy.results_dir, index)
-    clusters = phy.spike_clusters[index]
+    layout = layout or _probe_layout(phy, unit_ids)
+    xy, clusters, n_total = layout["xy"], layout["clusters"], layout["n_total"]
     pages = []
     # Exports before overview.pdf wrote this page as overview.png; it is the PDF's
     # page 1 now, so an old one would only describe an earlier sort.
@@ -5015,7 +5049,7 @@ def _write_overview(
             xy[exported], clusters[exported], background_xy=xy[~exported], n_total=n_total
         ))
 
-    pages.extend(_probe_waveform_pages(phy, unit_ids, xy, clusters, measured))
+    pages.extend(_probe_waveform_pages(phy, unit_ids, layout, measured))
     pdf = Path(figure_dir) / "overview.pdf"
     if not pages:
         pdf.unlink(missing_ok=True)
@@ -5026,40 +5060,27 @@ def _write_overview(
 
 
 def _probe_waveform_pages(
-    phy, unit_ids: np.ndarray, xy: np.ndarray | None, clusters: np.ndarray,
-    measured: dict | None,
+    phy, unit_ids: np.ndarray, layout: dict[str, Any], measured: dict | None,
 ) -> list[Any]:
     """Each exported unit's measured mean waveform where it sits on the probe.
 
     The waveform is the one ``units.pdf`` and ``sorted_spikes.mat`` hold -- a
-    unit with none is counted in the title's total but not drawn. A unit sits at the
-    median of its sampled spikes' positions, or at its peak channel's site when
-    none was sampled. Two pages of the same glyphs: one colour per unit, then
+    unit with none is counted in the title's total but not drawn. A unit sits
+    where ``layout`` places it (:func:`_probe_layout`) -- the ``x_um``/``y_um``
+    ``units.csv`` records. Two pages of the same glyphs: one colour per unit, then
     single units (``good``) red and multi-units (``mua``) light blue. Empty
     when nothing can be drawn.
     """
-    from ._export import final, probe_layout
+    from ._export import probe_layout
     from ._plots import summary as plots
 
-    results_dir = Path(phy.results_dir)
     if measured is None:
         log.info("no measured waveforms, so no waveform pages in overview.pdf")
         return []
-    positions_file = results_dir / "channel_positions.npy"
-    if not positions_file.exists() or phy.channel_map is None:
-        log.info("no channel_positions.npy in %s; no waveform pages", results_dir)
+    site_xy, positions = layout["site_xy"], layout["positions"]
+    if site_xy is None:
+        log.info("no channel_positions.npy in %s; no waveform pages", phy.results_dir)
         return []
-    site_xy = np.load(positions_file)
-    channel_map = np.asarray(phy.channel_map).ravel()
-
-    positions = (probe_layout.compute_unit_positions(xy, clusters, unit_ids)
-                 if xy is not None else {})
-    for unit in unit_ids:                          # no spike sampled: its peak channel
-        if int(unit) not in positions:
-            row = final.best_channel(phy, int(unit))
-            hit = np.flatnonzero(channel_map == row) if row is not None else []
-            if len(hit):
-                positions[int(unit)] = tuple(float(v) for v in site_xy[hit[0]])
 
     result = measured["result"]
     wanted = np.isin(np.asarray(result.unit_ids), unit_ids)

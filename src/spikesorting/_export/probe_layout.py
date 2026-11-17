@@ -13,6 +13,7 @@ __all__ = [
     "GLYPH_WIDTH_UM",
     "GLYPH_HEIGHT_UM",
     "compute_unit_positions",
+    "place_units",
     "compute_glyph_scale",
     "compute_waveform_glyphs",
 ]
@@ -41,6 +42,35 @@ def compute_unit_positions(
         if mine.size:
             out[int(unit)] = (float(np.median(mine[:, 0])), float(np.median(mine[:, 1])))
     return out
+
+
+def place_units(
+    medians: dict[int, tuple[float, float]],
+    unit_ids: np.ndarray,
+    peak_rows: dict[int, int | None],
+    site_xy: np.ndarray | None,
+    channel_map: np.ndarray | None,
+) -> dict[int, tuple[float, float]]:
+    """Where each unit sits: its spikes' median position, else its peak channel's site.
+
+    ``medians`` are :func:`compute_unit_positions`'s; ``peak_rows`` each unit's
+    peak channel as a binary row, found in ``channel_map`` to pick its row of
+    ``site_xy``. A unit with neither is left out. The one rule both
+    ``units.csv``'s ``x_um``/``y_um`` and ``overview.pdf``'s waveform centres use.
+    """
+    placed = {int(u): medians[int(u)] for u in unit_ids if int(u) in medians}
+    if site_xy is None or channel_map is None:
+        return placed
+    rows = np.asarray(channel_map).ravel()
+    for unit in unit_ids:
+        unit = int(unit)
+        row = peak_rows.get(unit)
+        if unit in placed or row is None:
+            continue
+        hit = np.flatnonzero(rows == row)
+        if hit.size:
+            placed[unit] = (float(site_xy[hit[0], 0]), float(site_xy[hit[0], 1]))
+    return placed
 
 
 def compute_glyph_scale(waveforms: np.ndarray, height_um: float = GLYPH_HEIGHT_UM) -> float:
