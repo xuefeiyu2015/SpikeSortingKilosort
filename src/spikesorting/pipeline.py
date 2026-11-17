@@ -5033,7 +5033,7 @@ def _probe_waveform_pages(
     """Each exported unit's measured mean waveform where it sits on the probe.
 
     The waveform is the one ``units.pdf`` and ``sorted_spikes.mat`` hold -- a
-    unit with none is counted in N_total but not drawn. A unit sits at the
+    unit with none is counted in the title's total but not drawn. A unit sits at the
     median of its sampled spikes' positions, or at its peak channel's site when
     none was sampled. Two pages of the same glyphs: one colour per unit, then
     single units (``good``) red and multi-units (``mua``) light blue. Banks come

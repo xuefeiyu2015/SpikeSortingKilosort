@@ -409,7 +409,7 @@ def plot_probe_waveforms(
     told apart. ``site_xy`` the recorded sites (drawn faintly, for scale);
     ``bank_spans`` ``(bank, y_low, y_high)`` in um, or empty to draw no bank
     bar. Depth is distance from the probe tip, in mm. ``n_total`` is the units
-    exported, ``len(glyphs)`` the ones drawn.
+    exported, shown in the title.
     """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
@@ -449,8 +449,7 @@ def plot_probe_waveforms(
             clip_on=False)
     ax.text(x_lo + 5 + scale_bar_um / 2, bar_y - 10, f"{scale_bar_um:g} um",
             ha="center", va="top", fontsize=8)
-    ax.set_title(f"N_total = {n_total:,}\nN_visual = {len(glyphs):,}", fontsize=9,
-                 loc="left")
+    ax.set_title(f"{n_total:,} units", fontsize=9, loc="left")
     if amplitude_note:
         ax.text(0.0, -0.035, amplitude_note, transform=ax.transAxes, ha="left",
                 va="top", fontsize=7, color="0.35")
