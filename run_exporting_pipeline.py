@@ -37,7 +37,7 @@ exported.
 
 Everything it prints -- each stage's outcome and time, the pipeline's messages,
 the timing tables -- is also saved to
-``<system>_dir/kilosort4/logs/exporting_<start>_<machine>.log``, one per run.
+``<system>_dir/<export_folder_name>/logs/exporting_<start>_<machine>.log``, one per run.
 
 Two flags, each overriding a session key for this run only:
 
@@ -89,7 +89,7 @@ def main() -> int:
     log_pipeline_messages()
 
     # Everything printed from here on is also kept, and saved as
-    # <system>_dir/kilosort4/logs/exporting_<start>_<machine>.log.
+    # <system>_dir/<export_folder_name>/logs/exporting_<start>_<machine>.log.
     run_log = RunLog("exporting")
     config = None
     try:

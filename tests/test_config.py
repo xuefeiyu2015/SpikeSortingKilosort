@@ -1740,3 +1740,36 @@ def test_every_template_states_the_output_folder_explicitly_as_kilosort4():
         assert "\nexport_folder_name: kilosort4 " in path.read_text(), path.name
         session = cfg.load_session_config(path, "windows_rig", CONFIG_DIR)
         assert session.output_folder == "kilosort4", path.name
+
+
+def test_after_sorting_the_printed_phy_command_opens_the_named_folder(tmp_path, monkeypatch, capsys):
+    # The instructions the sorting run prints at the end must point Phy at the
+    # folder export_folder_name names, not at kilosort4/.
+    import importlib.util
+    import sys
+    from types import SimpleNamespace
+
+    import spikesorting as ss
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("run_sorting_pipeline", root / "run_sorting_pipeline.py")
+    driver = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(root / "tools"))
+    spec.loader.exec_module(driver)
+
+    session = _folder_session(tmp_path, "export_folder_name: kilosort4_medicine\n")
+    done = SimpleNamespace(summary=lambda: "sorted")
+    def preprocess(config, system):
+        return done
+    def sort_with_kilosort(config, system, dry_run=False):
+        return done
+    monkeypatch.setattr(ss, "preprocess", preprocess)
+    monkeypatch.setattr(ss, "sort_with_kilosort", sort_with_kilosort)
+    monkeypatch.setattr(ss, "timing_table", lambda config, system: None)
+
+    assert driver._sort(SimpleNamespace(dry_run=False, config="session_x"), session) == 0
+    printed = capsys.readouterr().out
+    phy = [line for line in printed.splitlines() if "phy template-gui" in line]
+    assert phy and all("kilosort4_medicine" in line for line in phy), printed
+    assert str(tmp_path / "np" / "kilosort4_medicine" / "params.py") in printed
+    assert "run_exporting_pipeline.py --config session_x" in printed

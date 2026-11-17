@@ -14,9 +14,10 @@
 #     .yaml. --machine defaults to the platform, so the rig needs none.
 # curation in phy -- once per probe, and the sorting driver prints both lines
 #   conda activate phy
-#   cd <neuropixels_dir>/<run>_imec0/kilosort4/   (the directory holding params.py)
+#   cd <neuropixels_dir>/<run>_imec0/<export_folder_name>/   (kilosort4 unless export_folder_name says otherwise;
+#                                   the sorting run prints the full phy command)
 #   phy template-gui params.py
-# after curation -- back in kilosort4: the waveform export reads the recording
+# after curation -- back in the kilosort4 env: the waveform export reads the recording
 # through Kilosort's own preprocessing
 #   conda activate kilosort4
 #   python run_exporting_pipeline.py --config <session>
@@ -53,7 +54,7 @@ export_folder_name: kilosort4   # the output folder in each <system>_dir (null a
 # lands on disk. See "Paths" below.
 blackrock_dir: "Z:/Monkey Athos/2026-08-13"
 # The SpikeGLX GATE folder, not the probe folder -- this session covers two
-# probes, and each writes into its own <run>_imec<n>/kilosort4/ below this. (A
+# probes, and each writes into its own <run>_imec<n>/<export_folder_name>/  below this. (A
 # one-probe session names the probe folder itself; see session_template_1probe.)
 # It must not be the Blackrock directory: loading raises if any probe's folder
 # collides with it.
@@ -344,8 +345,8 @@ kilosort: {}
 #   whether to sort, which is what kilosort_on_* is for.
 #
 # Outputs -- one folder per stream, beside its own recording
-#   {blackrock_dir}/kilosort4/          not created: no Utah array is sorted
-#   {neuropixels_dir}/<run>_imec<n>/kilosort4/
+#   {blackrock_dir}/<export_folder_name>/  not created: no Utah array is sorted
+#   {neuropixels_dir}/<run>_imec<n>/<export_folder_name>/
 #                                       probe n's sorting, every edge file
 #                                       (its own copy of Blackrock's), its
 #                                       time map onto Blackrock
@@ -357,7 +358,7 @@ kilosort: {}
 #   names already says which recording it is. Synchronization belongs to the
 #   Neuropixels sorting: the time map and the Blackrock edge files it was
 #   fitted from sit beside it, so a local sorting stays local and the Blackrock
-#   share is only read. {blackrock_dir}/kilosort4/ exists only when the Utah
+#   share is only read. {blackrock_dir}/<export_folder_name>/  exists only when the Utah
 #   array is sorted.
 #
 # Where the SpikeGLX run went
@@ -478,7 +479,7 @@ kilosort: {}
 #   placed against the .nev markers and attributed to a task.
 #
 #   Everything derived from one sorted stream lands in one folder,
-#   <system>/<stream>/kilosort4/export/: figures, the manifest, the LFP and the
+#   <system>/<stream>/<export_folder_name>/export/: figures, the manifest, the LFP and the
 #   three .mat products, so an analysis can be handed the directory whole.
 #
 # Bad channels

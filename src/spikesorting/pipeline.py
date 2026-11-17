@@ -432,7 +432,7 @@ def exam_sync(config: SessionConfig, system: str) -> SyncExam | None:
     ``.ns5``). Each train is counted against the recording's length.
 
     **Changes nothing the pipeline uses.** It writes to
-    ``<neuropixels_dir>/kilosort4/sync_exam/`` only: the edge files the map is
+    ``<neuropixels_dir>/<export_folder_name>/sync_exam/`` only: the edge files the map is
     fitted from, the map and any accepted verdict stay as they are. Returns
     ``None`` when the session declares no such system.
     """

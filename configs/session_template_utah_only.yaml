@@ -8,9 +8,10 @@
 #     .yaml. --machine defaults to the platform, so the rig needs none.
 # curation in phy
 #   conda activate phy
-#   cd <blackrock_dir>/kilosort4/        (the directory holding params.py)
+#   cd <blackrock_dir>/<export_folder_name>/   (kilosort4 unless export_folder_name says otherwise;
+#                                   the sorting run prints the full phy command)
 #   phy template-gui params.py
-# after curation -- back in kilosort4: the waveform export reads the recording
+# after curation -- back in the kilosort4 env: the waveform export reads the recording
 # through Kilosort's own preprocessing
 #   conda activate kilosort4
 #   python run_exporting_pipeline.py --config <session>
@@ -202,9 +203,9 @@ kilosort: {}
 #   whether to sort, which is what kilosort_on_* is for.
 #
 # Outputs -- one folder per system, beside its own recording
-#   {blackrock_dir}/kilosort4/          sorted Utah array and export/
+#   {blackrock_dir}/<export_folder_name>/  sorted Utah array and export/
 #                                       (only when the array is sorted)
-#   {neuropixels_dir}/kilosort4/        sorted Neuropixels, every edge file
+#   {neuropixels_dir}/<export_folder_name>/  sorted Neuropixels, every edge file
 #                                       (Blackrock's too), the time map onto
 #                                       Blackrock time,
 #                                       the LF band, and export/
@@ -215,7 +216,7 @@ kilosort: {}
 #   names already says which recording it is. Synchronization belongs to the
 #   Neuropixels sorting: the time map and the Blackrock edge files it was
 #   fitted from sit beside it, so a local sorting stays local and the Blackrock
-#   share is only read. {blackrock_dir}/kilosort4/ exists only when the Utah
+#   share is only read. {blackrock_dir}/<export_folder_name>/  exists only when the Utah
 #   array is sorted.
 #
 # Where the SpikeGLX run went
@@ -240,7 +241,7 @@ kilosort: {}
 #
 #   Point the two neuropixels_dir values at the two *_imec<n> folders and their
 #   outputs cannot collide. Pointing both at a shared parent would put two
-#   sortings in one kilosort4/, and _publish merges rather than clobbers, so the
+#   sortings in one <export_folder_name>/, and _publish merges rather than clobbers, so the
 #   result would be a blend of the two.
 #
 # Probes
@@ -320,7 +321,7 @@ kilosort: {}
 #   placed against the .nev markers and attributed to a task.
 #
 #   Everything derived from one sorted stream lands in one folder,
-#   <system>/<stream>/kilosort4/export/: figures, the manifest, the LFP and the
+#   <system>/<stream>/<export_folder_name>/export/: figures, the manifest, the LFP and the
 #   three .mat products, so an analysis can be handed the directory whole.
 #
 # Bad channels
