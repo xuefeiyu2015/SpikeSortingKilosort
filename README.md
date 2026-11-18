@@ -379,13 +379,17 @@ python run_exporting_pipeline.py --config session_Porthos_1probe
 <blackrock_dir>/kilosort4/              only when the Utah array is sorted
                                         (nothing is written beside a sync-only .ns5)
                        export/
-                           figures/                     units.pdf (a row per unit), overview.png,
+                           figures/                     units.pdf (a row per unit), overview.pdf
+                                                        (page 1 = every unit's spikes on the probe; pages 2-3 = each unit's
+                                                        mean waveform on the probe: one colour
+                                                        per unit, then single red / multi light blue),
                                                         sync_overview.png (Neuropixels: what synchronization did)
                            sorting_summary_info.json    what ran, on what, from where
                            <recording>.sorted_spikes.mat  times, channel, unit, mean waveform
                            <recording>.waveforms.mat      per-spike snippets (when kept)
                            <lf recording>.lfp.mat         the LF band, on Blackrock time
-                           units.csv                      one row per unit: label, rate, ISI, ...
+                           units.csv                      one row per unit: label, rate, ISI, ...; x_um, y_um = where it sits on the probe
+                           channel_positions.csv          every electrode: channel (as units.csv), x_um, y_um
 ```
 
 `kilosort4` is the default name of that folder. Set **`export_folder_name`** in the

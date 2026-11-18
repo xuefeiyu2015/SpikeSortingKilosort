@@ -419,11 +419,14 @@ def test_export_results_reads_those_settings_rather_than_arguments(
     )
     assert with_noise["n_units"] == 2
     figures = sorted(p.name for p in session.paths.figures_for("neuropixels").iterdir())
-    assert figures == ["overview.png", "units.pdf"]
+    # overview.pdf: the spike-position page (and the waveform pages, when there are
+    # measured waveforms -- none here). No overview.png: it is the PDF's page 1.
+    assert figures == ["overview.pdf", "units.pdf"]
 
-    # A sorting without PC features cannot place spikes: no overview, the rest stands.
+    # A sorting without Kilosort's spike_positions.npy has no positions: no overview,
+    # the rest stands (they are never re-estimated from the PC features).
     shutil.rmtree(session.paths.figures_for("neuropixels"))
-    (sorted_dir / "pc_features.npy").unlink()
+    (sorted_dir / "spike_positions.npy").unlink()
     ss.export_results(cfg.with_overrides(session, export_figures=True), "neuropixels")
     figures = sorted(p.name for p in session.paths.figures_for("neuropixels").iterdir())
     assert figures == ["units.pdf"]
@@ -518,7 +521,14 @@ def test_a_utah_export_lands_on_the_nsp_clock(tmp_path, kilosort_results):
     # plus the small records that explain them -- here the .ns6 clock map.
     names = {p.name for p in (sorted_dir / "export").iterdir() if p.is_file()}
     assert names == {"HUB.sorted_spikes.mat", "units.csv", "sorting_summary_info.json",
-                     "nsp_time_map.json"}
+                     "nsp_time_map.json", "channel_positions.csv"}
+    # Where each unit sits, and every site: enough to redraw the probe overview.
+    import pandas as pd
+    units = pd.read_csv(sorted_dir / "export" / "units.csv")
+    assert {"x_um", "y_um"} <= set(units.columns) and units[["x_um", "y_um"]].notna().all().all()
+    sites = pd.read_csv(sorted_dir / "export" / "channel_positions.csv")
+    assert list(sites.columns) == ["channel", "x_um", "y_um"]
+    assert set(units["channel"]) <= set(sites["channel"])     # one numbering for both
 
     info = json.loads((sorted_dir / "export" / "sorting_summary_info.json").read_text())
     assert info["timebase"] == "nsp"

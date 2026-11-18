@@ -223,6 +223,10 @@ def kilosort_results(tmp_path) -> Path:
     features = np.zeros((spike_samples.size, 3, 4), dtype=np.float32)
     features[:, 0, 0] = rng.normal(10, 1, size=spike_samples.size)
     np.save(results_dir / "pc_features.npy", features)
+    # Kilosort 4's own per-spike positions: each spike on its unit's peak channel.
+    sites = np.column_stack([np.zeros(n_chan), 20.0 * np.arange(n_chan)])
+    np.save(results_dir / "spike_positions.npy",
+            sites[np.asarray(peak_channels)[spike_clusters]].astype(np.float32))
 
     (results_dir / "params.py").write_text(
         "dat_path = 'recording.bin'\n"

@@ -25,7 +25,6 @@ __all__ = [
     "compute_mean_waveform",
     "compute_waveform_features",
     "compute_unit_metrics",
-    "compute_spike_positions",
     "select_spikes_evenly",
 ]
 
@@ -234,38 +233,6 @@ def compute_unit_metrics(
     if mean_waveform is not None and fs:
         metrics.update(compute_waveform_features(mean_waveform, fs))
     return metrics
-
-
-def compute_spike_positions(
-    spike_templates: np.ndarray,
-    pc_features: np.ndarray,
-    pc_feature_ind: np.ndarray,
-    channel_positions: np.ndarray,
-    feature: int = 0,
-) -> np.ndarray:
-    """``(n_spikes, 2)`` x/y of each spike on the probe, in the probe's units.
-
-    cortexlab/spikes' estimator, as the hands-on-neuropixels course uses it: the
-    mean position of the channels a spike's template spans, weighted by the
-    square of its ``feature``-th PC on each. ``pc_features`` is
-    ``(n_spikes, n_pcs, n_channels)`` for the same spikes as ``spike_templates``,
-    so a subset of rows can be passed. A spike with no weight anywhere is NaN.
-    """
-    templates = np.asarray(spike_templates).reshape(-1).astype(np.int64)
-    features = np.asarray(pc_features, dtype=np.float64)
-    if features.ndim != 3 or features.shape[0] != templates.size:
-        raise ValueError(
-            f"pc_features must be (n_spikes, n_pcs, n_channels) for {templates.size} "
-            f"spikes, got {features.shape}"
-        )
-    channels = np.asarray(pc_feature_ind).astype(np.int64)[templates]   # (n, n_chan)
-    coords = np.asarray(channel_positions, dtype=np.float64)[channels]  # (n, n_chan, 2)
-    weights = features[:, feature, :] ** 2                              # (n, n_chan)
-    total = weights.sum(axis=1)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        positions = (coords * weights[..., None]).sum(axis=1) / total[:, None]
-    positions[total == 0] = np.nan
-    return positions
 
 
 def select_spikes_evenly(n_total: int, max_spikes: int | None) -> np.ndarray:
