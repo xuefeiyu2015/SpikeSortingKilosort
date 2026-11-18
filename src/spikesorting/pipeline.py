@@ -515,6 +515,11 @@ def _preprocess_expected(config: SessionConfig, system: str) -> dict[str, Any]:
     settings: dict[str, Any] = asdict(spec)
     if spec.method == "spikeinterface" and spec.car_mode:
         settings["reference_rows"] = _reference_rows(config, system)
+    # Only when there is something to interpolate, so a motion binary made
+    # before this key existed, with no bad channels, is still the same binary.
+    interpolated = _motion_bad_rows(config, system)
+    if interpolated:
+        settings["motion_interpolated"] = interpolated
     if spec.method == "catgt":
         # Only when there is something to exclude: a binary made before this
         # key existed, with no exclusions, is still the same binary.
@@ -538,6 +543,19 @@ def _preprocess_expected(config: SessionConfig, system: str) -> dict[str, Any]:
         "settings": settings,
         "source": provenance.source_fingerprint(_input_path(config, system)),
     }
+
+
+def _motion_bad_rows(config: SessionConfig, system: str) -> list[int]:
+    """``bad_channels`` to interpolate before motion correction; [] without motion.
+
+    Recorded in ``preprocess.json`` (``motion_interpolated``), so a changed
+    ``bad_channels`` remakes the motion-corrected binary -- and only that:
+    :func:`_catgt_stage_expected` leaves it out, as it leaves out ``motion``.
+    """
+    if not config.preprocess_for(system).motion:
+        return []
+    bad = config.kilosort_for(system).get("bad_channels") or []
+    return sorted({int(r) for r in bad})
 
 
 def _reference_rows(config: SessionConfig, system: str) -> list[int]:
@@ -781,6 +799,7 @@ def _run_preprocessing(
             spec,
             jobs,
             rows,
+            bad_rows=_motion_bad_rows(config, system),
         )
         target = folder / f"{info.path.stem}.bin"
     t_built = time.perf_counter()
@@ -1006,6 +1025,7 @@ def _run_catgt_preprocessing(
         si.read_neuropixels(out.path, out.n_chan, out.fs, out.sy_index, has_meta=True),
         spec.motion,
         jobs,
+        bad_rows=_motion_bad_rows(config, "neuropixels"),
     )
     t_built = time.perf_counter()
     path = si.write(corrected, folder / f"{out.path.stem}.motion.bin", jobs)
@@ -1034,7 +1054,8 @@ def _catgt_stage_expected(config: SessionConfig) -> dict[str, Any]:
     """What CatGT's output has to have been made from: everything the binary
     depends on except ``motion``, which is applied after it."""
     expected = _preprocess_expected(config, "neuropixels")
-    expected["settings"] = {k: v for k, v in expected["settings"].items() if k != "motion"}
+    expected["settings"] = {k: v for k, v in expected["settings"].items()
+                            if k not in ("motion", "motion_interpolated")}
     return expected
 
 
@@ -1677,6 +1698,18 @@ _PREVIOUS_CURATION = (
     # time_remapping's per-spike arrays, one per spike of the *old* sort
     "*_spike_seconds.npy", "*_spike_seconds_blackrock.npy",
     "*_spike_seconds_blackrock.json",
+    # export_results' products and its copies of the sort's records: every one
+    # describes the old sort's units and spikes. Downstream code loads these
+    # from the usual place, so between this sort and the next export they must
+    # be absent rather than the old sort's. What does not depend on the sort --
+    # the LFP and OneBox exports, the sync report, the time map and validation
+    # copies, sync_overview.png -- stays.
+    "export/*.sorted_spikes.mat", "export/*.waveforms.mat",
+    "export/units.csv", "export/channel_positions.csv",
+    "export/sorting_summary_info.json", "export/timing.txt",
+    "export/run_info.json", "export/kilosort4.log", "export/preprocess.json",
+    "export/figures/units.pdf", "export/figures/overview.pdf",
+    "export/figures/overview.png", "export/figures/motion_drift_*.png",
 )
 
 
@@ -1694,6 +1727,11 @@ def _clear_previous_curation(final_dir: Path) -> None:
     the old sort, and ``export_results`` would take them as the new sort's
     Blackrock times whenever the counts happened to agree. The time map itself
     stays -- it describes the sync edges, not the spikes.
+
+    And the sort's half of ``export/``: ``sorted_spikes.mat``, ``units.csv``,
+    the unit figures and the manifest name the old sort's clusters, and an
+    analysis reading them before the next ``export_results`` would get the
+    previous sorting with nothing saying so.
     """
     for pattern in _PREVIOUS_CURATION:
         for path in final_dir.glob(pattern):
@@ -1958,10 +1996,9 @@ def _waveform_fields(measured: dict | None) -> dict | None:
         "unit_ids": result.unit_ids,
         "units": measured.get("mean_units", "ADC"),
         "window_ms": measured.get("window_ms", float("nan")),
-        # Not transposed: Chunked takes the HDF5 shape, and MATLAB reverses it.
-        # (width, n_spikes) on disk is what MATLAB reads as nSpikes x nSamp,
-        # which is the orientation the online .nev container uses.
-        "snippets": result.snippets if measured.get("snippets_kept") else None,
+        # No per-spike snippets: they are a subset of the spikes, kept in
+        # waveforms.mat with the indices that place them (see
+        # export_sorted_spikes_mat).
     }
 
 
@@ -2426,6 +2463,40 @@ def _onebox_export_dir(config: SessionConfig) -> Path:
     return config.for_probe(config.probes[0]).paths.export_for("neuropixels")
 
 
+def _onebox_analog_in(folder: Path, obx: Path) -> Any:
+    """The one ``*.analog.mat`` in ``folder``, if it is an export of ``obx`` as
+    it is now; raises ``FileNotFoundError``/``ValueError``/``OSError`` otherwise."""
+    from ._io import analog
+
+    loaded = analog.load_onebox_analog(analog.find_onebox_analog(folder),
+                                       require_blackrock=False)
+    problem = analog.onebox_source_problem(loaded, obx)
+    if problem is not None:
+        raise ValueError(problem)
+    return loaded
+
+
+def _onebox_analog(config: SessionConfig) -> Any:
+    """The session's OneBox analog export, checked against this run's ``.obx.bin``.
+
+    Synchronization reads it back -- the no-burst cycle vote, the independent
+    checks, the sync report and figure -- so a file left from another run or
+    from before the recording was replaced must not stand in for this one.
+    Only ``export_analog: true`` writes it, so without a burst that setting
+    decides whether the map can be checked; the verdict and ``check_env.py
+    --config`` both say so.
+
+    Raises ``FileNotFoundError``/``ValueError`` naming the reason (every caller
+    already treats either as "no OneBox analog"), and ``OSError`` when the
+    ``.obx.bin`` cannot be reached to compare.
+    """
+    obx = _onebox_binary(config)
+    if obx is None:
+        raise FileNotFoundError("no OneBox recording beside the AP binary to "
+                                "check the analog export against")
+    return _onebox_analog_in(_onebox_export_dir(config), obx)
+
+
 def _fitted_onebox_map(config: SessionConfig) -> align.LinearMap | None:
     """``onebox_to_blackrock`` from this probe's ``time_map.json``, if there is one."""
     map_path = config.paths.aligned / "time_map.json"
@@ -2462,8 +2533,22 @@ def stamp_analog_timebase(
 
     import h5py
 
+    from ._io import analog
+
+    obx = _onebox_binary(config)
     stamped = None
     for path in exports:
+        # Only an export of this run's OneBox file as it is now: Blackrock time
+        # on another recording's samples would read as current and aligned.
+        try:
+            problem = ("no OneBox recording beside the AP binary to check it against"
+                       if obx is None else analog.onebox_source_problem(
+                           analog.load_onebox_analog(path, require_blackrock=False), obx))
+        except (OSError, ValueError, KeyError) as error:
+            problem = f"its source cannot be checked ({error})"
+        if problem is not None:
+            log.warning("%s stays on the OneBox clock: %s", path.name, problem)
+            continue
         with h5py.File(path, "r") as handle:
             fs = float(np.asarray(handle["analog/fs"][()]).ravel()[0])
         update_mat(path, {"analog": _blackrock_axis(fs, onebox_map)})
@@ -2481,6 +2566,49 @@ def _blackrock_axis(fs: float, mapping: align.LinearMap) -> dict[str, Any]:
         "blackrock_slope": mapping.slope,
         "blackrock_intercept": mapping.intercept,
     }
+
+
+def _lfp_source_problem(path: Path, lf_file: Path | None) -> str | None:
+    """Why the LFP export at ``path`` is not of ``lf_file`` as it is now, or None.
+
+    An export from before the LFP recorded its source's size and mtime is
+    held to what it did record -- the file name and the sample count -- rather
+    than refused: re-exporting is the whole LF band (~7 GB/hour).
+    """
+    import h5py
+
+    from ._io import spikeglx
+    from ._preprocess.provenance import export_source_problem
+
+    if lf_file is None:
+        return "no LF binary to check it against"
+    try:
+        with h5py.File(path, "r") as handle:
+            group = handle["lfp"]
+
+            def text(key):
+                return ("".join(chr(c) for c in np.asarray(group[key][()]).ravel())
+                        if key in group else None)
+
+            def number(key):
+                return (float(np.asarray(group[key][()]).ravel()[0])
+                        if key in group else None)
+
+            source, size, mtime = text("source"), number("source_size"), text("source_mtime_ns")
+            n_samples, decimate = number("n_samples"), number("decimate")
+        if size is not None and mtime is not None:
+            return export_source_problem(path.name, source, int(size), int(mtime), lf_file)
+        recorded = Path(str(source).replace("\\", "/")).name
+        if recorded != lf_file.name:
+            return f"{path.name} was written from {recorded}, not {lf_file.name}"
+        step = int(decimate or 1)
+        expected = (spikeglx.stream_info(lf_file).n_samples + step - 1) // step
+        if n_samples is None or int(n_samples) != expected:
+            return (f"{path.name} holds {n_samples} samples but {lf_file.name} "
+                    f"makes {expected}; re-export it")
+        return None
+    except (OSError, ValueError, KeyError) as error:
+        return f"its source cannot be checked ({error})"
 
 
 def _lf_binary(config: SessionConfig) -> Path | None:
@@ -2539,8 +2667,14 @@ def stamp_lfp_timebase(
 
     import h5py
 
+    lf_file = _lf_binary(config)
     stamped = None
     for path in exports:
+        # Only an export of this probe's LF binary as it is now.
+        problem = _lfp_source_problem(path, lf_file)
+        if problem is not None:
+            log.warning("%s stays on the probe's clock: %s", path.name, problem)
+            continue
         with h5py.File(path, "r") as handle:
             fs = float(np.asarray(handle["lfp/fs"][()]).ravel()[0])
         # t_blackrock(k) = slope * (k / fs) + intercept, another uniform axis:
@@ -2733,7 +2867,9 @@ def time_remapping(
             (match.slope - 1.0) * 1e6, offset, match.max_residual_s * 1e3,
         )
         cycles_from = "burst"
+        cycles_note = None
     else:
+        cycles_note = None
         log.warning(
             "no burst edges on one or both systems; the 1 Hz alone cannot tell "
             "which cycle pairs with which -- trying the photodiode, then the eye"
@@ -2754,6 +2890,7 @@ def time_remapping(
                 "%s; the map may be off by whole seconds and cannot be validated",
                 cycles_from,
             )
+            cycles_note = cycles_from
             cycles_from = "1hz_only"
 
         def coarse(times):
@@ -2778,7 +2915,7 @@ def time_remapping(
         log.info("no sorting at %s; wrote the time map only", results_dir)
         _save_map(aligned_dir, mapping, offset, config, obx_map, method="map_only",
                   cycles_from=cycles_from, cycle_vote=vote, coarse_tried=tried,
-                  inputs=_sync_inputs(config))
+                  inputs=_sync_inputs(config), cycles_note=cycles_note)
         return TimeMap(mapping, offset, "map_only", burst_match=match)
 
     # The rate the edges were converted with; _rate_problem has already checked
@@ -2822,7 +2959,7 @@ def time_remapping(
 
     _save_map(aligned_dir, mapping, offset, config, obx_map, method=method,
               cycles_from=cycles_from, tprime_error=tprime_error, cycle_vote=vote,
-              coarse_tried=tried, inputs=_sync_inputs(config))
+              coarse_tried=tried, inputs=_sync_inputs(config), cycles_note=cycles_note)
     log.info("the map and %s are provisional until validate_remapping accepts them",
              out_path.name)
     return TimeMap(mapping, offset, method, aligned_path=out_path, burst_match=match)
@@ -3299,17 +3436,19 @@ def _cycle_from_behaviour(
         return None, ("no channel named in both blackrock.analog_inputs and "
                       "neuropixels.analog_channels to pick the cycle with"), []
     try:
-        onebox = analog.load_onebox_analog(
-            analog.find_onebox_analog(_onebox_export_dir(config)),
-            require_blackrock=False,
-        )
+        onebox = _onebox_analog(config)
         br = analog.open_blackrock_analog(
             brk.analog_file, {n: brk.analog_inputs[n] for n in shared},
             brk.nsp_frontend_channels, gap_tolerance_ms=brk.gap_tolerance_ms,
             tolerance_s=config.alignment_tolerance_s,
         )
     except (OSError, ValueError, KeyError) as error:
-        return None, f"no photodiode or eye to pick the cycle with ({error})", []
+        reason = f"no photodiode or eye to pick the cycle with ({error})"
+        if not config.export_analog:
+            reason += ("; export_analog is false, so this run writes no OneBox "
+                       "analog export -- set export_analog: true and re-run the "
+                       "exporting pipeline to check the map without a burst")
+        return None, reason, []
     composed = align.compose_linear_maps(provisional, obx_map)
     onebox = _replace(onebox, slope=composed.slope, intercept=composed.intercept)
     period = config.sync_period_s
@@ -3366,6 +3505,7 @@ def _save_map(
     cycle_vote: Any = None,
     coarse_tried: list[dict[str, str]] | None = None,
     inputs: dict[str, str] | None = None,
+    cycles_note: str | None = None,
 ) -> None:
     obx_to_br = None if obx_map is None else align.compose_linear_maps(mapping, obx_map)
     # Only a burst is held out of the fit; without one nothing validates the map
@@ -3381,6 +3521,9 @@ def _save_map(
         # What picked which 1 Hz cycle pairs with which: "burst", "photodiode",
         # an eye channel's label, or "1hz_only" (ambiguous by whole seconds).
         "cycles_from": cycles_from,
+        # With cycles_from "1hz_only": why nothing picked the cycle, naming
+        # the setting to change when there is one (export_analog).
+        "cycles_note": cycles_note,
         # Without a burst: the vote that chose the whole-second offset in its
         # place. Photodiode votes count flashes, the others correlation windows.
         "sync_period_s": config.sync_period_s,
@@ -3851,7 +3994,6 @@ def _write_sync_report(
     channel, beside the data it describes. ``refused`` overrides the verdict
     with NOT VALIDATED and that reason, keeping the measurements beside it.
     """
-    from ._io import analog
     from ._sync.report import build_sync_report, render_sync_report
 
     map_path = config.paths.aligned / "time_map.json"
@@ -3863,9 +4005,7 @@ def _write_sync_report(
     export_dir = config.paths.export_for("neuropixels")
     names: list[str] = []
     try:
-        names = list(analog.load_onebox_analog(
-            analog.find_onebox_analog(_onebox_export_dir(config)), require_blackrock=False
-        ).names)
+        names = list(_onebox_analog(config).names)
     except (OSError, ValueError):
         pass                               # no analog export for this probe
 
@@ -3933,10 +4073,7 @@ def _independent_checks(config: SessionConfig) -> list[dict[str, Any]]:
         return unmeasured("no onebox_to_blackrock map (no OneBox 1 Hz edges), so the "
                           "OneBox copy cannot be put on Blackrock time")
     try:
-        onebox = analog.load_onebox_analog(
-            analog.find_onebox_analog(_onebox_export_dir(config)),
-            require_blackrock=False,
-        )
+        onebox = _onebox_analog(config)
     except (OSError, ValueError) as error:
         return unmeasured(f"no OneBox analog export: {error}")
     from dataclasses import replace as _replace
@@ -4027,8 +4164,7 @@ def _sync_figure_data(config: SessionConfig) -> dict[str, Any] | None:
 
     onebox = None
     try:
-        onebox = analog.load_onebox_analog(
-            analog.find_onebox_analog(_onebox_export_dir(config)), require_blackrock=False)
+        onebox = _onebox_analog(config)
         from dataclasses import replace as _replace
 
         onebox = _replace(onebox, slope=slope, intercept=intercept)

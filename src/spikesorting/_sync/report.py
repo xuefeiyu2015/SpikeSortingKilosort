@@ -254,9 +254,11 @@ def _verdict_without_burst(
     if not no_burst:
         return "NOT VALIDATED", "no 14 s bursts to check against; only fit residuals are available"
     if cycles_from == "1hz_only" or vote is None:
+        note = time_map.get("cycles_note")
         return "NOT VALIDATED", (
             "no 14 s burst; WARNING: no burst, photodiode or eye picked the whole-second "
-            "offset, so the map may be off by whole seconds")
+            "offset, so the map may be off by whole seconds"
+            + (f" ({note})" if note else ""))
     coarse = (f"coarse match by {vote['source']} in place of the burst: shift "
               f"{vote['shift_s']:+.3f} s, {vote['n_support']} of {vote['n_total']} "
               f"{vote.get('counted', 'votes')} agree (runner-up {vote['n_runner_up']}); "

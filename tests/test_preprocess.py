@@ -790,7 +790,7 @@ def _fake_motion(monkeypatch):
 
     ran = []
 
-    def motion_chain(recording, preset, jobs=None):
+    def motion_chain(recording, preset, jobs=None, bad_rows=None):
         ran.append(preset)
         out = spikeglx.stream_info(recording)
         info = {"run_times": {"detect_and_localize": 2.0, "estimate_motion": 1.0},
@@ -1037,6 +1037,64 @@ def test_peak_drift_moves_the_same_peaks_by_the_estimated_motion():
     assert np.allclose(drift["depth_corrected_um"][inside], 500.0, atol=1e-6)
     assert np.ptp(drift["depth_raw_um"]) > 25
     assert drift["displacement_um"].shape == (len(bins), 1)
+
+
+def test_bad_channels_are_interpolated_before_motion_is_estimated(monkeypatch):
+    # A known-bad site must not feed peaks to the drift estimate or be mixed
+    # into its neighbours by the motion interpolation: it is filled in from
+    # its neighbours first (IBL's kriging), and the binary keeps every row.
+    pytest.importorskip("spikeinterface.preprocessing")
+    probeinterface = pytest.importorskip("probeinterface")
+    import spikeinterface.core as sc
+    import spikeinterface.preprocessing as spre
+
+    from spikesorting._preprocess import si
+
+    rng = np.random.default_rng(0)
+    traces = (rng.normal(size=(3000, 6)) * 10).astype(np.int16)
+    traces[:, 2] = 30000                          # a stuck site
+    recording = sc.NumpyRecording([traces], sampling_frequency=30000.0)
+    probe = probeinterface.generate_linear_probe(num_elec=6, ypitch=20)
+    probe.set_device_channel_indices(np.arange(6))
+    recording = recording.set_probe(probe)
+    seen = {}
+
+    def correct_motion(rec, **kwargs):
+        seen["traces"] = rec.get_traces()
+        return rec, {"run_times": {}}
+
+    monkeypatch.setattr(spre, "correct_motion", correct_motion)
+    out, _ = si.motion_chain(recording, "dredge", bad_rows=[2])
+    assert out.get_num_channels() == 6
+    assert np.abs(seen["traces"][:, 2]).max() < 1000      # not the stuck value
+    np.testing.assert_array_equal(seen["traces"][:, 0], traces[:, 0])  # good rows untouched
+
+    with pytest.raises(ValueError, match=r"bad_channels \[9\]"):
+        si.motion_chain(recording, "dredge", bad_rows=[9])
+
+
+def test_the_interpolated_bad_channels_are_recorded_and_do_not_rerun_catgt(tmp_path):
+    # Changing bad_channels remakes the motion-corrected binary; CatGT's own
+    # record leaves the key out (as it leaves out motion). Without motion, or
+    # without bad channels, nothing is recorded, so older binaries still match.
+    from spikesorting import pipeline
+
+    def session(bad, motion="dredge"):
+        return _catgt_session(
+            tmp_path, preprocess=f"    motion: {motion}\n    car_mode: null\n    gfix: null\n",
+            extra=f"  kilosort:\n    bad_channels: {bad}\n")
+
+    expected = pipeline._preprocess_expected(session("[5, 2]"), "neuropixels")
+    assert expected["settings"]["motion_interpolated"] == [2, 5]
+    assert provenance.stale_reasons(
+        expected, pipeline._preprocess_expected(session("[5]"), "neuropixels"))
+    assert not provenance.stale_reasons(
+        pipeline._catgt_stage_expected(session("[5, 2]")),
+        pipeline._catgt_stage_expected(session("[5]")))
+    assert "motion_interpolated" not in pipeline._preprocess_expected(
+        session("[5, 2]", motion="null"), "neuropixels")["settings"]
+    assert "motion_interpolated" not in pipeline._preprocess_expected(
+        session("null"), "neuropixels")["settings"]
 
 
 def test_motion_correction_keeps_every_channel_whatever_the_preset(monkeypatch):

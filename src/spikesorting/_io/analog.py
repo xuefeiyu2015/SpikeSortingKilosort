@@ -24,6 +24,7 @@ __all__ = [
     "BlackrockAnalog",
     "find_onebox_analog",
     "load_onebox_analog",
+    "onebox_source_problem",
     "read_onebox",
     "iter_onebox",
     "open_blackrock_analog",
@@ -52,6 +53,11 @@ class OneBoxAnalog:
     #: ``onebox_to_blackrock``: blackrock = slope * (k / fs) + intercept
     slope: float
     intercept: float
+    #: The ``.obx.bin`` it was written from and its size / mtime then; None in
+    #: an export from before they were recorded.
+    source: str | None = None
+    source_size: int | None = None
+    source_mtime_ns: int | None = None
 
     def blackrock_time(self, k0: int, k1: int) -> np.ndarray:
         return self.slope * (np.arange(k0, k1) / self.fs) + self.intercept
@@ -114,6 +120,10 @@ def load_onebox_analog(path: str | Path, require_blackrock: bool = True) -> OneB
             timebase=_text(a, "timebase"),
             slope=_scalar(a, "blackrock_slope"),
             intercept=_scalar(a, "blackrock_intercept"),
+            source=_text(a, "source") if "source" in a else None,
+            source_size=int(_scalar(a, "source_size")) if "source_size" in a else None,
+            source_mtime_ns=(int(_text(a, "source_mtime_ns"))
+                             if "source_mtime_ns" in a else None),
         )
     if require_blackrock and info.timebase != "blackrock":
         raise ValueError(
@@ -121,6 +131,20 @@ def load_onebox_analog(path: str | Path, require_blackrock: bool = True) -> OneB
             "(run_exporting_pipeline.py) so onebox_to_blackrock is stamped in"
         )
     return info
+
+
+def onebox_source_problem(analog: OneBoxAnalog, obx_bin: str | Path) -> str | None:
+    """Why ``analog`` is not an export of ``obx_bin`` as it is now, or None.
+
+    Compared by file name, size and modification time -- not by the full path,
+    which differs between a share mounted on the rig and on the HPC. An export
+    that recorded none of them cannot be vouched for and is refused too.
+    ``obx_bin`` must be reachable: ``stat`` raises ``OSError`` otherwise.
+    """
+    from .._preprocess.provenance import export_source_problem
+
+    return export_source_problem(analog.path.name, analog.source, analog.source_size,
+                                 analog.source_mtime_ns, obx_bin)
 
 
 def read_onebox(analog: OneBoxAnalog, name: str, k0: int, k1: int) -> np.ndarray:

@@ -1195,6 +1195,7 @@ def check_session(config: SessionConfig) -> list[Check]:
         )
 
     checks.extend(_check_catgt_preprocessing(config))
+    checks.extend(_check_analog_for_sync(config))
 
     brk = config.blackrock
     if config.sorts_blackrock and brk.probe_file is None:
@@ -1219,6 +1220,32 @@ def check_session(config: SessionConfig) -> list[Check]:
             )
         )
     return checks
+
+
+def _check_analog_for_sync(config: SessionConfig) -> list[Check]:
+    """Without a burst, the map is checked against the photodiode/eye through
+    the OneBox analog export -- which only ``export_analog: true`` writes. Said
+    before the run, so a NOT VALIDATED is not the first anyone hears of it."""
+    brk, npx = config.blackrock, config.neuropixels
+    shared = [name for name in brk.analog_inputs if name in npx.analog_channels]
+    if not (config.aligns_systems and brk.analog_file is not None and shared):
+        return []
+    if config.export_analog:
+        return [Check(name=f"session:{config.session}:analog", status=OK,
+                      detail=f"export_analog: true -- {', '.join(shared)} can check "
+                             "the map without a burst",
+                      section=SECTION_SESSION)]
+    return [Check(
+        name=f"session:{config.session}:analog",
+        status=WARN,
+        detail=(f"export_analog is false, so this run writes no OneBox analog "
+                f"export: if the session has no 14 s burst, {', '.join(shared)} "
+                "cannot pick the 1 Hz cycle or check the map without an existing "
+                "usable OneBox export (one an earlier run wrote from this "
+                ".obx.bin, unchanged since), and the map is NOT VALIDATED"),
+        fix="set export_analog: true in the session",
+        section=SECTION_SESSION,
+    )]
 
 
 def _check_catgt_preprocessing(config: SessionConfig) -> list[Check]:

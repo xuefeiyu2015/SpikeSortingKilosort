@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from spikesorting import pipeline
 from spikesorting._io import analog, blackrock, matlab, spikeglx
 from spikesorting._sync import compare
 
@@ -343,6 +344,79 @@ def test_with_nothing_to_pick_the_cycle_the_map_says_so(tmp_path, monkeypatch):
     report = build_sync_report(payload, None, [])
     assert report["verdict"] == "NOT VALIDATED"
     assert "off by whole seconds" in report["verdict_note"]
+
+
+def _remap_after(tmp_path, monkeypatch, tamper):
+    """Like ``_remap_with_a_planted_cycle_error``, with ``tamper(obx, export)``
+    applied to the OneBox file or its analog export before remapping."""
+    import json
+
+    import spikesorting as ss
+    from spikesorting._sync import burst
+
+    session, reader = _session(tmp_path, stamped_slope=M)
+    _plant_1hz_without_burst(session)
+    obx = tmp_path / "run_g0" / "run_g0_t0.obx0.obx.bin"
+    export = analog.find_onebox_analog(session.paths.export_for("neuropixels"))
+    tamper(obx, export)
+    monkeypatch.setattr(analog, "open_blackrock_analog", _open_with(reader))
+    true_offset = C + (M - 1.0) * DURATION / 2
+    monkeypatch.setattr(burst, "estimate_offset", lambda *a, **k: true_offset + 3.0)
+    ss.time_remapping(session, "neuropixels")
+    return json.loads((session.paths.aligned / "time_map.json").read_text())
+
+
+def test_an_analog_export_of_a_changed_onebox_file_does_not_pick_the_cycle(
+    tmp_path, monkeypatch, caplog
+):
+    # The export on disk is from the OneBox file as it was; the file has since
+    # been replaced. Whatever export_analog says, a stale export must not vote.
+    import os
+
+    def replaced(obx, export):
+        stat = obx.stat()
+        os.utime(obx, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+
+    with caplog.at_level("INFO", logger="spikesorting"):
+        payload = _remap_after(tmp_path, monkeypatch, replaced)
+    assert payload["cycles_from"] == "1hz_only"
+    assert "has changed since" in caplog.text
+
+
+def test_an_analog_export_that_does_not_name_its_source_is_not_used(
+    tmp_path, monkeypatch, caplog
+):
+    # An export written before the source was recorded cannot be vouched for.
+    import h5py
+
+    def legacy(obx, export):
+        with h5py.File(export, "r+") as handle:
+            del handle["analog/source_size"]
+            del handle["analog/source_mtime_ns"]
+
+    with caplog.at_level("INFO", logger="spikesorting"):
+        payload = _remap_after(tmp_path, monkeypatch, legacy)
+    assert payload["cycles_from"] == "1hz_only"
+    assert "does not record which file" in caplog.text
+
+
+def test_the_onebox_source_check_ignores_the_mount_but_not_the_file(tmp_path):
+    from dataclasses import replace
+
+    obx = tmp_path / "run_g0_t0.obx0.obx.bin"
+    obx.write_bytes(b"\x00" * 14)
+    stat = obx.stat()
+    exported = analog.OneBoxAnalog(
+        path=tmp_path / "x.analog.mat", names=(), index={}, fs=1.0, n_samples=0,
+        v_per_digit=np.empty(0), timebase="onebox", slope=np.nan, intercept=np.nan,
+        source="Z:\\Monkey A\\run_g0\\run_g0_t0.obx0.obx.bin",       # the rig's mount
+        source_size=stat.st_size, source_mtime_ns=stat.st_mtime_ns,
+    )
+    assert analog.onebox_source_problem(exported, obx) is None
+    other = replace(exported, source="Z:/other_g0/other_g0_t0.obx0.obx.bin")
+    assert "was written from other_g0_t0" in analog.onebox_source_problem(other, obx)
+    smaller = replace(exported, source_size=stat.st_size - 2)
+    assert "has changed since" in analog.onebox_source_problem(smaller, obx)
 
 
 def test_without_a_burst_agreeing_channels_make_the_map_consistent(tmp_path, monkeypatch):
@@ -707,3 +781,64 @@ def test_a_figure_that_cannot_be_drawn_does_not_fail_validation(tmp_path, monkey
     result = ss.validate_remapping(session, figures=True)
     assert result.verdict.startswith("CONSISTENT")
     assert not (session.paths.figures_for("neuropixels") / pipeline.SYNC_FIGURE).exists()
+
+
+# ---------------------------------------------------------------------------
+# stamping only a current export
+# ---------------------------------------------------------------------------
+
+
+def test_an_analog_export_of_a_changed_onebox_file_is_not_stamped(tmp_path, caplog):
+    # The export/ copy that downstream analysis reads must not be put on
+    # Blackrock time when it is not of this recording as it is now.
+    import os
+
+    from spikesorting._sync.align import LinearMap
+
+    session, _ = _session(tmp_path, stamped_slope=M)
+    obx = tmp_path / "run_g0" / "run_g0_t0.obx0.obx.bin"
+    public = spikeglx.export_onebox_analog(
+        obx, session.paths.export_for("neuropixels"),
+        named={"eye_x": 1, "photodiode": 4}, burst_row=0,
+    )
+    mapping = LinearMap(slope=1.0, intercept=123.0, n_points=2, residuals_s=np.zeros(1))
+    stat = obx.stat()
+    os.utime(obx, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+
+    assert pipeline.stamp_analog_timebase(session, mapping) is None
+    assert analog.load_onebox_analog(public, require_blackrock=False).timebase == "onebox"
+    assert "stays on the OneBox clock" in caplog.text
+
+    os.utime(obx, ns=(stat.st_atime_ns, stat.st_mtime_ns))     # current again
+    assert pipeline.stamp_analog_timebase(session, mapping) == public
+    assert analog.load_onebox_analog(public).timebase == "blackrock"
+
+
+def test_without_an_analog_export_the_verdict_names_export_analog(tmp_path, monkeypatch):
+    # No burst, export_analog false, nothing in export/: the map cannot be
+    # checked, and the report says which setting would let it be.
+    from spikesorting._sync.report import build_sync_report
+
+    def removed(obx, export):
+        export.unlink()
+
+    payload = _remap_after(tmp_path, monkeypatch, removed)
+    assert payload["cycles_from"] == "1hz_only"
+    assert "set export_analog: true" in payload["cycles_note"]
+    report = build_sync_report(payload, None, [])
+    assert report["verdict"] == "NOT VALIDATED"
+    assert "set export_analog: true" in report["verdict_note"]
+
+
+def test_check_env_warns_when_export_analog_is_off_for_a_session_that_may_need_it(tmp_path):
+    from dataclasses import replace
+
+    import doctor
+
+    session, _ = _session(tmp_path, stamped_slope=M)
+    assert not session.export_analog
+    [check] = [c for c in doctor.check_session(session) if c.name.endswith(":analog")]
+    assert check.status == doctor.WARN and "export_analog" in check.fix
+    [check] = [c for c in doctor.check_session(replace(session, export_analog=True))
+               if c.name.endswith(":analog")]
+    assert check.status == doctor.OK
