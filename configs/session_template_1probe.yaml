@@ -102,7 +102,7 @@ neuropixels:
                          #   0.10 mV/sample, until it falls below 0.02 mV.
                          #   For chewing/licking/cable artifacts -- see "Preprocessing"
     phase_shift: true    # ADC multiplexing correction (CatGT tshift)
-    motion: medicine     # MEDiCINe, before Kilosort (pip install medicine-neuro); or dredge, ..., null -- see "Preprocessing"
+    motion: dredge       # DREDge, before Kilosort; or medicine (pip install medicine-neuro), dredge_fast, ..., null -- see "Preprocessing"
   kilosort:                    # every Kilosort parameter, stated -- see "Kilosort settings"
     # ---- this session ----
     bad_channels: []             # dead sites, as recording channel numbers -- see "Bad channels"
@@ -405,8 +405,8 @@ kilosort: {}
 #   nblocks is how many depth blocks Kilosort tracks: 1 is rigid (the whole shank
 #   moves together), 5 gives 5 non-overlapping blocks plus 4 straddling their
 #   boundaries, 0 disables it. The templates set 0 for Neuropixels because drift
-#   is corrected before Kilosort instead, by preprocess.motion: medicine (it
-#   tracked this lab's probes better than Kilosort's own correction). With
+#   is corrected before Kilosort instead, by preprocess.motion: dredge (on this
+#   lab's sessions it did better than MEDiCINe and Kilosort's own correction). With
 #   motion set, Kilosort sorts with nblocks: 0 whatever is written here (the log
 #   says so), so the 0 only states it.
 #
@@ -467,7 +467,7 @@ kilosort: {}
 #     phase_shift   Neuropixels digitises its channels in groups, a fraction of
 #                   a sample apart; this re-aligns them (CatGT tshift, which is
 #                   on unless -no_tshift). Needs the .meta.
-#     motion        medicine in the templates (Neuropixels). null keeps drift
+#     motion        dredge in the templates (Neuropixels). null keeps drift
 #                   correction inside Kilosort (then set nblocks: 5). A
 #                   SpikeInterface correct_motion preset corrects it here
 #                   instead and writes a motion-corrected binary; Kilosort's

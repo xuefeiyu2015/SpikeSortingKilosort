@@ -102,7 +102,7 @@ Kilosort -- and **`kilosort:`** -- what Kilosort itself does.
 | `car_mode` | the common reference: `gblcar` (median across channels), `gbldmx` (demuxed mean, CatGT only) or `null`. This *is* the CAR -- Kilosort's own `do_CAR` is always off, and writing `do_CAR` under `kilosort:` is refused with a pointer here |
 | `gfix` | CatGT's artifact removal: `null` off, or `[0.40, 0.10, 0.02]` (amplitude mV, slope mV/sample, recovery mV) for chewing, licking or cable artifacts |
 | `phase_shift` | the ADC multiplexing correction (CatGT tshift) |
-| `motion` | drift correction *before* Kilosort: `medicine` (the templates), `dredge`, `dredge_fast`, …, or `null` to leave it to Kilosort's `nblocks` |
+| `motion` | drift correction *before* Kilosort: `dredge` (the templates), `medicine`, `dredge_fast`, …, or `null` to leave it to Kilosort's `nblocks` |
 
 **`kilosort:`** (`neuropixels:` → `kilosort:`, per probe under `by_probe:` in the
 two-probe template; `blackrock:` → `kilosort:`) -- not the top-level `kilosort:`,
@@ -112,7 +112,7 @@ which the templates leave `{}`:
 |---|---|
 | `bad_channels` | recording channel numbers to drop (rows of the binary, not array positions) |
 | `highpass_cutoff` | Kilosort's own highpass, in Hz (default 300) |
-| `nblocks` | Kilosort's drift correction: `0` off (the templates: MEDiCINe corrects drift instead), `1` rigid, `5` five depth blocks (use this with `motion: null`). Ignored -- Kilosort sorts with `0` -- whenever `preprocess.motion` is set |
+| `nblocks` | Kilosort's drift correction: `0` off (the templates: DREDge corrects drift instead), `1` rigid, `5` five depth blocks (use this with `motion: null`). Ignored -- Kilosort sorts with `0` -- whenever `preprocess.motion` is set |
 | `artifact_threshold` | zero out batches above this amplitude |
 | `tmin` / `tmax` | sort only this window of the binary, in seconds |
 
@@ -177,13 +177,13 @@ Kilosort corrects drift by interpolating between neighbouring contacts, and at
 signal instead of moving it.
 
 **Neuropixels drift is corrected one of two ways — switched by one line.** The templates use
-**MEDiCINe** (`motion: medicine`, `nblocks: 0`): it tracked this lab's probes better than
-Kilosort's own correction.
+**DREDge** (`motion: dredge`, `nblocks: 0`): on this lab's sessions it did better than
+MEDiCINe and Kilosort's own correction.
 
 | `preprocess.motion` | who corrects drift | figures beside the sorting |
 |---|---|---|
 | `null` | Kilosort, at `kilosort.nblocks` (set it to 5) | Kilosort's `drift_amount.png`, `drift_scatter.png` |
-| `medicine` (the templates), `dredge`, `dredge_fast`, … | SpikeInterface, before Kilosort; Kilosort runs with `nblocks: 0` automatically, whatever the YAML says | `motion_drift_scatter.png` (before vs after), `motion_drift_amount.png` |
+| `dredge` (the templates), `dredge_fast`, `medicine`, … | SpikeInterface, before Kilosort; Kilosort runs with `nblocks: 0` automatically, whatever the YAML says | `motion_drift_scatter.png` (before vs after), `motion_drift_amount.png` |
 
 To go back to Kilosort's correction, set `motion: null` **and** `nblocks: 5` —
 with `nblocks: 0` nothing would correct drift. While `motion` is set, `nblocks` is
@@ -458,7 +458,7 @@ you ended up with, in 4e.
 
 Kilosort4 install docs: <https://kilosort.readthedocs.io/en/latest/installation.html>
 
-**MEDiCINe**, for `preprocess.motion: medicine` — **needed by the templates**, which use it for Neuropixels drift. SpikeInterface
+**Optional: MEDiCINe**, only for a session that sets `preprocess.motion: medicine` (the templates use DREDge, which needs nothing beyond this env). SpikeInterface
 ships the preset but not the method, which is its own package:
 
 ```bash
