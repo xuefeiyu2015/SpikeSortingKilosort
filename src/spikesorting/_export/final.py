@@ -237,8 +237,15 @@ def export_sorted_spikes_mat(
     """Write the sorted spikes as the online-spike container's twin.
 
     Field names are the ones ``jlab_loader`` reads off a ``.nev``
-    (``TimeStamps``/``Channel``/``Unit``/``Waveforms``), so the same analysis
-    code segments this product into trials without a branch. ``Unit`` holds the
+    (``TimeStamps``/``Channel``/``Unit``), so the same analysis code segments
+    this product into trials without a branch.
+
+    **No per-spike ``Waveforms``.** The snippets are cut from a subset of the
+    spikes (``waveforms.max_spikes`` per unit, none near the file's ends), so
+    a ``Waveforms`` here would have fewer rows than ``TimeStamps`` and nothing
+    saying which spike each row is. They go to ``waveforms.mat`` only, beside
+    the ``spike_index`` and ``spike_time_s`` that place each one. The
+    per-unit ``MeanWaveform``/``StdWaveform`` stay here. ``Unit`` holds the
     Kilosort cluster id -- the name is for compatibility, not a claim that a
     cluster is a Blackrock unit.
 
@@ -246,7 +253,7 @@ def export_sorted_spikes_mat(
     integer ticks would imply a precision the fit does not have. ``TimeRes`` is
     carried so the tick view can be recovered.
     """
-    from .._io.matlab import Chunked, write_mat
+    from .._io.matlab import write_mat
 
     unit_ids = np.asarray(unit_ids)
     times: list[np.ndarray] = []
@@ -304,27 +311,12 @@ def export_sorted_spikes_mat(
     if waveforms is not None:
         # Cut through Kilosort's own preprocessing and scaled to microvolts, so
         # unlike the Kilosort template these carry an amplitude, and the mean is
-        # exactly the mean of the snippets. The mean is always here; the
-        # snippets only when the session asked to keep them.
+        # exactly the mean of the snippets in waveforms.mat.
         product["MeanWaveform"] = np.asarray(waveforms["mean"], dtype=np.float32).T
         product["StdWaveform"] = np.asarray(waveforms["std"], dtype=np.float32).T
         product["MeanWaveformUnit"] = str(waveforms.get("units", "ADC"))
         product["window_ms"] = float(waveforms.get("window_ms", float("nan")))
         info["MeanWaveform_Unit_No"] = np.asarray(waveforms["unit_ids"], dtype=np.float64)
-        snippets = waveforms.get("snippets")
-        if snippets is not None:
-            # Given as (nSamp, nSpikes), which is the HDF5 shape; MATLAB reverses
-            # it and reads nSpikes x nSamp -- the online container's orientation.
-            # Single precision, in MeanWaveformUnit: they are preprocessed and
-            # scaled, so int16 counts would be both lossy and the wrong unit.
-            snippets = np.asarray(snippets, dtype=np.float32)
-            product["Waveforms"] = Chunked(
-                shape=snippets.shape,
-                dtype=np.float32,
-                fill=lambda dataset, s=snippets: dataset.__setitem__(slice(None), s),
-                chunks=None,
-                compression="gzip",
-            )
 
     product["info"] = info
     return write_mat(Path(out_dir) / filename, {"sorted_spikes": product})

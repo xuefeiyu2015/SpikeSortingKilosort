@@ -38,6 +38,35 @@ def source_fingerprint(path: str | Path) -> dict[str, Any]:
     return {"path": str(path), "size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
 
 
+def export_source_problem(
+    export_name: str,
+    recorded_source: str | None,
+    recorded_size: int | None,
+    recorded_mtime_ns: int | None,
+    binary: str | Path,
+) -> str | None:
+    """Why an export is not of ``binary`` as it is now, or None. ``recorded_*``
+    are what the export says it was written from.
+
+    By file name, size and modification time -- not the full path, which
+    differs between a share mounted on the rig and on the HPC. An export that
+    recorded no size/mtime cannot be vouched for. ``binary`` must be reachable:
+    ``stat`` raises ``OSError`` otherwise.
+    """
+    binary = Path(binary)
+    if recorded_size is None or recorded_mtime_ns is None:
+        return (f"{export_name} does not record which file it was written "
+                f"from; re-export it from {binary.name}")
+    recorded = Path(str(recorded_source).replace("\\", "/")).name
+    if recorded != binary.name:
+        return f"{export_name} was written from {recorded}, not {binary.name}"
+    stat = binary.stat()
+    if (int(stat.st_size), int(stat.st_mtime_ns)) != (recorded_size, recorded_mtime_ns):
+        return (f"{binary.name} has changed since {export_name} was written "
+                f"from it; re-export it")
+    return None
+
+
 def stale_reasons(recorded: dict[str, Any] | None, expected: dict[str, Any]) -> list[str]:
     """Why a recorded binary does not answer ``expected``; empty if it does."""
     if not recorded:

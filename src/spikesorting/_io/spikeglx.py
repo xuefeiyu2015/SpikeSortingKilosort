@@ -668,6 +668,7 @@ def export_lfp(
     if decimate < 1:
         raise ValueError("decimate must be >= 1")
 
+    lf_stat = info.path.stat()
     n_out = (info.n_samples + decimate - 1) // decimate
     n_chan = info.n_chan
     source = memmap_stream(info)
@@ -725,6 +726,10 @@ def export_lfp(
                 "max_int": float(info.meta.get(max_key, "nan")),
                 "sy_index": float(info.sy_index if info.sy_index is not None else -1),
                 "source": str(info.path),
+                # Which LF binary, as it was: stamp_lfp_timebase refuses to put
+                # Blackrock time on an export of another or a changed file.
+                "source_size": float(lf_stat.st_size),
+                "source_mtime_ns": str(lf_stat.st_mtime_ns),
                 "note": (
                     "data is int16, nChan x nSamples in MATLAB; channel_ids are "
                     "0-based rows of the source binary. Sample k is at "
@@ -843,6 +848,7 @@ def export_onebox_analog(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{info.path.stem}.analog.mat"
 
+    source_stat = info.path.stat()
     n_out = (info.n_samples + decimate - 1) // decimate
     row_bytes = info.n_chan * 2
     rows_per_chunk = max(decimate, (chunk_bytes // row_bytes) // decimate * decimate)
@@ -893,6 +899,12 @@ def export_onebox_analog(
                 "ai_range_max": float(info.meta.get(range_key, "nan")),
                 "max_int": float(info.meta.get(max_key, "nan")),
                 "source": str(info.path),
+                # Which .obx.bin, as it was: synchronization reads this export
+                # back (the no-burst cycle vote, the independent checks) and
+                # refuses one that no longer matches the recording on disk.
+                # mtime_ns as text: it does not fit float64 exactly.
+                "source_size": float(source_stat.st_size),
+                "source_mtime_ns": str(source_stat.st_mtime_ns),
                 "note": (
                     "data is int16, nChan x nSamples in MATLAB, one row per OneBox "
                     "XA input (xa gives which; index.<name> gives the 1-based row). "

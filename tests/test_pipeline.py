@@ -726,6 +726,42 @@ def test_an_unreachable_binary_costs_the_waveforms_and_nothing_else(tmp_path, ki
     assert ss.export_waveforms(session, "blackrock") is None
 
 
+def test_an_lfp_export_of_a_changed_or_other_binary_is_not_stamped(tmp_path, caplog):
+    # Blackrock time on another recording's LF band would read as current and
+    # aligned. A legacy export (no size/mtime) is held to its name and length.
+    import os
+    from dataclasses import replace
+
+    from spikesorting._io.matlab import update_mat
+    from spikesorting._io.spikeglx import export_lfp, meta_path_for
+    from spikesorting._sync.align import LinearMap
+
+    session = _session(tmp_path)
+    lf = tmp_path / "run_g0_t0.imec0.lf.bin"
+    lf.write_bytes(np.zeros(4 * 5000, dtype=np.int16).tobytes())
+    meta_path_for(lf).write_text(
+        "nSavedChans=4\nimSampRate=2500\ntypeThis=imec\nfileSizeBytes=0\n"
+        "snsApLfSy=3,0,1\nimAiRangeMax=0.6\nimMaxInt=512\n", encoding="utf-8")
+    session = replace(session, neuropixels=replace(session.neuropixels, lf_file=lf))
+    out = export_lfp(lf, session.paths.export_for("neuropixels"), decimate=1)
+    mapping = LinearMap(slope=1.0, intercept=5.0, n_points=2, residuals_s=np.zeros(1))
+
+    stat = lf.stat()
+    os.utime(lf, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+    assert ss.stamp_lfp_timebase(session, mapping) is None
+    assert "has changed since" in caplog.text
+
+    # Legacy: no size/mtime recorded. Same name and length -> stamped...
+    import h5py
+    with h5py.File(out, "r+") as handle:
+        del handle["lfp/source_size"]
+        del handle["lfp/source_mtime_ns"]
+    assert ss.stamp_lfp_timebase(session, mapping) == out
+    # ...a different length -> not.
+    update_mat(out, {"lfp": {"timebase": "stream", "n_samples": 4999.0}})
+    assert ss.stamp_lfp_timebase(session, mapping) is None
+
+
 def test_the_fitted_map_is_stamped_into_an_lfp_written_hours_earlier(tmp_path):
     # The LF band is extracted with the rest of the extraction, before any map
     # exists, so it goes out on the probe's own clock. The LF and AP streams of a
@@ -745,6 +781,8 @@ def test_the_fitted_map_is_stamped_into_an_lfp_written_hours_earlier(tmp_path):
         f"snsApLfSy={n_chan - 1},0,1\nimAiRangeMax=0.6\nimMaxInt=512\n",
         encoding="utf-8",
     )
+    from dataclasses import replace
+    session = replace(session, neuropixels=replace(session.neuropixels, lf_file=lf))
     out = export_lfp(lf, session.paths.export_for("neuropixels"), decimate=1)
 
     with h5py.File(out, "r") as handle:
@@ -2605,6 +2643,30 @@ def test_a_resort_clears_phys_state_from_the_previous_one(tmp_path):
         "spike_times.npy", "sync_edges.txt",
     ]
     assert (final / "cluster_group.tsv").read_text() == "new"
+
+
+def test_a_resort_removes_the_previous_sorts_export_and_keeps_the_rest(tmp_path):
+    # Between a re-sort and the next export_results, the usual place must not
+    # hold the old sort's spikes and units. What does not depend on the sort --
+    # LFP, OneBox analog, the sync records -- stays.
+    final = tmp_path / "kilosort4"
+    export, figures = final / "export", final / "export" / "figures"
+    figures.mkdir(parents=True)
+    old = ["run.sorted_spikes.mat", "run.waveforms.mat", "units.csv",
+           "channel_positions.csv", "sorting_summary_info.json", "timing.txt",
+           "run_info.json", "kilosort4.log", "preprocess.json"]
+    old_figures = ["units.pdf", "overview.pdf", "overview.png", "motion_drift_amount.png"]
+    kept = ["run.lfp.mat", "run.obx0.obx.analog.mat", "sync_report.json",
+            "sync_report.txt", "time_map.json", "validation.json"]
+    for name in old + kept:
+        (export / name).write_text("x")
+    for name in old_figures + ["sync_overview.png"]:
+        (figures / name).write_text("x")
+
+    pipeline._clear_previous_curation(final)
+
+    assert sorted(p.name for p in export.iterdir() if p.is_file()) == sorted(kept)
+    assert [p.name for p in figures.iterdir()] == ["sync_overview.png"]
 
 
 def test_aligned_times_are_bound_to_the_sorting_they_were_mapped_from(tmp_path):

@@ -27,6 +27,7 @@ def build_chain(
     spec: Any,
     job_kwargs: dict | None = None,
     reference_rows: Sequence[int] | None = None,
+    bad_rows: Sequence[int] | None = None,
 ) -> tuple[Any, dict | None]:
     """The preprocessed recording, as a lazy SpikeInterface chain, and what
     motion correction measured (None without it).
@@ -39,6 +40,9 @@ def build_chain(
     ``reference_rows`` are the rows the common median is taken over -- the
     probe's electrodes minus ``bad_channels``. It is still *subtracted* from
     every row, so the binary keeps its shape. ``None`` takes every row.
+
+    ``bad_rows`` (``bad_channels``) are interpolated from their neighbours
+    before motion correction; see :func:`motion_chain`.
     """
     import spikeinterface.preprocessing as spre
 
@@ -69,12 +73,13 @@ def build_chain(
     elif spec.car_mode is not None:
         raise ValueError(f"car_mode {spec.car_mode!r} has no SpikeInterface equivalent")
     if spec.motion is not None:
-        return motion_chain(rec, spec.motion, job_kwargs)
+        return motion_chain(rec, spec.motion, job_kwargs, bad_rows=bad_rows)
     return spre.astype(rec, dtype="int16", round=True), None
 
 
 def motion_chain(
-    recording: Any, preset: str, job_kwargs: dict | None = None
+    recording: Any, preset: str, job_kwargs: dict | None = None,
+    bad_rows: Sequence[int] | None = None,
 ) -> tuple[Any, dict]:
     """``recording`` drift-corrected with a ``correct_motion`` preset, as int16,
     and SpikeInterface's ``motion_info``: the motion, every peak it was
@@ -82,6 +87,14 @@ def motion_chain(
     is computed anyway; asking for it costs nothing.
 
     Used on its own after CatGT, which filters but has no motion correction.
+
+    **Known bad channels are interpolated first** (``bad_rows``: binary rows,
+    as ``bad_channels`` are), with SpikeInterface's ``interpolate_bad_channels``
+    -- the IBL pipeline's kriging from neighbouring sites. Otherwise a noisy
+    site adds peaks at a fixed depth to the drift estimate, and its signal is
+    mixed into its good neighbours by the motion interpolation before Kilosort
+    drops the row. Interpolated rather than removed: the binary keeps every row
+    the ``.meta`` channel map indexes. Kilosort still ignores the row.
     """
     import spikeinterface.preprocessing as spre
 
@@ -94,6 +107,17 @@ def motion_chain(
         )
     if preset == "medicine":
         check_medicine()
+    if bad_rows:
+        ids = list(recording.channel_ids)
+        outside = [r for r in bad_rows if not 0 <= r < len(ids)]
+        if outside:
+            raise ValueError(
+                f"bad_channels {outside} are not rows of this {len(ids)}-channel "
+                "recording"
+            )
+        recording = spre.interpolate_bad_channels(
+            recording, [ids[r] for r in sorted(set(bad_rows))]
+        )
     # Every channel is kept. The DREDge presets say so themselves; others
     # (medicine) leave it to interpolate_motion's default, "remove_channels",
     # which drops the sites drift carries off the probe's ends -- and the
